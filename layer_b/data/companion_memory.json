@@ -1,0 +1,21 @@
+{
+  "history": [
+    {
+      "role": "user",
+      "content": "what is poor plus seven"
+    },
+    {
+      "role": "assistant",
+      "content": "Ha, poor plus seven equals... still poor, but with better math skills! Ask me a robot thing, my circuits are better at that."
+    },
+    {
+      "role": "user",
+      "content": "what is your name"
+    },
+    {
+      "role": "assistant",
+      "content": "I'm PiCar, your friendly little rolling buddy! Right now I've got a couple bottles in my sights and clear road ahead."
+    }
+  ],
+  "last_turn_at": 1783948606.0289469
+}

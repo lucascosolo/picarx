@@ -22,8 +22,14 @@ Each reply is grounded with a short snapshot of picarx/state/world
 (face/objects/distance/battery) folded into the prompt, so it can
 answer naturally ("are you doing okay?", "what's that thing you're
 looking at?") without needing its own sensor access. Conversation
-history is kept in memory only (a rolling window) - it resets on
-restart, which is an intentional simplicity trade-off for now.
+history is a rolling window (HISTORY_TURNS messages) persisted to
+disk (COMPANION_MEMORY_PATH) after every turn, so a restart doesn't
+erase who it was just talking to - it picks the same conversation
+back up rather than meeting the room as a stranger every boot. If the
+gap since the last turn is long enough to plausibly be a new
+conversation (MEMORY_STALE_GAP), that gap is surfaced to the model as
+context instead of being hidden, so it doesn't continue an hour-old
+sentence as if no time passed.
 
 Requires ANTHROPIC_API_KEY in the environment, same as coach.py. If
 it's missing, or a request fails/times out, this module just replies
@@ -42,12 +48,17 @@ from broker_client import Bus
 import threading
 import queue
 import time
+import json
 from collections import deque
 
 HISTORY_TURNS = 12          # user+assistant messages kept for context
 WORKER_THREADS = 2
 REPLY_TIMEOUT = 8.0
 REPLY_MAX_TOKENS = 150
+
+DATA_DIR = "/home/picarx/layer_b/data"
+COMPANION_MEMORY_PATH = f"{DATA_DIR}/companion_memory.json"
+MEMORY_STALE_GAP = 1800      # seconds of silence before a gap is worth mentioning to the model
 
 COMPANION_MODEL = os.environ.get("COMPANION_MODEL", "claude-sonnet-5")
 
@@ -68,6 +79,13 @@ safety-critical command system handles "explore", "stop", "status", "objects",
 "history", and "battery". If someone asks you to move, stop, explore, or asks a
 question one of those commands already answers, tell them briefly to just say that
 word directly instead of trying to comply here yourself.
+
+Your conversation history survives your own restarts, so earlier messages in this
+conversation may be from before you rebooted. Treat that history as a real memory
+of an ongoing relationship, not a stranger's transcript. If a message starts with
+"[picked back up after ...]", meaningful time passed since the last exchange - don't
+awkwardly continue an old sentence, but you can naturally reference what you talked
+about before if it's relevant.
 """
 
 
@@ -75,11 +93,40 @@ class Companion:
     def __init__(self):
         self.bus = Bus()
         self.lock = threading.Lock()
-        self.history = deque(maxlen=HISTORY_TURNS)
+        self.history, self.last_turn_at = self._load_memory()
         self.latest_world = None
         self.work_queue = queue.Queue()
         self._client = None
         self._warned_no_key = False
+
+    # ---------- memory persistence ----------
+
+    def _load_memory(self):
+        try:
+            with open(COMPANION_MEMORY_PATH) as f:
+                raw = json.load(f)
+            history = deque(raw.get("history", []), maxlen=HISTORY_TURNS)
+            last_turn_at = raw.get("last_turn_at")
+            print(f"Companion: resuming memory ({len(history)} messages, "
+                  f"last turn at {last_turn_at})")
+            return history, last_turn_at
+        except FileNotFoundError:
+            return deque(maxlen=HISTORY_TURNS), None
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Companion: failed to load memory, starting fresh: {e}")
+            return deque(maxlen=HISTORY_TURNS), None
+
+    def _save_memory(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with self.lock:
+            snapshot = json.dumps({
+                "history": list(self.history),
+                "last_turn_at": self.last_turn_at,
+            }, indent=2)
+        tmp_path = f"{COMPANION_MEMORY_PATH}.tmp"
+        with open(tmp_path, "w") as f:
+            f.write(snapshot)
+        os.replace(tmp_path, COMPANION_MEMORY_PATH)
 
     # ---------- inbound ----------
 
@@ -136,15 +183,32 @@ class Companion:
 
         return "; ".join(parts)
 
+    def _gap_note(self, now):
+        """Empty unless enough silence passed since the last turn (possibly
+        across a restart) that the model should know it's not still mid-conversation."""
+        if not self.history or self.last_turn_at is None:
+            return ""
+        gap = now - self.last_turn_at
+        if gap < MEMORY_STALE_GAP:
+            return ""
+        minutes = gap / 60.0
+        if minutes < 90:
+            span = f"{minutes:.0f} minutes"
+        else:
+            span = f"{minutes / 60.0:.1f} hours"
+        return f"[picked back up after {span} of silence]\n"
+
     def _handle_utterance(self, text):
         client = self._get_client()
         if client is None:
             self.bus.publish("picarx/audio/speak", {"text": "Sorry, I can't chat right now."})
             return
 
+        now = time.time()
         with self.lock:
             messages = list(self.history)
-        messages = messages + [{"role": "user", "content": f"[current status: {self._context_blurb()}]\n{text}"}]
+        gap_note = self._gap_note(now)
+        messages = messages + [{"role": "user", "content": f"{gap_note}[current status: {self._context_blurb()}]\n{text}"}]
 
         try:
             response = client.messages.create(
@@ -167,6 +231,8 @@ class Companion:
         with self.lock:
             self.history.append({"role": "user", "content": text})
             self.history.append({"role": "assistant", "content": reply})
+            self.last_turn_at = now
+        self._save_memory()
 
         print(f"Companion says: {reply}")
         self.bus.publish("picarx/audio/speak", {"text": reply})
