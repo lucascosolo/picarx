@@ -72,6 +72,15 @@ class MotionSmoother(threading.Thread):
     def update_targets(self, speed=None, angle=None):
         with self.lock:
             if speed is not None:
+                # On a direction REVERSAL, snap through zero instead of
+                # ramping down first: at speed_step 2.0/20ms, going from
+                # forward-25 to backward-30 spent ~0.55s of a ~1s escape
+                # step just decelerating - eroding commanded maneuvers to
+                # almost no actual displacement (a big part of "announces
+                # an escape but barely moves"). Ramping is kept within a
+                # direction; only the sign flip is immediate.
+                if speed * self.current_speed < 0:
+                    self.current_speed = 0
                 self.target_speed = speed
             if angle is not None:
                 self.target_angle = angle

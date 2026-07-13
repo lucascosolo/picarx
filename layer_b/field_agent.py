@@ -301,6 +301,7 @@ class FieldAgent:
         self.coach_steps = None
         self.coach_step_index = 0
         self.coach_step_until = 0.0
+        self.coach_motion_max = None   # peak scene_motion seen during the maneuver
         self.coach_action_started_at = 0.0
         self.last_coach_query_id_used = None
         self.last_coach_situation_key = None
@@ -344,7 +345,10 @@ class FieldAgent:
             return
         self.last_announcement_at = now
         print(f"Field Agent says: {text}")
-        self.bus.publish("picarx/audio/speak", {"text": text})
+        # ts lets audio_nodes drop announcements that sat in the playback
+        # queue too long - narrating a decision from 20 seconds ago while
+        # already doing something else is worse than staying quiet.
+        self.bus.publish("picarx/audio/speak", {"text": text, "ts": now})
 
     # ---------- inbound: world state ----------
 
@@ -638,6 +642,7 @@ class FieldAgent:
             self.coach_steps = steps
             self.coach_step_index = 0
             self.coach_step_until = now + steps[0]["duration"]
+            self.coach_motion_max = None
             self.coach_action_started_at = now
             self.last_coach_query_id_used = query_id
             self.last_coach_situation_key = payload.get("situation_key")
@@ -694,9 +699,24 @@ class FieldAgent:
         return f"{source} {maneuver}."
         # else: stale/unknown query id (already timed out or superseded) - ignore
 
+    def _episode_moved(self, steps, motion_max):
+        """Did the robot actually GO anywhere during a maneuver? "No veto"
+        alone is not success: pushing against something the sensors can't
+        see (table edge above the ultrasonic beam) never vetoes, so every
+        useless maneuver got recorded as a win, the bandit reinforced it,
+        and the robot proudly re-announced learned no-ops forever. Require
+        visual evidence of motion whenever the maneuver contains any
+        moving step. No vision signal at all -> benefit of the doubt."""
+        if steps and all(s["action"].get("direction") == "stop" for s in steps):
+            return True  # a pure hold-still maneuver is supposed to not move
+        if motion_max is None:
+            return True
+        return motion_max >= STUCK_MOTION_THRESHOLD
+
     def _finish_coach_episode(self, now):
         with self.lock:
-            succeeded = not any(t > self.coach_action_started_at for t in self.veto_events)
+            veto_free = not any(t > self.coach_action_started_at for t in self.veto_events)
+        succeeded = veto_free and self._episode_moved(self.coach_steps, self.coach_motion_max)
         query_id = self.last_coach_query_id_used
         situation_key = self.last_coach_situation_key
         self.coach_steps = None
@@ -766,11 +786,26 @@ class FieldAgent:
                 self.state_until = now + 0.25
                 self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
                 return
+            # Safe holding reflex while waiting: brief stop, ease back,
+            # then hold stop. The back-off is bounded WELL under the
+            # safety daemon's 2s continuous-reverse cap so the reflex
+            # itself never generates reverse-limit vetoes.
             if now < self.coach_action_started_at + 0.3:
                 self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
-            else:
+            elif now < self.coach_action_started_at + 1.8:
                 self.publish_intent({"direction": "backward", "speed": 25}, priority=COACH_PRIORITY)
+            else:
+                self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
             return
+
+        # Sample movement evidence while the maneuver runs (see
+        # _episode_moved - this is what tells a real escape apart from
+        # uselessly grinding against an unseen obstacle).
+        snap = self._snapshot() or {}
+        motion = (snap.get("objects") or {}).get("scene_motion")
+        if motion is not None:
+            self.coach_motion_max = motion if self.coach_motion_max is None \
+                else max(self.coach_motion_max, motion)
 
         # Run the suggested step sequence back to back: hold each step
         # until its duration elapses, then advance to the next; finish
