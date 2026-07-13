@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /home/picarx/layer_b/modules/field_agent.py
 """
-Field Agent (Layer B) - integration test harness.
+Field Agent (Layer B) - integration test harness / onboard brain.
 
 This is the first module that actually exercises the whole Layer B
 pipeline end to end instead of bypassing it:
@@ -11,28 +11,36 @@ pipeline end to end instead of bypassing it:
     safety daemon. This module never touches the safety socket for
     movement.
   - World knowledge comes from picarx/state/world, published by
-    world_state.py. This module does not re-derive it from raw
-    sensors.
+    world_state.py (including tracked/labeled objects from
+    vision_basic.py's object detector). This module does not
+    re-derive it from raw sensors.
   - "History" answers come from reading event_logger.py's SQLite
     database directly (read-only queries only - this module never
     writes to that DB, event_logger.py is the sole writer).
   - Speech in and out rides the existing picarx/audio/heard and
     picarx/audio/speak topics, same as your original modules.
+  - Novel objects and repeated-collision fail states are referred to
+    coach.py over picarx/coach/query - see "Coach integration" below.
 
 REQUIRES ALL OF THE FOLLOWING RUNNING FIRST:
   broker_client.py (fixed version, supports multi-topic subscribe)
   safety_daemon.py
   audio_nodes.py       (for STT input + TTS output)
   distance_sensor.py
-  vision_basic.py      (optional but recommended - enables face reports)
+  vision_basic.py      (required - face + labeled object tracking)
   arbiter.py           (required for exploration to actually move)
   world_state.py       (required for "what do you see" / exploration)
   event_logger.py      (required for "what have you done" / history)
+  coach.py             (optional - novelty/fail-state advice; field
+                        agent degrades gracefully to its own canned
+                        evasion behavior if it's not running or a
+                        query times out)
 
 Voice commands understood (see handle_voice_command):
   "explore" / "start"          -> begin autonomous wandering
   "stop" / "halt"               -> stop moving, cancel any intent
   "status" / "what do you see"  -> report current world state aloud
+  "objects" / "what's around"   -> list currently tracked objects
   "history" / "what have you done" / "what happened"
                                 -> summarize event log aloud
   "battery" / "charge" / "level" -> report battery voltage
@@ -40,6 +48,41 @@ Voice commands understood (see handle_voice_command):
 
 You can also just watch stdout - every decision this module makes is
 printed, not just spoken, so you can test without a working mic/speaker.
+
+---------------------------------------------------------------------
+Coach integration (novel situations + fail states)
+---------------------------------------------------------------------
+Two separate, independent triggers talk to coach.py over the bus:
+
+  1. Novel object ("watch" query, non-urgent): the first time
+     world_state reports an object label this module has never seen
+     before, it announces it and fires a non-blocking
+     picarx/coach/query. Exploration keeps running unaffected while
+     waiting; if/when picarx/coach/suggestion arrives with a matching
+     query_id, its action is applied for a bounded duration as a
+     one-off, then picarx/coach/outcome reports whether that window
+     stayed collision-free.
+
+  2. Repeated collision ("urgent" query, blocking): if the safety
+     daemon vetoes this module's own move intents VETO_FAIL_THRESHOLD
+     times within VETO_WINDOW seconds (the actual "keeps running into
+     an object it doesn't sense" failure mode - the vision/ultrasonic
+     obstacle checks below already try to prevent this, but this is
+     the backstop for whatever they miss), or the normal evasion
+     state machine has had to trigger EVASION_FAIL_THRESHOLD times
+     within EVASION_FAIL_WINDOW (a "stuck bouncing off the same
+     thing" pattern), this module treats it as a fail state: it holds
+     a safe reflex (stop, then a slow back-off) and fires a blocking
+     picarx/coach/query with a bounded timeout. If a suggestion
+     arrives in time, it's tried; whether or not it works (or the
+     query times out with no answer at all - no network, no API key,
+     coach.py not running), the canned evasion behavior is always the
+     fallback, so a working coach is never a safety dependency.
+
+Everything above involving actual motion is only ever *applied* while
+explore_mode is on; novelty detection/announcement itself runs
+continuously (see _perception_tick / run) since noticing things
+doesn't require driving anywhere.
 """
 import os
 import getpass
@@ -54,6 +97,8 @@ import json
 import time
 import random
 import threading
+import uuid
+from collections import deque
 
 SOURCE_NAME = "field_agent"
 
@@ -68,6 +113,45 @@ INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker
 
+# Evasion/coaching priorities - both outrank normal exploring (5), and
+# COACH_PRIORITY outranks the canned evasion sequence (8) too, since a
+# coach-directed maneuver during a fail state should win over whatever
+# the plain reflex would have done.
+EVADE_PRIORITY = 8
+COACH_PRIORITY = 9
+WATCH_PRIORITY = 6
+
+# A depth-sensor-free obstacle signal: world_state flags a tracked
+# object "approaching" if its bounding box is growing quickly while
+# centered in frame. Treated exactly like a close ultrasonic reading.
+def _vision_obstacle(snapshot):
+    if not snapshot:
+        return None
+    objects = snapshot.get("objects") or {}
+    if objects.get("stale", True):
+        return None
+    best = None
+    for obj in objects.get("items", []):
+        if obj.get("approaching") and (best is None or obj.get("area_ratio", 0) > best.get("area_ratio", 0)):
+            best = obj
+    return best
+
+
+def _prune_older_than(dq, window, now):
+    while dq and dq[0] < now - window:
+        dq.popleft()
+
+
+# ---- fail-state escalation tuning ----
+VETO_WINDOW = 4.0             # seconds
+VETO_FAIL_THRESHOLD = 3       # this many of OUR OWN vetoed intents in the window -> fail state
+EVASION_FAIL_WINDOW = 20.0    # seconds
+EVASION_FAIL_THRESHOLD = 3    # this many evasion triggers in the window -> fail state (stuck bouncing)
+
+COACH_URGENT_TIMEOUT = 3.0    # how long we'll hold a safe reflex waiting for advice
+COACH_WATCH_TIMEOUT = 5.0     # how long we'll wait on a non-blocking novelty query
+DEFAULT_COACH_DURATION = 1.5  # how long to follow a suggested action if it doesn't specify one
+
 
 class FieldAgent:
     def __init__(self):
@@ -77,20 +161,50 @@ class FieldAgent:
         self.explore_mode = False
         self.latest_world = None
         self.face_was_detected = False
+        self.known_object_labels = set()
 
         self.last_announcement_at = 0.0
         self.start_time = time.time()
 
-        # State machine for non-blocking obstacle evasion
-        self.state = "CRUISING"  # "CRUISING", "EVADING"
+        # State machine for non-blocking obstacle evasion / coaching.
+        # These fields are only ever mutated from explore_tick's
+        # thread (the run() loop) - bus callbacks only ever feed the
+        # lock-protected inboxes below, never touch state directly,
+        # so there's no cross-thread race on the state machine itself.
+        self.state = "CRUISING"  # "CRUISING", "EVADING", "COACHING"
         self.evade_stage = 0     # 0: stop, 1: reverse, 2: turn
         self.state_until = 0.0
+        self.evasion_fail_events = deque()
 
         # Wander state (mirrors the old reflex explorer's behavior,
         # now expressed as intents instead of direct socket calls)
         self.last_wander = time.time()
         self.wander_interval = random.uniform(5.0, 10.0)
         self.steering_active_until = 0
+
+        # Cross-thread inboxes (bus callbacks append, explore_tick/
+        # _perception_tick drain under self.lock).
+        self.veto_events = deque()
+        self.pending_novel_objects = deque()
+        self.pending_suggestions = deque()
+
+        # Urgent (blocking, fail-state) coach query bookkeeping.
+        self.coach_query_id = None
+        self.coach_query_deadline = 0.0
+        self.coach_action = None
+        self.coach_action_started_at = 0.0
+        self.coach_apply_until = 0.0
+        self.last_coach_query_id_used = None
+        self.last_coach_situation_key = None
+
+        # Non-blocking (novelty) coach query bookkeeping.
+        self.watch_query_id = None
+        self.watch_query_deadline = 0.0
+        self.watch_coach_action = None
+        self.watch_action_started_at = 0.0
+        self.watch_action_until = 0.0
+        self.watch_query_id_used = None
+        self.watch_situation_key = None
 
     # ---------- outbound: intents ----------
 
@@ -119,18 +233,48 @@ class FieldAgent:
     # ---------- inbound: world state ----------
 
     def on_world_state(self, payload):
+        novel = []
         with self.lock:
             self.latest_world = payload
             face = payload.get("face", {})
             detected = bool(face.get("detected")) and not face.get("stale", True)
-
-            if detected and not self.face_was_detected:
-                self.announce("I see a face.")
+            face_became_detected = detected and not self.face_was_detected
             self.face_was_detected = detected
+
+            objects = payload.get("objects", {})
+            if not objects.get("stale", True):
+                for obj in objects.get("items", []):
+                    label = obj.get("label")
+                    if label and label not in self.known_object_labels:
+                        self.known_object_labels.add(label)
+                        novel.append(obj)
+
+        if face_became_detected:
+            self.announce("I see a face.")
+        if novel:
+            with self.lock:
+                self.pending_novel_objects.extend(novel)
 
     def _snapshot(self):
         with self.lock:
             return dict(self.latest_world) if self.latest_world else None
+
+    # ---------- inbound: safety-daemon outcomes ----------
+
+    def on_action_result(self, payload):
+        if payload.get("source") != SOURCE_NAME:
+            return
+        result = payload.get("result") or {}
+        if result.get("status") != "vetoed":
+            return
+        with self.lock:
+            self.veto_events.append(time.time())
+
+    # ---------- inbound: coach ----------
+
+    def on_coach_suggestion(self, payload):
+        with self.lock:
+            self.pending_suggestions.append(payload)
 
     # ---------- inbound: voice ----------
 
@@ -162,6 +306,10 @@ class FieldAgent:
 
         if "history" in text or "what have you done" in text or "what happened" in text:
             self.report_history()
+            return
+
+        if "object" in text or "what's around" in text or "whats around" in text or "what do you notice" in text:
+            self.report_objects()
             return
 
         if "what do you see" in text or "status" in text or "report" in text:
@@ -203,11 +351,33 @@ class FieldAgent:
         else:
             parts.append("I don't have a fresh distance reading")
 
+        objects = snap.get("objects", {})
+        if not objects.get("stale", True) and objects.get("items"):
+            labels = [o.get("label", "something") for o in objects["items"]]
+            parts.append(f"I'm tracking {len(labels)} object{'s' if len(labels) != 1 else ''}: {', '.join(labels)}")
+
         battery = snap.get("battery", {})
         if battery.get("voltage") is not None:
             parts.append(f"my battery is at {battery['voltage']:.1f} volts")
 
         self.announce(". ".join(parts) + ".", force=True)
+
+    def report_objects(self):
+        snap = self._snapshot()
+        objects = snap.get("objects", {}) if snap else {}
+        if objects.get("stale", True) or not objects.get("items"):
+            self.announce("I don't see anything I can identify right now.", force=True)
+            return
+        items = objects["items"]
+        descriptions = []
+        for obj in items:
+            label = obj.get("label", "something")
+            age = time.time() - obj.get("first_seen", time.time())
+            if age < 3.0:
+                descriptions.append(f"a {label} I just noticed")
+            else:
+                descriptions.append(f"a {label} I've been tracking for a bit")
+        self.announce(f"I currently see {len(items)}: " + ", ".join(descriptions) + ".", force=True)
 
     def report_history(self):
         try:
@@ -266,22 +436,211 @@ class FieldAgent:
 
         self.announce(". ".join(parts) + ".", force=True)
 
+    # ---------- coach integration ----------
+
+    def _start_coach_query(self, situation, urgent, label=None, extra=None):
+        query_id = str(uuid.uuid4())
+        snap = self._snapshot() or {}
+        payload = {
+            "query_id": query_id,
+            "source": SOURCE_NAME,
+            "situation": situation,
+            "label": label,
+            "urgent": urgent,
+            "requested_at": time.time(),
+            "context": {
+                "distance_cm": snap.get("distance_cm"),
+                "distance_stale": snap.get("distance_stale", True),
+                "objects": snap.get("objects", {}).get("items", []),
+                "last_action": snap.get("last_action"),
+                "battery": snap.get("battery"),
+            },
+            "extra": extra or {},
+        }
+        now = time.time()
+        if urgent:
+            self.coach_query_id = query_id
+            self.coach_query_deadline = now + COACH_URGENT_TIMEOUT
+        else:
+            self.watch_query_id = query_id
+            self.watch_query_deadline = now + COACH_WATCH_TIMEOUT
+        print(f"Field Agent querying coach: situation={situation} label={label} urgent={urgent}")
+        self.bus.publish("picarx/coach/query", payload)
+
+    def _on_novel_object(self, obj):
+        label = obj.get("label", "something")
+        self.announce(f"I see something new - looks like a {label}.")
+        if self.watch_query_id is not None:
+            return  # already waiting on a novelty query, don't pile on
+        self._start_coach_query(situation="novel_object", urgent=False, label=label, extra={"object": obj})
+
+    def _apply_coach_suggestion(self, payload):
+        query_id = payload.get("query_id")
+        if not query_id:
+            return
+        action = payload.get("action")
+        duration = payload.get("duration") or DEFAULT_COACH_DURATION
+        rationale = payload.get("rationale")
+        cached = payload.get("cached")
+        now = time.time()
+
+        if query_id == self.coach_query_id:
+            self.coach_action = action
+            self.coach_action_started_at = now
+            self.coach_apply_until = now + duration
+            self.last_coach_query_id_used = query_id
+            self.last_coach_situation_key = payload.get("situation_key")
+            self.coach_query_id = None
+            print(f"Coach suggestion (urgent, cached={cached}): {action} - {rationale}")
+            self.announce("Trying something the coach suggested.")
+        elif query_id == self.watch_query_id:
+            self.watch_coach_action = action
+            self.watch_action_started_at = now
+            self.watch_action_until = now + duration
+            self.watch_query_id_used = query_id
+            self.watch_situation_key = payload.get("situation_key")
+            self.watch_query_id = None
+            print(f"Coach suggestion (watch, cached={cached}): {action} - {rationale}")
+        # else: stale/unknown query id (already timed out or superseded) - ignore
+
+    def _finish_coach_episode(self, now):
+        with self.lock:
+            succeeded = not any(t > self.coach_action_started_at for t in self.veto_events)
+        query_id = self.last_coach_query_id_used
+        situation_key = self.last_coach_situation_key
+        self.coach_action = None
+        self.state = "CRUISING"
+        self.last_wander = now
+        self.bus.publish("picarx/coach/outcome", {
+            "query_id": query_id,
+            "situation_key": situation_key,
+            "source": SOURCE_NAME,
+            "success": succeeded,
+        })
+        if succeeded:
+            self.announce("That worked.")
+        else:
+            self.announce("Still stuck, backing off the normal way.")
+            self.state = "EVADING"
+            self.evade_stage = 0
+            self.state_until = now + 0.25
+            self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+
+    def _finish_watch_episode(self):
+        with self.lock:
+            succeeded = not any(t > self.watch_action_started_at for t in self.veto_events)
+        self.bus.publish("picarx/coach/outcome", {
+            "query_id": self.watch_query_id_used,
+            "situation_key": self.watch_situation_key,
+            "source": SOURCE_NAME,
+            "success": succeeded,
+        })
+        self.watch_coach_action = None
+
+    def _handle_coaching_tick(self, now):
+        if self.coach_action is None:
+            # Still waiting on a reply - hold a safe reflex rather than
+            # doing nothing (or worse, drifting forward) while we wait.
+            if now > self.coach_query_deadline:
+                self.announce("No answer from the coach, handling it myself.")
+                self.coach_query_id = None
+                self.state = "EVADING"
+                self.evade_stage = 0
+                self.state_until = now + 0.25
+                self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+                return
+            if now < self.coach_action_started_at + 0.3:
+                self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
+            else:
+                self.publish_intent({"direction": "backward", "speed": 25}, priority=COACH_PRIORITY)
+            return
+
+        if now < self.coach_apply_until:
+            self.publish_intent(self.coach_action, priority=COACH_PRIORITY, ttl=0.6)
+            return
+
+        self._finish_coach_episode(now)
+
+    def _enter_collision_fail_state(self, reason):
+        now = time.time()
+        self.evasion_fail_events.append(now)
+        _prune_older_than(self.evasion_fail_events, EVASION_FAIL_WINDOW, now)
+        stuck_pattern = len(self.evasion_fail_events) >= EVASION_FAIL_THRESHOLD
+        with self.lock:
+            self.veto_events.clear()
+        self.state = "COACHING"
+        self.coach_action = None
+        self.coach_apply_until = 0.0
+        self.coach_action_started_at = now
+        self.announce("I keep running into something. Let me get some advice.", force=True)
+        self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
+        self._start_coach_query(
+            situation="collision_loop", urgent=True,
+            extra={"reason": reason, "stuck_pattern": stuck_pattern},
+        )
+
+    def _begin_evasion(self, reason):
+        now = time.time()
+        self.evasion_fail_events.append(now)
+        _prune_older_than(self.evasion_fail_events, EVASION_FAIL_WINDOW, now)
+        if len(self.evasion_fail_events) >= EVASION_FAIL_THRESHOLD:
+            self._enter_collision_fail_state(f"evasion_loop:{reason}")
+            return
+        self.state = "EVADING"
+        self.evade_stage = 0
+        self.state_until = now + 0.25
+        self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+
+    # ---------- perception (always runs, independent of explore_mode) ----------
+
+    def _perception_tick(self):
+        with self.lock:
+            novel = list(self.pending_novel_objects)
+            self.pending_novel_objects.clear()
+            suggestions = list(self.pending_suggestions)
+            self.pending_suggestions.clear()
+
+        for obj in novel:
+            self._on_novel_object(obj)
+        for payload in suggestions:
+            self._apply_coach_suggestion(payload)
+
     # ---------- exploration behavior ----------
 
     def explore_tick(self):
         now = time.time()
+
+        with self.lock:
+            _prune_older_than(self.veto_events, VETO_WINDOW, now)
+            veto_count = len(self.veto_events)
+
+        if self.state == "COACHING":
+            self._handle_coaching_tick(now)
+            return
+
+        if self.watch_coach_action is not None:
+            if now < self.watch_action_until:
+                self.publish_intent(self.watch_coach_action, priority=WATCH_PRIORITY, ttl=0.6)
+                return
+            self._finish_watch_episode()
+
+        if veto_count >= VETO_FAIL_THRESHOLD:
+            self._enter_collision_fail_state("repeated_veto")
+            return
+
         snap = self._snapshot()
         distance = snap.get("distance_cm") if snap else None
         distance_stale = snap.get("distance_stale", True) if snap else True
+        vision_obstacle = _vision_obstacle(snap)
 
         # --- Handle Evasion State Machine ---
         if self.state == "EVADING":
             if now < self.state_until:
                 # Continue executing current stage behavior
                 if self.evade_stage == 0:
-                    self.publish_intent({"direction": "stop"}, priority=8)
+                    self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 1:
-                    self.publish_intent({"direction": "backward", "speed": 30}, priority=8)
+                    self.publish_intent({"direction": "backward", "speed": 30}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 2:
                     # Maintain the turn angle chosen when entering this stage
                     pass
@@ -292,18 +651,27 @@ class FieldAgent:
                 if self.evade_stage == 1:
                     # Move backward for 1.2 seconds
                     self.state_until = now + 1.2
-                    self.publish_intent({"direction": "backward", "speed": 30}, priority=8)
+                    self.publish_intent({"direction": "backward", "speed": 30}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 2:
                     # Choose random direction to pivot away for 0.6 seconds
                     angle = random.choice([-30, 30])
                     self.state_until = now + 0.6
-                    self.publish_intent({"direction": "turn", "angle": angle}, priority=8)
+                    self.publish_intent({"direction": "turn", "angle": angle}, priority=EVADE_PRIORITY)
                 else:
                     # Evasion complete, clean slate
-                    self.publish_intent({"direction": "turn", "angle": 0}, priority=8)
+                    self.publish_intent({"direction": "turn", "angle": 0}, priority=EVADE_PRIORITY)
                     self.state = "CRUISING"
                     self.last_wander = now
                 return
+
+        # --- Handle a vision-flagged approaching object (covers the
+        # ultrasonic's blind spots - this is the fix for driving
+        # straight into things the distance sensor never saw) ---
+        if vision_obstacle is not None:
+            label = vision_obstacle.get("label", "something")
+            self.announce(f"A {label} is closing in, backing away.")
+            self._begin_evasion("vision")
+            return
 
         # --- Handle Trustworthiness of Sensor Data ---
         if distance is None or distance_stale or distance < 0:
@@ -314,10 +682,7 @@ class FieldAgent:
         # --- Handle New Obstacle Detection ---
         if distance < OBSTACLE_DISTANCE_CM:
             self.announce("Obstacle ahead, backing away.")
-            self.state = "EVADING"
-            self.evade_stage = 0
-            self.state_until = now + 0.25  # Quick stop window
-            self.publish_intent({"direction": "stop"}, priority=8)
+            self._begin_evasion("ultrasonic")
             return
 
         # --- Handle Timed Steering Reset during standard wander ---
@@ -344,12 +709,15 @@ class FieldAgent:
     def run(self):
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
+        self.bus.subscribe("picarx/action/result", self.on_action_result)
+        self.bus.subscribe("picarx/coach/suggestion", self.on_coach_suggestion)
 
-        print("Field Agent active. Say 'explore', 'stop', 'status', 'history', or 'battery'.")
+        print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online.", force=True)
 
         period = 1.0 / EXPLORE_TICK_HZ
         while True:
+            self._perception_tick()
             if self.explore_mode:
                 self.explore_tick()
             time.sleep(period)

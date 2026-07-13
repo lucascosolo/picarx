@@ -5,5 +5,6 @@
   {"name": "arbiter", "version": "0.1", "entrypoint": "arbiter.py", "enabled": true},
   {"name": "world_state", "version": "0.1", "entrypoint": "world_state.py", "enabled": true},
   {"name": "event_logger", "version": "0.1", "entrypoint": "event_logger.py", "enabled": true},
+  {"name": "coach", "version": "0.1", "entrypoint": "coach.py", "enabled": true},
   {"name": "field_agent", "version": "0.1", "entrypoint": "field_agent.py", "enabled": true}
 ]

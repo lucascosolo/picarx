@@ -19,6 +19,7 @@ that:
 
 Inputs (subscribed):
   picarx/vision/faces     - from vision_basic.py
+  picarx/vision/objects   - from vision_basic.py (tracked/labeled objects)
   picarx/sensors/distance - from distance_sensor.py
   picarx/audio/heard      - from audio_nodes.py
   picarx/action/result    - from arbiter.py
@@ -41,6 +42,13 @@ Output (published):
     },
     "distance_cm": <float or None>,
     "distance_stale": bool,
+    "objects": {
+        "items": [ {"id", "label", "confidence", "x","y","w","h",
+                    "frame_width", "frame_height", "area_ratio",
+                    "center_offset", "first_seen", "last_seen",
+                    "approach_rate", "approaching"}, ... ],
+        "stale": bool
+    },
     "battery": {
         "voltage": <float or None>,
         "low": bool,
@@ -87,9 +95,19 @@ BATTERY_POLL_INTERVAL = 5.0
 STALE_AFTER = {
     "face": 2.0,
     "distance": 2.0,
+    "objects": 2.0,
     "heard": 15.0,
     "battery": 20.0,
 }
+
+# An object counts as "approaching" once its bounding-box area grows
+# this fraction of the frame per second while sitting within the
+# center portion of the frame - a depth-sensor-free stand-in for
+# "something is closing in on us," used to catch obstacles the
+# ultrasonic sensor's narrow cone misses entirely.
+APPROACH_RATE_THRESHOLD = 0.12  # area_ratio growth per second
+APPROACH_CENTER_FRACTION = 0.5  # |center_offset| must be within this
+                                 # fraction of half the frame width
 
 
 class WorldState:
@@ -101,6 +119,8 @@ class WorldState:
             "face": {"detected": False, "updated_at": None},
             "distance_cm": None,
             "distance_updated_at": None,
+            "objects": {},  # id -> tracked object record (see on_objects)
+            "objects_updated_at": None,
             "battery": {"voltage": None, "low": False, "critical": False, "updated_at": None},
             "last_heard": {"text": None, "updated_at": None},
             "last_action": {"source": None, "action": None, "result": None, "updated_at": None},
@@ -116,6 +136,31 @@ class WorldState:
         with self.lock:
             self.state["distance_cm"] = payload.get("distance_cm")
             self.state["distance_updated_at"] = time.time()
+
+    def on_objects(self, payload):
+        now = time.time()
+        with self.lock:
+            existing = self.state["objects"]
+            updated = {}
+            for obj in payload.get("objects", []):
+                tid = obj["id"]
+                prev = existing.get(tid)
+                approach_rate = 0.0
+                if prev is not None:
+                    dt = now - prev["_ts"]
+                    if dt > 0:
+                        approach_rate = (obj["area_ratio"] - prev["area_ratio"]) / dt
+                record = dict(obj)
+                record["approach_rate"] = approach_rate
+                record["approaching"] = (
+                    approach_rate > APPROACH_RATE_THRESHOLD
+                    and abs(obj.get("center_offset", 0)) <
+                        (obj.get("frame_width", 1) / 2.0) * APPROACH_CENTER_FRACTION
+                )
+                record["_ts"] = now
+                updated[tid] = record
+            self.state["objects"] = updated
+            self.state["objects_updated_at"] = now
 
     def on_heard(self, payload):
         with self.lock:
@@ -173,6 +218,8 @@ class WorldState:
             face = dict(self.state["face"])
             distance_cm = self.state["distance_cm"]
             distance_updated_at = self.state["distance_updated_at"]
+            objects = {tid: dict(obj) for tid, obj in self.state["objects"].items()}
+            objects_updated_at = self.state["objects_updated_at"]
             battery = dict(self.state["battery"])
             heard = dict(self.state["last_heard"])
             last_action = dict(self.state["last_action"])
@@ -185,6 +232,13 @@ class WorldState:
             },
             "distance_cm": distance_cm,
             "distance_stale": self._is_stale(distance_updated_at, "distance"),
+            "objects": {
+                "items": [
+                    {k: v for k, v in obj.items() if k != "_ts"}
+                    for obj in objects.values()
+                ],
+                "stale": self._is_stale(objects_updated_at, "objects"),
+            },
             "battery": {
                 **battery,
                 "stale": self._is_stale(battery.get("updated_at"), "battery"),
@@ -200,6 +254,7 @@ class WorldState:
 
     def run(self):
         self.bus.subscribe("picarx/vision/faces", self.on_face)
+        self.bus.subscribe("picarx/vision/objects", self.on_objects)
         self.bus.subscribe("picarx/sensors/distance", self.on_distance)
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
