@@ -15,7 +15,15 @@
     {
       "role": "assistant",
       "content": "I'm PiCar, your friendly little rolling buddy! Right now I've got a couple bottles in my sights and clear road ahead."
+    },
+    {
+      "role": "user",
+      "content": "how would you today"
+    },
+    {
+      "role": "assistant",
+      "content": "Doing great, thanks for asking - battery's sitting pretty at 8.3 volts, so I've got plenty of juice in me today. Nobody's in front of my cameras right now though, kinda quiet out here."
     }
   ],
-  "last_turn_at": 1783948606.0289469
+  "last_turn_at": 1783949929.924271
 }
