@@ -1,0 +1,9 @@
+[
+  {"name": "vision_basic", "version": "0.1", "entrypoint": "vision_basic.py", "enabled": true},
+  {"name": "distance_sensor", "version": "0.1", "entrypoint": "distance_sensor.py", "enabled": true},
+  {"name": "audio_nodes", "version": "0.1", "entrypoint": "audio_nodes.py", "enabled": true},
+  {"name": "arbiter", "version": "0.1", "entrypoint": "arbiter.py", "enabled": true},
+  {"name": "world_state", "version": "0.1", "entrypoint": "world_state.py", "enabled": true},
+  {"name": "event_logger", "version": "0.1", "entrypoint": "event_logger.py", "enabled": true},
+  {"name": "field_agent", "version": "0.1", "entrypoint": "field_agent.py", "enabled": true}
+]
