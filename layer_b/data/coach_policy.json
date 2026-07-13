@@ -1,0 +1,73 @@
+{
+  "novel_object:bottle": {
+    "arms": {
+      "{\"action\": {\"angle\": -25, \"direction\": \"turn\"}, \"duration\": 0.8}": {
+        "action": {
+          "direction": "turn",
+          "angle": -25
+        },
+        "duration": 0.8,
+        "rationale": "Reorient away from stationary bottle obstacle ahead",
+        "successes": 0,
+        "failures": 0,
+        "last_updated": 1783919660.0742557
+      },
+      "{\"action\": {\"direction\": \"backward\", \"speed\": 20}, \"duration\": 0.5}": {
+        "action": {
+          "direction": "backward",
+          "speed": 20
+        },
+        "duration": 0.5,
+        "rationale": "Back away from novel bottle object to increase safety distance.",
+        "successes": 0,
+        "failures": 0,
+        "last_updated": 1783919765.6127331
+      }
+    }
+  },
+  "novel_object:car": {
+    "arms": {
+      "{\"action\": {\"direction\": \"backward\", \"speed\": 20}, \"duration\": 1.5}": {
+        "action": {
+          "direction": "backward",
+          "speed": 20
+        },
+        "duration": 1.5,
+        "rationale": "Create distance from novel large object filling frame; reassess once clear",
+        "successes": 0,
+        "failures": 0,
+        "last_updated": 1783919833.0659397
+      }
+    }
+  },
+  "novel_object:person": {
+    "arms": {
+      "{\"action\": {\"direction\": \"backward\", \"speed\": 15}, \"duration\": 1.2}": {
+        "action": {
+          "direction": "backward",
+          "speed": 15
+        },
+        "duration": 1.2,
+        "rationale": "Person detected ahead at 1.5m. Back away to safe distance.",
+        "successes": 0,
+        "failures": 0,
+        "last_updated": 1783919860.6753666
+      }
+    }
+  },
+  "novel_object:sofa": {
+    "arms": {
+      "{\"action\": {\"direction\": \"backward\", \"speed\": 20}, \"duration\": 0.8}": {
+        "action": {
+          "direction": "backward",
+          "speed": 20
+        },
+        "duration": 0.8,
+        "rationale": "Create distance from novel large object; assess from safer range",
+        "successes": 0,
+        "failures": 0,
+        "last_updated": 1783919874.0493207
+      }
+    }
+  }
+}

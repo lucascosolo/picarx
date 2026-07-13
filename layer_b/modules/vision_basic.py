@@ -230,7 +230,10 @@ def run():
                 if class_id <= 0 or class_id >= len(VOC_CLASSES):
                     continue
                 box = detections[0, 0, i, 3:7] * [frame_w, frame_h, frame_w, frame_h]
-                x1, y1, x2, y2 = box.astype(int)
+                # int(...) here, not just .astype(int): numpy int64 scalars
+                # aren't JSON-serializable, and json.dumps() would otherwise
+                # blow up the instant any object is actually detected.
+                x1, y1, x2, y2 = (int(v) for v in box.astype(int))
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(frame_w, x2), min(frame_h, y2)
                 if x2 <= x1 or y2 <= y1:

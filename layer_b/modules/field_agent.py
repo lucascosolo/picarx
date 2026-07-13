@@ -46,6 +46,14 @@ Voice commands understood (see handle_voice_command):
   "battery" / "charge" / "level" -> report battery voltage
   "hello" / "hi"                 -> greet
 
+Anything that doesn't match one of the above only gets forwarded for
+free-form conversation (via picarx/audio/unhandled, to companion.py,
+if running) when it starts with a wake phrase - see WAKE_PHRASES
+below, e.g. "hey pi, what do you think of the weather". Without a
+wake phrase it's just dropped (and printed to stdout), so STT
+mis-hearing background noise doesn't burn an API call on every false
+transcription. Hard commands above are unaffected either way.
+
 You can also just watch stdout - every decision this module makes is
 printed, not just spoken, so you can test without a working mic/speaker.
 
@@ -94,6 +102,7 @@ from broker_client import Bus
 
 import sqlite3
 import json
+import re
 import time
 import random
 import threading
@@ -109,6 +118,14 @@ DB_PATH = "/home/picarx/layer_b/data/events.db"
 EXPLORE_PRIORITY = 5
 EXPLORE_TICK_HZ = 5
 INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
+
+# STT will constantly transcribe background noise/TV/conversation into
+# text; without a wake phrase, every one of those would silently burn
+# an Anthropic API call in companion.py. Only utterances that start
+# with one of these get forwarded to the LLM chat fallback at all -
+# hard commands (explore/stop/etc.) are unaffected and still work
+# with or without a wake phrase, since they're matched earlier above.
+WAKE_PHRASES = ("robot", "hey robot", "computer")
 
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker
@@ -316,9 +333,28 @@ class FieldAgent:
             self.report_status()
             return
 
-        if "hello" in text or "hi" in text:
+        if "hello" in text or re.search(r"\bhi\b", text):
             self.announce("Hello! I am ready to chat and explore.", force=True)
             return
+
+        # Nothing above matched a hard command. Only forward to the LLM
+        # chat fallback if a wake phrase was used (see WAKE_PHRASES) -
+        # anything else is dropped, but still printed so you can see
+        # what got heard and tune the wake phrases if something real
+        # is being missed.
+        remainder = self._strip_wake_phrase(text)
+        if remainder is not None:
+            self.bus.publish("picarx/audio/unhandled", {"text": remainder})
+        else:
+            print(f"(no wake phrase, not forwarding to chat): '{text}'")
+
+    @staticmethod
+    def _strip_wake_phrase(text):
+        for phrase in WAKE_PHRASES:
+            if text.startswith(phrase):
+                remainder = text[len(phrase):].strip(" ,.:;-")
+                return remainder if remainder else "hello"
+        return None
 
     # ---------- spoken reports ----------
 

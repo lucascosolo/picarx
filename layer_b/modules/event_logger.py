@@ -23,6 +23,15 @@ What gets logged, and why each is handled differently:
                            and whether the safety layer allowed or
                            vetoed it - the core "what happened" trail.
 
+  picarx/coach/episode  - logged immediately, every message. One row
+                           per completed coach query: the situation,
+                           the action tried (cached arm or fresh LLM
+                           suggestion), and whether it succeeded. This
+                           is the actual inspectable training history
+                           behind coach.py's policy cache - the cache
+                           itself only keeps aggregate counts, this is
+                           the full record of every episode that fed it.
+
   picarx/state/world    - NOT logged on every publish (it's emitted
                            at PUBLISH_HZ from world_state.py, which
                            would flood the database with near-duplicate
@@ -117,6 +126,9 @@ class EventLogger:
     def on_action_result(self, payload):
         self.log_event("picarx/action/result", payload)
 
+    def on_coach_episode(self, payload):
+        self.log_event("picarx/coach/episode", payload)
+
     def on_world_state(self, payload):
         # Always keep the freshest snapshot around for the timer loop
         # to write out on its own schedule.
@@ -154,6 +166,7 @@ class EventLogger:
     def run(self):
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
+        self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 
         threading.Thread(target=self.snapshot_loop, daemon=True).start()

@@ -12,7 +12,11 @@ import json
 import subprocess
 from vosk import Model, KaldiRecognizer
 
-MODEL_PATH = "/home/picarx/layer_b/modules/models/model-en"
+# Upgraded from the original small model ("model-en", still present on
+# disk for rollback) to Vosk's lgraph model: same engine/pipeline, a
+# meaningfully more accurate decoding graph, and still light enough to
+# run in real time on a Pi (unlike Vosk's full ~1.8GB server model).
+MODEL_PATH = "/home/picarx/layer_b/modules/models/model-en-lgraph"
 
 class AudioNode:
     def __init__(self):
@@ -39,10 +43,10 @@ class AudioNode:
     # off to PulseAudio) and target the physical sound card directly.
     # A systemd service has no PulseAudio session to connect to, so
     # anything routed through "default" silently fails there even
-    # though it works fine from an interactive login shell. Set this
-    # to match your actual output device from `aplay -l`, e.g.
-    # "plughw:0,0" or "plughw:1,0".
-    AUDIO_OUT_DEVICE = "plughw:1,0" 
+    # though it works fine from an interactive login shell. Card index
+    # from `aplay -l`: card 0 is the HifiBerry DAC HAT (the real
+    # speaker output); cards 2/3 are just the Pi's HDMI outputs.
+    AUDIO_OUT_DEVICE = "plughw:0,0"
 
     def speak(self, text):
         print(f"PiCar Speaking: {text}")
@@ -71,10 +75,11 @@ class AudioNode:
         print("Audio node running: starting ALSA audio stream...")
         self.speak("Systems initialized. Voice control active.")
         
-        # Use arecord with plughw to automatically resample the USB mic to 16000Hz
+        # Use arecord with plughw to automatically resample the USB mic to 16000Hz.
+        # Card index from `arecord -l`: card 1 is the USB PnP Sound Device (the mic).
         cmd = [
             "arecord",
-            "-D", "plughw:2,0",
+            "-D", "plughw:1,0",
             "-f", "S16_LE",
             "-c", "1",
             "-r", "16000",
@@ -89,6 +94,7 @@ class AudioNode:
             # Read 4000 bytes at a time from the arecord output
             data = process.stdout.read(4000)
             if len(data) == 0:
+                print("Audio node: arecord produced no data (device open failure or process exit) - STT is now dead until this module restarts")
                 break
                 
             if self.rec.AcceptWaveform(data):

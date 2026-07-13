@@ -25,19 +25,34 @@ Local policy cache (the "training data")
 -----------------------------------------
 Every situation collapses to a coarse situation_key (e.g.
 "novel_object:bottle" or "collision_loop:repeated_veto"). Each key
-tracks an action plus how many times it's succeeded/failed when
-actually tried:
+tracks a small set of candidate actions ("arms", after multi-armed
+bandit terminology) it has actually tried, each with its own
+success/failure record:
 
-  - A confident cache hit (enough successes, high enough success
-    rate - see MIN_SUCCESSES/SUCCESS_RATE_THRESHOLD) is served
-    immediately, with no LLM call at all - a suggestion that worked
-    before IS the training signal that produces better behavior later,
-    exactly by skipping the trip back out to the model once the robot
-    already knows what to do.
-  - Anything else (novel situation, or a cached action that hasn't
-    proven itself yet) goes to the Anthropic API for a fresh
-    suggestion, which becomes a new/updated (unproven) cache entry
-    that starts earning its own success/failure record from here on.
+  - A brand new situation, or one with fewer than MIN_ARMS_BEFORE_EXPLOIT
+    tried arms, always goes to the Anthropic API for a fresh suggestion,
+    which becomes a new arm starting its own 0/0 record.
+  - Otherwise, most of the time (1 - NEW_ARM_EXPLORE_RATE) this module
+    exploits what it already knows: it scores every existing arm with a
+    UCB1 bonus (success rate + an uncertainty bonus that favors
+    under-tried arms) and serves the best one, with NO LLM call at all.
+    A suggestion that worked before IS the training signal that
+    produces better behavior later, by skipping the trip back out to
+    the model once the robot already knows a good answer for this
+    situation.
+  - The rest of the time (NEW_ARM_EXPLORE_RATE, capped once a
+    situation has MAX_ARMS_PER_SITUATION arms) it still asks the LLM
+    for a fresh candidate even though it already has a working answer -
+    this is deliberate: without ever exploring, the first action that
+    happens to work twice gets frozen in forever, even if a better one
+    exists. This is a real (if small) multi-armed bandit, not just a
+    frozen lookup table.
+
+Every completed query (chosen arm, whether it came from the cache or
+a fresh LLM call, and the eventual success/failure) is also published
+on picarx/coach/episode, which event_logger.py persists to the shared
+events DB - so the full history of what was tried and how it went is
+actually inspectable later, not just collapsed into a counter.
 
 The cache is persisted to disk (COACH_POLICY_PATH) so it survives
 restarts - restarting the robot should not erase what it already
@@ -59,6 +74,8 @@ sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 
 import json
+import math
+import random
 import time
 import threading
 import queue
@@ -66,8 +83,10 @@ import queue
 DATA_DIR = "/home/picarx/layer_b/data"
 COACH_POLICY_PATH = f"{DATA_DIR}/coach_policy.json"
 
-MIN_SUCCESSES = 2          # need at least this many confirmed successes...
-SUCCESS_RATE_THRESHOLD = 0.66   # ...and this success rate to trust the cache blindly
+MIN_ARMS_BEFORE_EXPLOIT = 2   # always ask the LLM until a situation has this many tried arms
+MAX_ARMS_PER_SITUATION = 4    # stop growing new arms past this many
+NEW_ARM_EXPLORE_RATE = 0.2    # even once past MIN_ARMS_BEFORE_EXPLOIT, try something new this often
+UCB_C = 1.4                   # exploration bonus weight (classic UCB1 uses sqrt(2) ~= 1.41)
 
 WORKER_THREADS = 2          # query handling runs off the MQTT callback thread
 
@@ -107,6 +126,10 @@ class Coach:
         self.bus = Bus()
         self.lock = threading.Lock()
         self.policy = self._load_policy()
+        # query_id -> in-flight episode bookkeeping (in-memory only; if
+        # coach.py restarts mid-episode, that one episode's outcome is
+        # simply never recorded - the persisted policy itself is safe).
+        self.pending_queries = {}
         self.work_queue = queue.Queue()
         self._client = None
         self._warned_no_key = False
@@ -116,12 +139,19 @@ class Coach:
     def _load_policy(self):
         try:
             with open(COACH_POLICY_PATH) as f:
-                return json.load(f)
+                raw = json.load(f)
         except FileNotFoundError:
             return {}
         except (json.JSONDecodeError, OSError) as e:
             print(f"Coach: failed to load policy cache, starting fresh: {e}")
             return {}
+        policy = {}
+        for key, entry in raw.items():
+            if isinstance(entry, dict) and "arms" in entry:
+                policy[key] = entry
+            else:
+                print(f"Coach: dropping legacy-format policy entry for {key} (pre-bandit cache schema)")
+        return policy
 
     def _save_policy(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -141,9 +171,30 @@ class Coach:
         return f"{situation}:{reason}"
 
     @staticmethod
-    def _success_rate(entry):
-        attempts = entry["successes"] + entry["failures"]
-        return entry["successes"] / attempts if attempts else 0.0
+    def _arm_signature(action, duration):
+        return json.dumps({"action": action, "duration": round(duration, 1)}, sort_keys=True)
+
+    def _select_arm(self, situation_key):
+        """Returns an arm signature to exploit, or None to signal 'ask the LLM'."""
+        entry = self.policy.get(situation_key)
+        arms = entry["arms"] if entry else {}
+        if not arms or len(arms) < MIN_ARMS_BEFORE_EXPLOIT:
+            return None
+        if len(arms) < MAX_ARMS_PER_SITUATION and random.random() < NEW_ARM_EXPLORE_RATE:
+            return None
+
+        total_pulls = sum(a["successes"] + a["failures"] for a in arms.values())
+        best_sig, best_score = None, -1.0
+        for sig, arm in arms.items():
+            pulls = arm["successes"] + arm["failures"]
+            if pulls == 0:
+                score = float("inf")  # never-resolved arm - try it before trusting anything else
+            else:
+                rate = arm["successes"] / pulls
+                score = rate + UCB_C * math.sqrt(math.log(total_pulls + 1) / pulls)
+            if score > best_score:
+                best_score, best_sig = score, sig
+        return best_sig
 
     # ---------- Anthropic call ----------
 
@@ -230,71 +281,96 @@ class Coach:
         situation_key = self._situation_key(payload)
 
         with self.lock:
-            entry = self.policy.get(situation_key)
-            use_cached = (
-                entry is not None
-                and entry["successes"] >= MIN_SUCCESSES
-                and self._success_rate(entry) >= SUCCESS_RATE_THRESHOLD
-            )
-            cached_action = dict(entry) if (use_cached and entry) else None
+            arm_sig = self._select_arm(situation_key)
+            chosen_arm = dict(self.policy[situation_key]["arms"][arm_sig]) if arm_sig else None
 
-        if cached_action:
-            print(f"Coach: serving cached policy for {situation_key} (no LLM call)")
-            self.bus.publish("picarx/coach/suggestion", {
-                "query_id": query_id,
-                "situation_key": situation_key,
-                "action": cached_action["action"],
-                "duration": cached_action["duration"],
-                "rationale": cached_action.get("last_rationale", "known-good response"),
-                "cached": True,
-            })
+        if chosen_arm is not None:
+            print(f"Coach: exploiting learned arm for {situation_key} (no LLM call)")
+            self._dispatch_suggestion(
+                query_id, situation_key, arm_sig, chosen_arm["action"], chosen_arm["duration"],
+                chosen_arm.get("rationale", "known-good response"), cached=True, query_payload=payload,
+            )
             return
 
         result = self._query_llm(payload, situation_key)
         if result is None:
-            print(f"Coach: no suggestion available for {situation_key} (no key/cache/response)")
+            print(f"Coach: no suggestion available for {situation_key} (no key/response, no learned arm yet)")
             return
 
         action, duration, rationale = result
+        arm_sig = self._arm_signature(action, duration)
         now = time.time()
         with self.lock:
-            existing = self.policy.get(situation_key, {"successes": 0, "failures": 0})
-            self.policy[situation_key] = {
-                "action": action,
-                "duration": duration,
-                "last_rationale": rationale,
-                "successes": existing["successes"],
-                "failures": existing["failures"],
-                "last_updated": now,
-            }
+            entry = self.policy.setdefault(situation_key, {"arms": {}})
+            arm = entry["arms"].setdefault(arm_sig, {
+                "action": action, "duration": duration, "rationale": rationale,
+                "successes": 0, "failures": 0, "last_updated": now,
+            })
+            arm["rationale"] = rationale
+            arm["last_updated"] = now
         self._save_policy()
 
+        self._dispatch_suggestion(query_id, situation_key, arm_sig, action, duration, rationale,
+                                   cached=False, query_payload=payload)
+
+    def _dispatch_suggestion(self, query_id, situation_key, arm_sig, action, duration, rationale, cached, query_payload):
+        with self.lock:
+            self.pending_queries[query_id] = {
+                "situation_key": situation_key,
+                "arm_sig": arm_sig,
+                "action": action,
+                "duration": duration,
+                "rationale": rationale,
+                "cached": cached,
+                "query_payload": query_payload,
+                "issued_at": time.time(),
+            }
         self.bus.publish("picarx/coach/suggestion", {
             "query_id": query_id,
             "situation_key": situation_key,
             "action": action,
             "duration": duration,
             "rationale": rationale,
-            "cached": False,
+            "cached": cached,
         })
 
     # ---------- inbound: outcomes ----------
 
     def on_outcome(self, payload):
+        query_id = payload.get("query_id")
         situation_key = payload.get("situation_key")
-        if not situation_key:
-            return
+        success = bool(payload.get("success"))
+
         with self.lock:
-            entry = self.policy.get(situation_key)
-            if entry is None:
-                return
-            if payload.get("success"):
-                entry["successes"] += 1
-            else:
-                entry["failures"] += 1
-            entry["last_updated"] = time.time()
-        print(f"Coach: recorded {'success' if payload.get('success') else 'failure'} for {situation_key}")
+            pending = self.pending_queries.pop(query_id, None)
+            if pending is None or pending["situation_key"] != situation_key:
+                return  # stale/unknown episode (e.g. coach restarted mid-episode) - nothing to update
+            entry = self.policy.setdefault(situation_key, {"arms": {}})
+            arm = entry["arms"].get(pending["arm_sig"])
+            if arm is not None:
+                if success:
+                    arm["successes"] += 1
+                else:
+                    arm["failures"] += 1
+                arm["last_updated"] = time.time()
         self._save_policy()
+        print(f"Coach: recorded {'success' if success else 'failure'} for {situation_key}")
+
+        query_payload = pending["query_payload"]
+        self.bus.publish("picarx/coach/episode", {
+            "query_id": query_id,
+            "situation_key": situation_key,
+            "situation": query_payload.get("situation"),
+            "label": query_payload.get("label"),
+            "context": query_payload.get("context"),
+            "action": pending["action"],
+            "duration": pending["duration"],
+            "rationale": pending["rationale"],
+            "cached": pending["cached"],
+            "success": success,
+            "issued_at": pending["issued_at"],
+            "finished_at": time.time(),
+        })
 
     # ---------- worker pool ----------
 
