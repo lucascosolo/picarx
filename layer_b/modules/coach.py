@@ -88,6 +88,18 @@ MAX_ARMS_PER_SITUATION = 4    # stop growing new arms past this many
 NEW_ARM_EXPLORE_RATE = 0.2    # even once past MIN_ARMS_BEFORE_EXPLOIT, try something new this often
 UCB_C = 1.4                   # exploration bonus weight (classic UCB1 uses sqrt(2) ~= 1.41)
 
+# Arm retirement: UCB1's uncertainty bonus keeps periodically re-picking
+# an arm even after it has clearly proven bad (observed in the field - a
+# turn arm that went 0/3 in collision_loop:repeated_veto while its
+# siblings were ~7/2, yet kept getting re-explored and burning a real
+# movement cycle each time). Once an arm has failed enough times with a
+# low enough success rate, retire it - BUT only when doing so still
+# leaves at least MIN_ARMS_BEFORE_EXPLOIT arms, so pruning a dead action
+# frees a slot for a fresh candidate instead of forcing an immediate
+# (paid) LLM call. The full episode history survives in events.db.
+RETIRE_MIN_FAILURES = 3        # need at least this many failures to consider retiring
+RETIRE_MAX_SUCCESS_RATE = 0.2  # ...and a success rate at or below this
+
 WORKER_THREADS = 2          # query handling runs off the MQTT callback thread
 
 DEFAULT_SPEED = 25
@@ -195,6 +207,25 @@ class Coach:
             if score > best_score:
                 best_score, best_sig = score, sig
         return best_sig
+
+    def _maybe_retire_arm(self, entry, arm_sig):
+        """Drop a consistently-failing arm so UCB1 stops re-exploring it,
+        but only when enough arms remain that no fresh LLM call is forced.
+        Caller must hold self.lock. See RETIRE_* constants."""
+        arms = entry["arms"]
+        arm = arms.get(arm_sig)
+        if arm is None:
+            return
+        pulls = arm["successes"] + arm["failures"]
+        if arm["failures"] < RETIRE_MIN_FAILURES:
+            return
+        if pulls == 0 or (arm["successes"] / pulls) > RETIRE_MAX_SUCCESS_RATE:
+            return
+        if len(arms) - 1 < MIN_ARMS_BEFORE_EXPLOIT:
+            return  # retiring would drop below the exploit floor and force a paid LLM call
+        del arms[arm_sig]
+        print(f"Coach: retired persistently-failing arm ({arm['successes']}/{arm['failures']}) "
+              f"for a situation - freeing a slot for a fresh candidate")
 
     # ---------- Anthropic call ----------
 
@@ -352,6 +383,7 @@ class Coach:
                     arm["successes"] += 1
                 else:
                     arm["failures"] += 1
+                    self._maybe_retire_arm(entry, pending["arm_sig"])
                 arm["last_updated"] = time.time()
         self._save_policy()
         print(f"Coach: recorded {'success' if success else 'failure'} for {situation_key}")

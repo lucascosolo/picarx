@@ -148,9 +148,9 @@
         },
         "duration": 1.5,
         "rationale": "Battery critical. Reverse away from cliff edge detected ahead.",
-        "successes": 7,
+        "successes": 8,
         "failures": 2,
-        "last_updated": 1783953145.585496
+        "last_updated": 1783953565.5200655
       },
       "{\"action\": {\"angle\": -25, \"direction\": \"turn\"}, \"duration\": 1.2}": {
         "action": {
@@ -159,9 +159,9 @@
         },
         "duration": 1.2,
         "rationale": "Rotate left to escape repeated backward veto; reorient away from cliff edge.",
-        "successes": 7,
+        "successes": 8,
         "failures": 2,
-        "last_updated": 1783953155.013229
+        "last_updated": 1783953576.3487663
       },
       "{\"action\": {\"angle\": -30, \"direction\": \"turn\"}, \"duration\": 0.5}": {
         "action": {
@@ -181,9 +181,9 @@
         },
         "duration": 0.8,
         "rationale": "Reverse away from cliff edge, reset forward approach",
-        "successes": 6,
+        "successes": 8,
         "failures": 2,
-        "last_updated": 1783953020.0406072
+        "last_updated": 1783953585.3726192
       }
     }
   },
@@ -274,9 +274,9 @@
         },
         "duration": 1.2,
         "rationale": "Create distance from dining table, reassess with fresh sensor data",
-        "successes": 0,
+        "successes": 1,
         "failures": 0,
-        "last_updated": 1783923031.487344
+        "last_updated": 1783953574.3436894
       },
       "{\"action\": {\"direction\": \"backward\", \"speed\": 15}, \"duration\": 0.8}": {
         "action": {
