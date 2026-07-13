@@ -245,7 +245,7 @@ class AudioNode:
     # though it works fine from an interactive login shell. Card index
     # from `aplay -l`: card 0 is the HifiBerry DAC HAT (the real
     # speaker output); cards 2/3 are just the Pi's HDMI outputs.
-    AUDIO_OUT_DEVICE = "plughw:0,0"
+    AUDIO_OUT_DEVICE = "plughw:1,0"
 
     def speak(self, text):
         print(f"PiCar Speaking: {text}")
@@ -274,8 +274,24 @@ class AudioNode:
         if text:
             self.speak(text)
 
+    def _enable_speakers(self):
+        # The robot_hat speaker amp is gated by a GPIO switch that comes
+        # up DISABLED on every boot - without flipping it on first, aplay
+        # plays to a dead output and no speech is ever heard. Must run
+        # after the hat is initialized (safety_daemon's Picarx() does
+        # that) and before our first speak(). Override the command via
+        # SPEAKER_ENABLE_CMD if your robot_hat build names it differently.
+        cmd = os.environ.get("SPEAKER_ENABLE_CMD", "robot_hat enable_speaker")
+        try:
+            subprocess.run(cmd.split(), check=False, timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"Audio node: ran '{cmd}' to enable the speaker amp.")
+        except (FileNotFoundError, subprocess.SubprocessError) as e:
+            print(f"Audio node: could not enable speakers via '{cmd}': {e}")
+
     def run(self):
         self.bus.subscribe("picarx/audio/speak", self.handle_speak_request)
+        self._enable_speakers()
 
         if not self.model:
             print("Audio node running in output-only mode.")
@@ -283,13 +299,13 @@ class AudioNode:
                 time.sleep(1)
 
         print("Audio node running: starting ALSA audio stream...")
-        self.speak("Systems initialized. Voice control active.")
+        self.speak("Systems initialized. Standing by for instructions.")
 
         # Use arecord with plughw to automatically resample the USB mic to 16000Hz.
         # Card index from `arecord -l`: card 1 is the USB PnP Sound Device (the mic).
         cmd = [
             "arecord",
-            "-D", "plughw:1,0",
+            "-D", "plughw:0,0",
             "-f", "S16_LE",
             "-c", "1",
             "-r", "16000",
@@ -302,7 +318,8 @@ class AudioNode:
 
         gate = EnergyGate()
         prebuffer = deque(maxlen=PREBUFFER_CHUNKS)
-        last_stop_reflex_at = 0.0
+        self._last_stop_reflex_at = 0.0
+        gate_was_open = False
 
         while True:
             # Read a chunk at a time from the arecord output
@@ -326,13 +343,22 @@ class AudioNode:
             rms = _chunk_rms(data)
 
             if not gate.process(rms, now):
-                # Confirmed silence (or forced-shut ambient-noise gate) -
-                # skip Kaldi entirely for this chunk: no acoustic model,
-                # no decoder search, nothing, until sound picks up again.
+                # Confirmed silence. Because we stop feeding Kaldi during
+                # silence, its own endpointer never sees the trailing
+                # silence it needs to finalize - so on the FIRST silent
+                # chunk after speech, finalize the utterance ourselves
+                # (FinalResult). Without this, successive phrases pile
+                # into one un-ended utterance ("explore explore explore")
+                # until Kaldi flushes on its own many seconds later.
+                if gate_was_open:
+                    gate_was_open = False
+                    self._emit_result(self.rec.FinalResult(), now)
                 # Keep a short rolling buffer so if speech starts on the
                 # very next chunk, we don't lose the onset.
                 prebuffer.append(data)
                 continue
+
+            gate_was_open = True
 
             # Just triggered (or still within the trailing window) -
             # flush any pre-buffered quiet-adjacent audio first so the
@@ -343,21 +369,25 @@ class AudioNode:
                     self.rec.AcceptWaveform(buffered)
                 prebuffer.clear()
 
+            # A natural in-speech endpoint (e.g. a real pause) still
+            # finalizes immediately; otherwise we wait for gate close.
             if self.rec.AcceptWaveform(data):
-                result = json.loads(self.rec.Result())
-                text = result.get("text", "").lower()
+                self._emit_result(self.rec.Result(), now)
 
-                if text:
-                    print(f"Heard locally: '{text}'")
-                    # Publish what was heard to the MQTT bus
-                    self.bus.publish("picarx/audio/heard", {"text": text})
-
-                    # Core local reflex - throttled (see STOP_REFLEX_COOLDOWN
-                    # above) so repeating "stop" doesn't queue a pile of
-                    # blocking TTS announcements that delay everything else.
-                    if ("halt" in text or "stop" in text) and (now - last_stop_reflex_at) > STOP_REFLEX_COOLDOWN:
-                        last_stop_reflex_at = now
-                        self.bus.publish("picarx/audio/speak", {"text": "Stopping"})
+    def _emit_result(self, result_json, now):
+        try:
+            text = json.loads(result_json).get("text", "").lower().strip()
+        except (json.JSONDecodeError, AttributeError):
+            return
+        if not text:
+            return
+        print(f"Heard locally: '{text}'")
+        self.bus.publish("picarx/audio/heard", {"text": text})
+        # Core local reflex - throttled (see STOP_REFLEX_COOLDOWN) so
+        # repeating "stop" doesn't queue a pile of blocking TTS.
+        if ("halt" in text or "stop" in text) and (now - self._last_stop_reflex_at) > STOP_REFLEX_COOLDOWN:
+            self._last_stop_reflex_at = now
+            self.bus.publish("picarx/audio/speak", {"text": "Stopping"})
 
 if __name__ == "__main__":
     node = AudioNode()

@@ -153,6 +153,17 @@ SCAN_PAN_ANGLES = (-70, -35, 0, 35, 70)
 SCAN_DWELL_SEC = 1.8
 SCAN_TILT = 0
 
+# Lighter periodic "glance" done WHILE cruising (as opposed to the full
+# startup sweep above): fewer angles, shorter dwell, no spoken report.
+# The point is to catch objects off to the side that the forward-facing
+# camera+ultrasonic miss when approaching at an angle (the "drives
+# diagonally and clips a table leg" failure), and to keep the
+# escape-direction estimate below fresh. Silent so it doesn't narrate a
+# look-around every half minute.
+SCAN_PAN_ANGLES_QUICK = (-55, 0, 55)
+SCAN_DWELL_QUICK_SEC = 1.0
+CRUISE_SCAN_INTERVAL = 25.0    # re-glance around at least this often while cruising
+
 # Physical stuck detection: commanding forward with nothing being
 # vetoed, but the camera scene isn't changing -> wheels are pushing
 # against something below the ultrasonic beam (or slipping). vision's
@@ -244,7 +255,8 @@ class FieldAgent:
         # lock-protected inboxes below, never touch state directly,
         # so there's no cross-thread race on the state machine itself.
         self.state = "CRUISING"  # "CRUISING", "SCANNING", "EVADING", "COACHING"
-        self.evade_stage = 0     # 0: stop, 1: reverse, 2: turn
+        self.evade_stage = 0     # 0:stop 1:pre-turn 2:reverse-arc 3:straighten+go
+        self.evade_angle = 0     # steering angle held through the reverse arc
         self.state_until = 0.0
         self.evasion_fail_events = deque()
         self.next_fail_state_allowed_at = 0.0
@@ -256,6 +268,14 @@ class FieldAgent:
         self.scan_dwell_until = 0.0
         self.scan_sightings = []       # [{"pan": angle, "labels": [...]}, ...]
         self.last_room_scan = None     # kept for reports; also published + logged
+        self.scan_angles = SCAN_PAN_ANGLES   # which sweep this scan is running
+        self.scan_dwell_sec = SCAN_DWELL_SEC
+        self.scan_is_startup = True    # startup scan announces; periodic glance stays quiet
+        self.last_scan_at = 0.0        # when the last sweep finished (paces periodic glances)
+        # Escape direction learned from the most recent scan: turn toward
+        # whichever side had fewer objects, instead of a coin flip. None
+        # until a scan has produced an asymmetry.
+        self.preferred_escape_angle = None
 
         # Physical stuck detection state (see STUCK_AFTER_SEC).
         self.forward_since = None      # when the current uninterrupted forward run began
@@ -275,9 +295,13 @@ class FieldAgent:
         # Urgent (blocking, fail-state) coach query bookkeeping.
         self.coach_query_id = None
         self.coach_query_deadline = 0.0
-        self.coach_action = None
+        # A coach suggestion is now an ordered list of steps
+        # ([{"action","duration"}, ...]) run back to back, not a single
+        # action. coach_steps None = still waiting on a reply.
+        self.coach_steps = None
+        self.coach_step_index = 0
+        self.coach_step_until = 0.0
         self.coach_action_started_at = 0.0
-        self.coach_apply_until = 0.0
         self.last_coach_query_id_used = None
         self.last_coach_situation_key = None
 
@@ -378,20 +402,19 @@ class FieldAgent:
         self.handle_voice_command(text)
 
     def handle_voice_command(self, text):
-        if "explore" in text or "start" in text:
+        # Only an explicit "explore" starts driving. "start" was too loose -
+        # STT mishearing background noise/TV as "start" could auto-launch
+        # exploration on its own, which is exactly the unwanted
+        # "moves around on boot" behavior. Default state is stationary.
+        if "explore" in text:
             if not self.explore_mode:
                 self.explore_mode = True
                 self.given_up = False
                 self.consecutive_coach_failures = 0
                 self.next_fail_state_allowed_at = 0.0
-                self.forward_since = None
                 # Look around before rolling: sweep the camera across
                 # the room and take stock of what's where first.
-                self.state = "SCANNING"
-                self.scan_index = 0
-                self.scan_dwell_until = time.time() + SCAN_DWELL_SEC
-                self.scan_sightings = []
-                self.publish_look(SCAN_PAN_ANGLES[0])
+                self._enter_scanning(time.time(), startup=True)
                 self.announce("Starting exploration. Let me take a look around first.", force=True)
             return
 
@@ -592,6 +615,12 @@ class FieldAgent:
     def _on_novel_object(self, obj):
         label = obj.get("label", "something")
         self.announce(f"I see something new - looks like a {label}.")
+        # Only consult the coach about how to react to a new object while
+        # we're actually exploring - a novelty maneuver is pointless (and
+        # a wasted LLM/bandit call) when parked and awaiting commands.
+        # Noticing/announcing still happens either way.
+        if not self.explore_mode:
+            return
         if self.watch_query_id is not None:
             return  # already waiting on a novelty query, don't pile on
         self._start_coach_query(situation="novel_object", urgent=False, label=label, extra={"object": obj})
@@ -600,29 +629,69 @@ class FieldAgent:
         query_id = payload.get("query_id")
         if not query_id:
             return
-        action = payload.get("action")
-        duration = payload.get("duration") or DEFAULT_COACH_DURATION
+        steps = self._normalize_steps(payload)
         rationale = payload.get("rationale")
         cached = payload.get("cached")
         now = time.time()
 
         if query_id == self.coach_query_id:
-            self.coach_action = action
+            self.coach_steps = steps
+            self.coach_step_index = 0
+            self.coach_step_until = now + steps[0]["duration"]
             self.coach_action_started_at = now
-            self.coach_apply_until = now + duration
             self.last_coach_query_id_used = query_id
             self.last_coach_situation_key = payload.get("situation_key")
             self.coach_query_id = None
-            print(f"Coach suggestion (urgent, cached={cached}): {action} - {rationale}")
-            self.announce("Trying something the coach suggested.")
+            print(f"Coach suggestion (urgent, cached={cached}): {steps} - {rationale}")
+            self.announce(self._coach_speech(steps, rationale, cached), force=True)
         elif query_id == self.watch_query_id:
-            self.watch_coach_action = action
+            # Novelty reactions stay simple: run the first step only.
+            self.watch_coach_action = steps[0]["action"]
             self.watch_action_started_at = now
-            self.watch_action_until = now + duration
+            self.watch_action_until = now + steps[0]["duration"]
             self.watch_query_id_used = query_id
             self.watch_situation_key = payload.get("situation_key")
             self.watch_query_id = None
-            print(f"Coach suggestion (watch, cached={cached}): {action} - {rationale}")
+            print(f"Coach suggestion (watch, cached={cached}): {steps[0]} - {rationale}")
+            self.announce(self._coach_speech(steps, rationale, cached), force=True)
+
+    @staticmethod
+    def _normalize_steps(payload):
+        """Coach now sends a "steps" list; tolerate a legacy single
+        "action"/"duration" payload too. Always returns a non-empty list
+        of {"action","duration"} with sane durations."""
+        raw = payload.get("steps")
+        if not raw:
+            action = payload.get("action") or {"direction": "stop"}
+            raw = [{"action": action, "duration": payload.get("duration") or DEFAULT_COACH_DURATION}]
+        steps = []
+        for s in raw:
+            action = s.get("action") or {"direction": "stop"}
+            try:
+                duration = float(s.get("duration") or DEFAULT_COACH_DURATION)
+            except (TypeError, ValueError):
+                duration = DEFAULT_COACH_DURATION
+            steps.append({"action": action, "duration": duration})
+        return steps or [{"action": {"direction": "stop"}, "duration": DEFAULT_COACH_DURATION}]
+
+    @staticmethod
+    def _coach_speech(steps, rationale, cached):
+        # Spoken so the user can hear the LLM coach is actually engaged.
+        # Names the source (fresh model call vs. remembered past advice)
+        # and reads back the coach's own rationale when there is one.
+        source = "From memory, I've learned to" if cached else "The coach is advising me to"
+        verbs = {"backward": "back away", "forward": "go forward",
+                 "stop": "hold still", "turn": "turn"}
+        moves = [verbs.get((s.get("action") or {}).get("direction"), "move") for s in steps]
+        # De-dupe consecutive identical verbs so "turn, turn" reads cleanly.
+        seq = []
+        for m in moves:
+            if not seq or seq[-1] != m:
+                seq.append(m)
+        maneuver = ", then ".join(seq)
+        if rationale:
+            return f"{source} {maneuver}. {rationale}"
+        return f"{source} {maneuver}."
         # else: stale/unknown query id (already timed out or superseded) - ignore
 
     def _finish_coach_episode(self, now):
@@ -630,7 +699,12 @@ class FieldAgent:
             succeeded = not any(t > self.coach_action_started_at for t in self.veto_events)
         query_id = self.last_coach_query_id_used
         situation_key = self.last_coach_situation_key
-        self.coach_action = None
+        self.coach_steps = None
+        # Straighten the wheels before resuming: a coach maneuver (often a
+        # turn, or a reverse while the wheels were already turned) leaves
+        # the steering angled, so plain forward cruise would arc right
+        # back into the same object. Reset to straight first.
+        self.publish_intent({"direction": "turn", "angle": 0}, priority=COACH_PRIORITY)
         self.state = "CRUISING"
         self.last_wander = now
         self.bus.publish("picarx/coach/outcome", {
@@ -681,7 +755,7 @@ class FieldAgent:
         self.watch_coach_action = None
 
     def _handle_coaching_tick(self, now):
-        if self.coach_action is None:
+        if self.coach_steps is None:
             # Still waiting on a reply - hold a safe reflex rather than
             # doing nothing (or worse, drifting forward) while we wait.
             if now > self.coach_query_deadline:
@@ -698,11 +772,22 @@ class FieldAgent:
                 self.publish_intent({"direction": "backward", "speed": 25}, priority=COACH_PRIORITY)
             return
 
-        if now < self.coach_apply_until:
-            self.publish_intent(self.coach_action, priority=COACH_PRIORITY, ttl=0.6)
+        # Run the suggested step sequence back to back: hold each step
+        # until its duration elapses, then advance to the next; finish
+        # after the last. The arbiter/safety layer only ever sees the one
+        # primitive we publish this tick, so multi-step maneuvers never
+        # leak into the hardware-gate layers.
+        while self.coach_step_index < len(self.coach_steps) and now >= self.coach_step_until:
+            self.coach_step_index += 1
+            if self.coach_step_index < len(self.coach_steps):
+                self.coach_step_until = now + self.coach_steps[self.coach_step_index]["duration"]
+
+        if self.coach_step_index >= len(self.coach_steps):
+            self._finish_coach_episode(now)
             return
 
-        self._finish_coach_episode(now)
+        self.publish_intent(self.coach_steps[self.coach_step_index]["action"],
+                            priority=COACH_PRIORITY, ttl=0.6)
 
     def _enter_collision_fail_state(self, reason):
         now = time.time()
@@ -736,8 +821,8 @@ class FieldAgent:
             self.veto_events.clear()
         self.forward_since = None
         self.state = "COACHING"
-        self.coach_action = None
-        self.coach_apply_until = 0.0
+        self.coach_steps = None
+        self.coach_step_index = 0
         self.coach_action_started_at = now
         self.announce("I keep running into something. Let me get some advice.", force=True)
         self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
@@ -775,6 +860,20 @@ class FieldAgent:
 
     # ---------- look-around head scan ----------
 
+    def _enter_scanning(self, now, startup):
+        """Begin a camera head sweep. startup=True is the full sweep on
+        'explore' (announces what it sees); startup=False is the lighter,
+        silent periodic glance done while cruising."""
+        self.state = "SCANNING"
+        self.scan_is_startup = startup
+        self.scan_angles = SCAN_PAN_ANGLES if startup else SCAN_PAN_ANGLES_QUICK
+        self.scan_dwell_sec = SCAN_DWELL_SEC if startup else SCAN_DWELL_QUICK_SEC
+        self.scan_index = 0
+        self.scan_sightings = []
+        self.scan_dwell_until = now + self.scan_dwell_sec
+        self.forward_since = None
+        self.publish_look(self.scan_angles[0])
+
     def _handle_scanning_tick(self, now):
         # Stationary the whole time - hold an explicit stop so the
         # arbiter doesn't fall through to some stale lower-priority
@@ -790,26 +889,41 @@ class FieldAgent:
             o.get("label") for o in objects.get("items", [])
             if o.get("label") and not objects.get("stale", True)
         })
-        self.scan_sightings.append({"pan": SCAN_PAN_ANGLES[self.scan_index], "labels": labels})
+        self.scan_sightings.append({"pan": self.scan_angles[self.scan_index], "labels": labels})
 
         self.scan_index += 1
-        if self.scan_index < len(SCAN_PAN_ANGLES):
-            self.publish_look(SCAN_PAN_ANGLES[self.scan_index])
-            self.scan_dwell_until = now + SCAN_DWELL_SEC
+        if self.scan_index < len(self.scan_angles):
+            self.publish_look(self.scan_angles[self.scan_index])
+            self.scan_dwell_until = now + self.scan_dwell_sec
             return
 
-        # Sweep complete - recenter, remember, publish, announce, roll.
+        # Sweep complete - recenter, remember, publish, set escape bias, roll.
         self.publish_look(0, 0)
         self.last_room_scan = {"scanned_at": now, "sightings": self.scan_sightings}
         self.bus.publish("picarx/exploration/room_scan", self.last_room_scan)
-
-        seen = sorted({label for s in self.scan_sightings for label in s["labels"]})
-        if seen:
-            self.announce(f"I looked around and I can see: {', '.join(seen)}. Off I go.", force=True)
-        else:
-            self.announce("I looked around but didn't recognize anything. Exploring anyway.", force=True)
+        self.preferred_escape_angle = self._escape_angle_from_scan()
+        self.last_scan_at = now
         self.state = "CRUISING"
         self.last_wander = now
+
+        if self.scan_is_startup:
+            seen = sorted({label for s in self.scan_sightings for label in s["labels"]})
+            if seen:
+                self.announce(f"I looked around and I can see: {', '.join(seen)}. Off I go.", force=True)
+            else:
+                self.announce("I looked around but didn't recognize anything. Exploring anyway.", force=True)
+
+    def _escape_angle_from_scan(self):
+        """Turn toward whichever side had fewer objects in the last sweep.
+        Camera-based (the head pans, so left/right sightings are real),
+        which sidesteps the forward-fixed ultrasonic entirely. Returns a
+        signed angle, or None if the scan was symmetric / empty (caller
+        falls back to a random pick)."""
+        left = sum(len(s["labels"]) for s in self.scan_sightings if s["pan"] < 0)
+        right = sum(len(s["labels"]) for s in self.scan_sightings if s["pan"] > 0)
+        if left == right:
+            return None
+        return -30 if left < right else 30
 
     # ---------- exploration behavior ----------
 
@@ -844,31 +958,53 @@ class FieldAgent:
         vision_obstacle = _vision_obstacle(snap)
 
         # --- Handle Evasion State Machine ---
+        # Ackermann-correct: a car can only change heading while it is
+        # MOVING with the wheels turned. The old sequence turned the
+        # wheels while stationary (which does nothing on this chassis)
+        # then drove off straight - so it returned to the same spot and
+        # re-hit the same object. Now the wheels are pre-turned toward
+        # the escape side and the robot REVERSES along that arc, so its
+        # heading actually swings away before it drives on.
         if self.state == "EVADING":
             if now < self.state_until:
-                # Continue executing current stage behavior
+                # Hold the current stage's command (re-published so the
+                # arbiter's per-source intent doesn't expire mid-stage).
                 if self.evade_stage == 0:
                     self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 1:
-                    self.publish_intent({"direction": "backward", "speed": 30}, priority=EVADE_PRIORITY)
+                    # Wheels turning to the escape angle; hold still.
+                    self.publish_intent({"direction": "turn", "angle": self.evade_angle}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 2:
-                    # Maintain the turn angle chosen when entering this stage
-                    pass
+                    # Reverse with wheels still turned -> arcs away.
+                    self.publish_intent({"direction": "backward", "speed": 30}, priority=EVADE_PRIORITY)
+                elif self.evade_stage == 3:
+                    # Straighten and ease forward onto the new heading.
+                    self.publish_intent({"direction": "forward", "speed": 20}, priority=EVADE_PRIORITY)
                 return
             else:
-                # Progress to next step of evasion
                 self.evade_stage += 1
                 if self.evade_stage == 1:
-                    # Move backward for 1.2 seconds
-                    self.state_until = now + 1.2
-                    self.publish_intent({"direction": "backward", "speed": 30}, priority=EVADE_PRIORITY)
+                    # Choose + command the escape steering angle. Toward
+                    # whichever side the last scan found clearer; coin
+                    # flip only if we have no asymmetry to go on.
+                    self.evade_angle = self.preferred_escape_angle
+                    if self.evade_angle is None:
+                        self.evade_angle = random.choice([-30, 30])
+                    self.state_until = now + 0.3
+                    self.publish_intent({"direction": "turn", "angle": self.evade_angle}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 2:
-                    # Choose random direction to pivot away for 0.6 seconds
-                    angle = random.choice([-30, 30])
+                    # Reverse along the arc (wheels stay turned - backward
+                    # only changes speed, not the held steering angle).
+                    self.state_until = now + 1.3
+                    self.publish_intent({"direction": "backward", "speed": 30}, priority=EVADE_PRIORITY)
+                elif self.evade_stage == 3:
+                    # Straighten wheels, then commit forward briefly so we
+                    # actually leave on the new heading instead of arcing
+                    # right back.
                     self.state_until = now + 0.6
-                    self.publish_intent({"direction": "turn", "angle": angle}, priority=EVADE_PRIORITY)
+                    self.publish_intent({"direction": "turn", "angle": 0}, priority=EVADE_PRIORITY)
+                    self.publish_intent({"direction": "forward", "speed": 20}, priority=EVADE_PRIORITY)
                 else:
-                    # Evasion complete, clean slate
                     self.publish_intent({"direction": "turn", "angle": 0}, priority=EVADE_PRIORITY)
                     self.state = "CRUISING"
                     self.last_wander = now
@@ -906,6 +1042,15 @@ class FieldAgent:
         if distance < OBSTACLE_DISTANCE_CM:
             self.announce("Obstacle ahead, backing away.")
             self._begin_evasion("ultrasonic")
+            return
+
+        # --- Periodic look-around while cruising ---
+        # Path is clear here (obstacle/evasion checks above already
+        # returned). Every so often, stop and glance side to side so
+        # objects approached at an angle get noticed before a corner
+        # clips them, and so the escape-direction bias stays current.
+        if now - self.last_scan_at > CRUISE_SCAN_INTERVAL:
+            self._enter_scanning(now, startup=False)
             return
 
         # --- Handle Timed Steering Reset during standard wander ---
@@ -962,7 +1107,7 @@ class FieldAgent:
         self.bus.subscribe("picarx/coach/suggestion", self.on_coach_suggestion)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
-        self.announce("Field agent online.", force=True)
+        self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)
 
         period = 1.0 / EXPLORE_TICK_HZ
         while True:

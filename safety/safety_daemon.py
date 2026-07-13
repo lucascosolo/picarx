@@ -23,6 +23,17 @@ SOCKET_PATH = "/tmp/picarx_safety.sock"
 SAFE_DISTANCE_CM = 15
 CLIFF_THRESHOLD = 200
 
+# The cliff/grayscale sensors are FRONT-mounted and there is no
+# rear-facing sensor, so nothing can see a drop-off behind the robot
+# (it backed off a tabletop at startup). As a backstop, bound how long
+# one continuous reverse may run: a normal escape reverse (~1.2s) and
+# coach reverse suggestions (<=1.5s) pass, but a sustained runaway gets
+# vetoed -> emergency stop. Any non-reverse command resets the timer,
+# so bursts of reversing separated by forward/turn/stop are each
+# independently bounded. Not a substitute for a real rear sensor.
+MAX_CONTINUOUS_REVERSE_SEC = 2.0
+_reverse_state = {"since": None}
+
 # Battery monitoring thresholds
 BATTERY_ADC_CHANNEL = "A4"
 LOW_BATTERY_VOLTAGE = 6.7
@@ -145,7 +156,18 @@ def is_safe(action):
     #    most of this daemon's measured CPU load - the arbiter
     #    re-sends the active action at 10Hz, so is_safe used to run
     #    the full sensor suite ten times a second even while stopped.
-    if direction in ("stop", "turn", "backward", "look"):
+    if direction == "backward":
+        now = time.time()
+        if _reverse_state["since"] is None:
+            _reverse_state["since"] = now
+        if now - _reverse_state["since"] > MAX_CONTINUOUS_REVERSE_SEC:
+            return False, "reverse time limit (no rear sensor)"
+        return True, "ok"
+
+    # Any non-reverse command ends the current continuous-reverse run.
+    _reverse_state["since"] = None
+
+    if direction in ("stop", "turn", "look"):
         return True, "ok"
 
     with hardware_lock:
