@@ -141,12 +141,20 @@ WATCH_PRIORITY = 6
 # A depth-sensor-free obstacle signal: world_state flags a tracked
 # object "approaching" if its bounding box is growing quickly while
 # centered in frame. Treated exactly like a close ultrasonic reading.
+#
+# close_object is checked first and takes priority: it's class-agnostic
+# (doesn't require the SSD to confidently recognize what the object is -
+# see vision_basic.py), so it catches point-blank obstacles like a
+# cabinet that "approaching" never can, since that path only fires for
+# objects the SSD actually tracks by label in the first place.
 def _vision_obstacle(snapshot):
     if not snapshot:
         return None
     objects = snapshot.get("objects") or {}
     if objects.get("stale", True):
         return None
+    if objects.get("close_object"):
+        return {"label": "something", "area_ratio": 1.0}
     best = None
     for obj in objects.get("items", []):
         if obj.get("approaching") and (best is None or obj.get("area_ratio", 0) > best.get("area_ratio", 0)):
@@ -168,6 +176,15 @@ EVASION_FAIL_THRESHOLD = 3    # this many evasion triggers in the window -> fail
 COACH_URGENT_TIMEOUT = 3.0    # how long we'll hold a safe reflex waiting for advice
 COACH_WATCH_TIMEOUT = 5.0     # how long we'll wait on a non-blocking novelty query
 DEFAULT_COACH_DURATION = 1.5  # how long to follow a suggested action if it doesn't specify one
+
+# If every direction is blocked (e.g. boxed in between an obstacle and
+# a cliff/wall behind), no coach suggestion can possibly succeed - a
+# minimum cooldown between failed fail-state episodes, and a hard stop
+# after enough consecutive failures, keep that from turning into a
+# rapid-fire query storm (each one a real API call) that never lets a
+# single attempt actually run its course.
+FAIL_STATE_COOLDOWN = 3.0        # seconds to wait after a failed episode before trying again
+MAX_CONSECUTIVE_FAILURES = 3     # give up and wait for a human after this many straight failures
 
 
 class FieldAgent:
@@ -192,6 +209,9 @@ class FieldAgent:
         self.evade_stage = 0     # 0: stop, 1: reverse, 2: turn
         self.state_until = 0.0
         self.evasion_fail_events = deque()
+        self.next_fail_state_allowed_at = 0.0
+        self.consecutive_coach_failures = 0
+        self.given_up = False    # true once MAX_CONSECUTIVE_FAILURES is hit; "explore" clears it
 
         # Wander state (mirrors the old reflex explorer's behavior,
         # now expressed as intents instead of direct socket calls)
@@ -307,6 +327,9 @@ class FieldAgent:
             if not self.explore_mode:
                 self.explore_mode = True
                 self.state = "CRUISING"
+                self.given_up = False
+                self.consecutive_coach_failures = 0
+                self.next_fail_state_allowed_at = 0.0
                 self.announce("Starting exploration.", force=True)
             return
 
@@ -554,13 +577,28 @@ class FieldAgent:
             "success": succeeded,
         })
         if succeeded:
+            self.consecutive_coach_failures = 0
             self.announce("That worked.")
-        else:
-            self.announce("Still stuck, backing off the normal way.")
-            self.state = "EVADING"
-            self.evade_stage = 0
-            self.state_until = now + 0.25
+            return
+
+        self.consecutive_coach_failures += 1
+        self.next_fail_state_allowed_at = now + FAIL_STATE_COOLDOWN
+        if self.consecutive_coach_failures >= MAX_CONSECUTIVE_FAILURES:
+            # Nothing suggested has worked several times in a row -
+            # very likely every direction is genuinely blocked (boxed
+            # in between an obstacle and a cliff/wall behind, say).
+            # No further suggestion can fix that; stop actually trying
+            # and say so, instead of burning more queries on repeats.
+            self.given_up = True
+            self.announce("I'm stuck and nothing is working. Please help me, or tell me to explore again.", force=True)
             self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+            return
+
+        self.announce("Still stuck, backing off the normal way.")
+        self.state = "EVADING"
+        self.evade_stage = 0
+        self.state_until = now + 0.25
+        self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
 
     def _finish_watch_episode(self):
         with self.lock:
@@ -599,6 +637,29 @@ class FieldAgent:
 
     def _enter_collision_fail_state(self, reason):
         now = time.time()
+
+        if self.state == "COACHING":
+            # Already mid-episode - a fresh trigger here (e.g. the
+            # coach's own suggested action itself getting vetoed) used
+            # to abandon the in-progress episode and fire a brand new
+            # query immediately, which is how this turned into a
+            # same-second query storm. Let the current episode run its
+            # course and reach its own pass/fail conclusion instead.
+            return
+
+        if self.given_up:
+            # Already told the user we're stuck; hold still instead of
+            # silently resuming the retry loop. "explore" clears this.
+            self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
+            return
+
+        if now < self.next_fail_state_allowed_at:
+            # Cooling down after a recent failed attempt - a fresh
+            # trigger during this window (still stuck) just holds a
+            # plain stop rather than hammering the coach again.
+            self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
+            return
+
         self.evasion_fail_events.append(now)
         _prune_older_than(self.evasion_fail_events, EVASION_FAIL_WINDOW, now)
         stuck_pattern = len(self.evasion_fail_events) >= EVASION_FAIL_THRESHOLD
@@ -705,7 +766,10 @@ class FieldAgent:
         # straight into things the distance sensor never saw) ---
         if vision_obstacle is not None:
             label = vision_obstacle.get("label", "something")
-            self.announce(f"A {label} is closing in, backing away.")
+            if label == "something":
+                self.announce("Something's right in front of me, backing away.")
+            else:
+                self.announce(f"A {label} is closing in, backing away.")
             self._begin_evasion("vision")
             return
 

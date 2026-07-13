@@ -47,6 +47,9 @@ Output (published):
                     "frame_width", "frame_height", "area_ratio",
                     "center_offset", "first_seen", "last_seen",
                     "approach_rate", "approaching"}, ... ],
+        "close_object": bool,  # class-agnostic - see vision_basic.py;
+                                # true if something is filling most of
+                                # the frame regardless of what it is
         "stale": bool
     },
     "battery": {
@@ -121,6 +124,7 @@ class WorldState:
             "distance_updated_at": None,
             "objects": {},  # id -> tracked object record (see on_objects)
             "objects_updated_at": None,
+            "close_object": False,
             "battery": {"voltage": None, "low": False, "critical": False, "updated_at": None},
             "last_heard": {"text": None, "updated_at": None},
             "last_action": {"source": None, "action": None, "result": None, "updated_at": None},
@@ -161,6 +165,7 @@ class WorldState:
                 updated[tid] = record
             self.state["objects"] = updated
             self.state["objects_updated_at"] = now
+            self.state["close_object"] = bool(payload.get("close_object", False))
 
     def on_heard(self, payload):
         with self.lock:
@@ -220,6 +225,7 @@ class WorldState:
             distance_updated_at = self.state["distance_updated_at"]
             objects = {tid: dict(obj) for tid, obj in self.state["objects"].items()}
             objects_updated_at = self.state["objects_updated_at"]
+            close_object = self.state["close_object"]
             battery = dict(self.state["battery"])
             heard = dict(self.state["last_heard"])
             last_action = dict(self.state["last_action"])
@@ -237,6 +243,7 @@ class WorldState:
                     {k: v for k, v in obj.items() if k != "_ts"}
                     for obj in objects.values()
                 ],
+                "close_object": close_object,
                 "stale": self._is_stale(objects_updated_at, "objects"),
             },
             "battery": {
