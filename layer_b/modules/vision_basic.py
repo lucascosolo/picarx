@@ -122,12 +122,28 @@ OBJECT_MATCH_MAX_DIST = 120        # pixels; centroid match distance cap
 OBJECT_CONFIDENCE_THRESHOLD = 0.5
 
 # Class-agnostic "something huge is right in front of the camera"
-# signal - see the close_object note in the module docstring. Deliberately
-# not debounced across multiple ticks the way faces/tracked objects are:
-# this is meant to be as immediate as the ultrasonic's own point-blank
-# check, which also reacts on a single reading.
-CLOSE_OBJECT_MIN_CONFIDENCE = 0.2   # much lower bar - we don't care what it is
-CLOSE_OBJECT_AREA_RATIO = 0.45      # bbox covers this fraction of the frame
+# signal - see the close_object note in the module docstring.
+#
+# Field data (7.5min of debug_monitor logging) showed the original
+# single-pass 0.2-confidence/0.45-area version false-positived
+# constantly - dozens of "evasion_loop:vision" fail states while the
+# ultrasonic simultaneously read 60-300cm of clear air, completely
+# derailing exploration. The SSD hands out low-confidence frame-filling
+# boxes for walls, floors, and furniture across the room, not just
+# point-blank obstacles. Three changes, each keeping most of the
+# original intent:
+#   - confidence 0.2 -> 0.3 and area 0.45 -> 0.55 (still far below the
+#     0.5 labeled-object bar, still class-agnostic)
+#   - debounced to CLOSE_OBJECT_CONFIRM_PASSES consecutive SSD passes,
+#     like every other detection in this module - a real point-blank
+#     obstacle stays in frame across passes; single-frame texture
+#     flukes don't
+# field_agent additionally cross-checks against the ultrasonic before
+# treating it as an obstacle (see VISION_OBSTACLE_ULTRASONIC_CLEAR_CM
+# there).
+CLOSE_OBJECT_MIN_CONFIDENCE = 0.3
+CLOSE_OBJECT_AREA_RATIO = 0.55
+CLOSE_OBJECT_CONFIRM_PASSES = 2
 
 # Motion gate: only bother running the SSD at all if the scene looks
 # like it's actually changed since the last time we ran it, checked on
@@ -266,6 +282,8 @@ def run():
     last_forced_detect = 0.0
     last_motion_thumb = None
     close_object = False   # persists between ticks where the SSD didn't run
+    close_streak = 0       # consecutive SSD passes with a frame-filling detection
+    scene_motion = None    # last motion-thumb mean abs diff (for stuck detection downstream)
 
     while True:
         frame = picam2.capture_array()
@@ -307,7 +325,8 @@ def run():
                 should_run_ssd = True
             else:
                 diff = cv2.absdiff(thumb, last_motion_thumb)
-                moved = float(diff.mean()) > MOTION_DIFF_THRESHOLD
+                scene_motion = float(diff.mean())
+                moved = scene_motion > MOTION_DIFF_THRESHOLD
                 should_run_ssd = moved or (now - last_forced_detect) > FORCE_DETECT_INTERVAL
             last_motion_thumb = thumb
 
@@ -324,7 +343,7 @@ def run():
                 detections = net.forward()
 
                 found = []
-                close_object = False
+                close_hit_this_pass = False
                 for i in range(detections.shape[2]):
                     confidence = float(detections[0, 0, i, 2])
                     if confidence < CLOSE_OBJECT_MIN_CONFIDENCE:
@@ -344,8 +363,8 @@ def run():
                         continue
 
                     area_ratio = ((x2 - x1) * (y2 - y1)) / float(frame_w * frame_h)
-                    if area_ratio > CLOSE_OBJECT_AREA_RATIO:
-                        close_object = True
+                    if area_ratio > CLOSE_OBJECT_AREA_RATIO and confidence >= CLOSE_OBJECT_MIN_CONFIDENCE:
+                        close_hit_this_pass = True
 
                     if class_id >= len(VOC_CLASSES) or confidence < OBJECT_CONFIDENCE_THRESHOLD:
                         continue
@@ -354,6 +373,9 @@ def run():
                         "confidence": confidence,
                         "bbox": (x1, y1, x2 - x1, y2 - y1),
                     })
+
+                close_streak = close_streak + 1 if close_hit_this_pass else 0
+                close_object = close_streak >= CLOSE_OBJECT_CONFIRM_PASSES
 
                 tracker.update(found, now)
 
@@ -372,7 +394,11 @@ def run():
                 "first_seen": t["first_seen"],
                 "last_seen": t["last_seen"],
             })
-        bus.publish("picarx/vision/objects", {"objects": objects_payload, "close_object": close_object})
+        bus.publish("picarx/vision/objects", {
+            "objects": objects_payload,
+            "close_object": close_object,
+            "scene_motion": scene_motion,
+        })
 
         time.sleep(DETECT_INTERVAL)
 

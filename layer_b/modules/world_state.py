@@ -125,6 +125,7 @@ class WorldState:
             "objects": {},  # id -> tracked object record (see on_objects)
             "objects_updated_at": None,
             "close_object": False,
+            "scene_motion": None,  # vision's motion-thumb diff; low while camera view is static
             "battery": {"voltage": None, "low": False, "critical": False, "updated_at": None},
             "last_heard": {"text": None, "updated_at": None},
             "last_action": {"source": None, "action": None, "result": None, "updated_at": None},
@@ -166,6 +167,7 @@ class WorldState:
             self.state["objects"] = updated
             self.state["objects_updated_at"] = now
             self.state["close_object"] = bool(payload.get("close_object", False))
+            self.state["scene_motion"] = payload.get("scene_motion")
 
     def on_heard(self, payload):
         with self.lock:
@@ -226,6 +228,7 @@ class WorldState:
             objects = {tid: dict(obj) for tid, obj in self.state["objects"].items()}
             objects_updated_at = self.state["objects_updated_at"]
             close_object = self.state["close_object"]
+            scene_motion = self.state["scene_motion"]
             battery = dict(self.state["battery"])
             heard = dict(self.state["last_heard"])
             last_action = dict(self.state["last_action"])
@@ -244,6 +247,7 @@ class WorldState:
                     for obj in objects.values()
                 ],
                 "close_object": close_object,
+                "scene_motion": scene_motion,
                 "stale": self._is_stale(objects_updated_at, "objects"),
             },
             "battery": {

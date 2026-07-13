@@ -111,6 +111,81 @@ TRAILING_SILENCE_SEC = 1.2      # keep decoding this long after the last loud ch
 PREBUFFER_CHUNKS = 3            # ~375ms kept during silence so speech onset isn't chopped
 DEBUG_LEVELS = bool(os.environ.get("AUDIO_DEBUG_LEVELS"))
 
+# --- stuck-open gate failsafe ---
+# Field data (debug_monitor, 7.5min sample): this process averaged 74%
+# CPU with peaks at 100% - the gate was effectively never closing. The
+# floor estimate only adapts during CONFIRMED SILENCE, so any sustained
+# sound source (driving-motor noise through a gain-12 mic, a TV, the
+# robot's own constant TTS during a fail-state storm) keeps rms above
+# threshold forever, and the floor never gets a silent moment to catch
+# up: decode runs continuously from then on. Real utterances last a few
+# seconds; anything keeping the gate open for FLOOR_RESEED_AFTER_SEC
+# straight is ambient by definition. Two-layer fix:
+#   - while the gate is open, the floor also drifts (much more slowly)
+#     TOWARD the observed rms, so continuous noise gradually raises the
+#     threshold above itself and the gate re-closes on its own;
+#   - if it's still open after FLOOR_RESEED_AFTER_SEC, the floor is
+#     hard-reseeded to the recent rms average and the gate forced shut.
+OPEN_DRIFT_ALPHA = 0.005        # per-chunk (~125ms): ~25s time constant while gate is open
+FLOOR_RESEED_AFTER_SEC = 20.0   # continuously open longer than this -> reseed floor, close gate
+RESEED_RMS_WINDOW = 40          # chunks (~5s) of recent rms kept for the reseed value
+
+# Tail kept muted after our own TTS playback finishes, so the speaker's
+# reverb doesn't re-open the gate. See mute_until in AudioNode.speak() -
+# without this the robot hears and dutifully decodes every one of its
+# own announcements (which, during a busy exploration session, is a
+# near-continuous stream) - burning decode CPU and keeping the gate open.
+SELF_SPEECH_MUTE_TAIL_SEC = 0.4
+
+
+class EnergyGate:
+    """Decides, chunk by chunk, whether Kaldi should see any audio.
+
+    Pure bookkeeping (no I/O), factored out of the capture loop so the
+    stuck-open failsafe logic is testable off-robot.
+    """
+
+    def __init__(self):
+        self.noise_floor = None
+        self.speaking_until = 0.0
+        self.open_since = None          # when the gate last transitioned closed -> open
+        self.recent_rms = deque(maxlen=RESEED_RMS_WINDOW)
+
+    def process(self, rms, now):
+        """Returns True if this chunk should be decoded."""
+        self.recent_rms.append(rms)
+        if self.noise_floor is None:
+            self.noise_floor = rms
+        threshold = max(MIN_THRESHOLD, self.noise_floor * NOISE_MULTIPLIER)
+
+        if rms > threshold:
+            self.speaking_until = now + TRAILING_SILENCE_SEC
+            if self.open_since is None:
+                self.open_since = now
+
+        gate_open = now <= self.speaking_until
+
+        if gate_open:
+            # Slow drift toward sustained sound so continuous ambient
+            # noise eventually raises the threshold above itself.
+            self.noise_floor += OPEN_DRIFT_ALPHA * (rms - self.noise_floor)
+            if now - self.open_since > FLOOR_RESEED_AFTER_SEC:
+                avg = sum(self.recent_rms) / len(self.recent_rms)
+                print(f"Audio gate: open {FLOOR_RESEED_AFTER_SEC:.0f}s straight - treating as "
+                      f"ambient noise, reseeding floor {self.noise_floor:.0f} -> {avg:.0f}")
+                self.noise_floor = avg
+                self.speaking_until = 0.0
+                self.open_since = None
+                return False
+        else:
+            self.open_since = None
+            # Confirmed silence - normal (faster) floor adaptation.
+            self.noise_floor += NOISE_FLOOR_ALPHA * (rms - self.noise_floor)
+
+        if DEBUG_LEVELS:
+            print(f"Audio node: chunk rms={rms:.0f} floor={self.noise_floor:.0f} threshold={threshold:.0f}")
+        return gate_open
+
 # Digital gain applied to every captured chunk before anything else
 # sees it - see the module docstring for why this exists. 1.0 = no
 # change. Tune with AUDIO_DEBUG_LEVELS=1 alongside SILENCE_RMS_THRESHOLD.
@@ -144,6 +219,7 @@ def _chunk_rms(data):
 class AudioNode:
     def __init__(self):
         self.bus = Bus()
+        self.mute_until = 0.0   # mic ignored while our own TTS is playing (see speak())
 
         # TTS: shell out to espeak directly per call, rather than using
         # pyttsx3. pyttsx3's espeak driver has a known issue on Linux
@@ -173,14 +249,25 @@ class AudioNode:
 
     def speak(self, text):
         print(f"PiCar Speaking: {text}")
-        espeak_proc = subprocess.Popen(["espeak", "--stdout", text], stdout=subprocess.PIPE)
-        subprocess.run(
-            ["aplay", "-D", self.AUDIO_OUT_DEVICE, "-q"],
-            stdin=espeak_proc.stdout,
-            check=False,
-        )
-        espeak_proc.stdout.close()
-        espeak_proc.wait()
+        # Mute our own mic for the duration of playback (+ a short
+        # reverb tail): the mic sits right next to the speaker, so
+        # without this every announcement gets captured, holds the
+        # energy gate open, and burns a full STT decode on our own
+        # voice. Set BEFORE playback starts and refreshed after, since
+        # playback is blocking and this handler runs on the MQTT
+        # callback thread while the mic loop keeps consuming chunks.
+        self.mute_until = float("inf")
+        try:
+            espeak_proc = subprocess.Popen(["espeak", "--stdout", text], stdout=subprocess.PIPE)
+            subprocess.run(
+                ["aplay", "-D", self.AUDIO_OUT_DEVICE, "-q"],
+                stdin=espeak_proc.stdout,
+                check=False,
+            )
+            espeak_proc.stdout.close()
+            espeak_proc.wait()
+        finally:
+            self.mute_until = time.time() + SELF_SPEECH_MUTE_TAIL_SEC
 
     def handle_speak_request(self, payload):
         text = payload.get("text", "")
@@ -213,8 +300,7 @@ class AudioNode:
         # Start the microphone stream directly from the OS
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
 
-        speaking_until = 0.0    # keep decoding until this timestamp
-        noise_floor = None      # bootstrapped from the first chunk we see
+        gate = EnergyGate()
         prebuffer = deque(maxlen=PREBUFFER_CHUNKS)
         last_stop_reflex_at = 0.0
 
@@ -225,30 +311,26 @@ class AudioNode:
                 print("Audio node: arecord produced no data (device open failure or process exit) - STT is now dead until this module restarts")
                 break
 
-            data = _apply_gain(data, AUDIO_GAIN)
-
             now = time.time()
+
+            # Our own TTS is playing (or just finished) - drop the
+            # chunk entirely: no decode, no gate/floor update (the
+            # speaker blast would poison the ambient estimate), no
+            # prebuffer (we don't want our own voice flushed into the
+            # recognizer when the gate next opens).
+            if now < self.mute_until:
+                prebuffer.clear()
+                continue
+
+            data = _apply_gain(data, AUDIO_GAIN)
             rms = _chunk_rms(data)
-            if noise_floor is None:
-                noise_floor = rms
-            threshold = max(MIN_THRESHOLD, noise_floor * NOISE_MULTIPLIER)
 
-            if rms > threshold:
-                speaking_until = now + TRAILING_SILENCE_SEC
-            elif now > speaking_until:
-                # Only drift the floor estimate during confirmed
-                # silence, so speech itself can never drag it upward.
-                noise_floor = noise_floor * (1 - NOISE_FLOOR_ALPHA) + rms * NOISE_FLOOR_ALPHA
-
-            if DEBUG_LEVELS:
-                print(f"Audio node: chunk rms={rms:.0f} floor={noise_floor:.0f} threshold={threshold:.0f}")
-
-            if now > speaking_until:
-                # Confirmed silence - skip Kaldi entirely for this chunk
-                # (the actual CPU win: no acoustic model, no decoder
-                # search, nothing, until sound picks up again), but
-                # keep a short rolling buffer so if speech starts on
-                # the very next chunk, we don't lose the onset.
+            if not gate.process(rms, now):
+                # Confirmed silence (or forced-shut ambient-noise gate) -
+                # skip Kaldi entirely for this chunk: no acoustic model,
+                # no decoder search, nothing, until sound picks up again.
+                # Keep a short rolling buffer so if speech starts on the
+                # very next chunk, we don't lose the onset.
                 prebuffer.append(data)
                 continue
 

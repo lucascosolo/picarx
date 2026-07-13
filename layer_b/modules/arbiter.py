@@ -54,6 +54,7 @@ class Arbiter:
         # source_name -> {"priority", "action", "expires_at"}
         self.intents = {}
         self.last_sent_action = None
+        self.last_look_sent = None
 
     # ---------- intent bookkeeping ----------
 
@@ -79,6 +80,24 @@ class Arbiter:
         source = payload.get("source")
         with self.lock:
             self.intents.pop(source, None)
+
+    def on_look(self, payload):
+        """
+        Camera head (pan/tilt) channel - deliberately OUTSIDE the
+        priority/winner system above. Look actions don't drive the
+        wheels, so they must not compete with (or starve) movement
+        intents for the single winner slot; they're forwarded to the
+        safety daemon directly, deduplicated so a re-published
+        identical head position doesn't hit the socket again.
+        """
+        action = payload.get("action") or {}
+        if action.get("direction") != "look":
+            return
+        key = (action.get("pan", 0), action.get("tilt", 0))
+        if key == self.last_look_sent:
+            return
+        self.last_look_sent = key
+        self.send_to_safety(action)
 
     def _prune_expired(self):
         now = time.time()
@@ -114,6 +133,7 @@ class Arbiter:
     def run(self):
         self.bus.subscribe("picarx/intent/move", self.on_intent)
         self.bus.subscribe("picarx/intent/cancel", self.on_cancel)
+        self.bus.subscribe("picarx/intent/look", self.on_look)
         print("Arbiter active. Waiting for motion intents.")
 
         period = 1.0 / TICK_HZ

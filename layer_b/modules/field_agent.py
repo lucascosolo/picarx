@@ -130,6 +130,37 @@ WAKE_PHRASES = ("robot", "hey robot", "computer")
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker
 
+# Vision close_object cross-check: if the ultrasonic has a FRESH
+# reading that says the path ahead is clearly open, a frame-filling
+# SSD detection is a wall/sofa across the room (or floor texture), not
+# a point-blank obstacle - field data showed vision evasions firing
+# with 60-300cm of measured clear air. The vision signal exists to
+# cover the ultrasonic's close-range dead zone; that dead zone only
+# produces short or missing readings, never confidently-long ones, so
+# trusting a long fresh reading over vision here doesn't reopen it.
+VISION_OBSTACLE_ULTRASONIC_CLEAR_CM = 60
+
+# Look-around head scan performed when exploration starts: sweep the
+# camera across these pan angles (degrees, negative = left), dwelling
+# at each long enough for the SSD to get a detection pass in
+# (OBJECT_DETECT_INTERVAL is 1.5s), recording what's visible where.
+# The result is announced, published on picarx/exploration/room_scan,
+# and logged to events.db - the robot's first durable record of room
+# layout. (An ackermann-steered car can't spin in place, so a head
+# sweep is the practical version of "turn a circle and take in the
+# room".)
+SCAN_PAN_ANGLES = (-70, -35, 0, 35, 70)
+SCAN_DWELL_SEC = 1.8
+SCAN_TILT = 0
+
+# Physical stuck detection: commanding forward with nothing being
+# vetoed, but the camera scene isn't changing -> wheels are pushing
+# against something below the ultrasonic beam (or slipping). vision's
+# scene_motion (mean abs thumbnail diff, ~6.0+ while actually moving)
+# stays near zero when the view is frozen.
+STUCK_AFTER_SEC = 4.0          # this long of continuous forward with a static view -> stuck
+STUCK_MOTION_THRESHOLD = 3.0   # scene_motion below this counts as "static"
+
 # Evasion/coaching priorities - both outrank normal exploring (5), and
 # COACH_PRIORITY outranks the canned evasion sequence (8) too, since a
 # coach-directed maneuver during a fail state should win over whatever
@@ -183,7 +214,14 @@ DEFAULT_COACH_DURATION = 1.5  # how long to follow a suggested action if it does
 # after enough consecutive failures, keep that from turning into a
 # rapid-fire query storm (each one a real API call) that never lets a
 # single attempt actually run its course.
-FAIL_STATE_COOLDOWN = 3.0        # seconds to wait after a failed episode before trying again
+# Raised 3.0 -> 8.0 and now applied after EVERY episode (success too,
+# not just failure): field data showed 68 fail-state entries in 7.5
+# minutes - episodes kept "succeeding" (their action window happened to
+# stay veto-free), resetting the failure counter, then instantly
+# re-triggering. Each entry is an announcement plus a potential paid
+# LLM call, so back-to-back re-entry has to be rate-limited regardless
+# of episode outcome.
+FAIL_STATE_COOLDOWN = 8.0        # min seconds between fail-state episodes
 MAX_CONSECUTIVE_FAILURES = 3     # give up and wait for a human after this many straight failures
 
 
@@ -205,13 +243,22 @@ class FieldAgent:
         # thread (the run() loop) - bus callbacks only ever feed the
         # lock-protected inboxes below, never touch state directly,
         # so there's no cross-thread race on the state machine itself.
-        self.state = "CRUISING"  # "CRUISING", "EVADING", "COACHING"
+        self.state = "CRUISING"  # "CRUISING", "SCANNING", "EVADING", "COACHING"
         self.evade_stage = 0     # 0: stop, 1: reverse, 2: turn
         self.state_until = 0.0
         self.evasion_fail_events = deque()
         self.next_fail_state_allowed_at = 0.0
         self.consecutive_coach_failures = 0
         self.given_up = False    # true once MAX_CONSECUTIVE_FAILURES is hit; "explore" clears it
+
+        # Look-around head scan state (see SCAN_PAN_ANGLES).
+        self.scan_index = 0
+        self.scan_dwell_until = 0.0
+        self.scan_sightings = []       # [{"pan": angle, "labels": [...]}, ...]
+        self.last_room_scan = None     # kept for reports; also published + logged
+
+        # Physical stuck detection state (see STUCK_AFTER_SEC).
+        self.forward_since = None      # when the current uninterrupted forward run began
 
         # Wander state (mirrors the old reflex explorer's behavior,
         # now expressed as intents instead of direct socket calls)
@@ -255,6 +302,14 @@ class FieldAgent:
 
     def cancel_intent(self):
         self.bus.publish("picarx/intent/cancel", {"source": SOURCE_NAME})
+
+    def publish_look(self, pan, tilt=SCAN_TILT):
+        # Camera head only - rides its own topic, outside the arbiter's
+        # single-winner movement channel (see arbiter.on_look).
+        self.bus.publish("picarx/intent/look", {
+            "source": SOURCE_NAME,
+            "action": {"direction": "look", "pan": pan, "tilt": tilt},
+        })
 
     # ---------- outbound: speech ----------
 
@@ -326,17 +381,25 @@ class FieldAgent:
         if "explore" in text or "start" in text:
             if not self.explore_mode:
                 self.explore_mode = True
-                self.state = "CRUISING"
                 self.given_up = False
                 self.consecutive_coach_failures = 0
                 self.next_fail_state_allowed_at = 0.0
-                self.announce("Starting exploration.", force=True)
+                self.forward_since = None
+                # Look around before rolling: sweep the camera across
+                # the room and take stock of what's where first.
+                self.state = "SCANNING"
+                self.scan_index = 0
+                self.scan_dwell_until = time.time() + SCAN_DWELL_SEC
+                self.scan_sightings = []
+                self.publish_look(SCAN_PAN_ANGLES[0])
+                self.announce("Starting exploration. Let me take a look around first.", force=True)
             return
 
         if "stop" in text or "halt" in text:
             if self.explore_mode:
                 self.explore_mode = False
                 self.cancel_intent()
+                self.publish_look(0, 0)  # recenter the head wherever the scan/drive left it
                 self.announce("Stopping.", force=True)
             return
 
@@ -578,6 +641,12 @@ class FieldAgent:
         })
         if succeeded:
             self.consecutive_coach_failures = 0
+            # Success still starts the cooldown: an instantly
+            # re-triggering "success" (the suggested action's window
+            # happened to stay veto-free without actually freeing the
+            # robot) was re-entering a fresh episode within the same
+            # second - see FAIL_STATE_COOLDOWN comment.
+            self.next_fail_state_allowed_at = now + FAIL_STATE_COOLDOWN
             self.announce("That worked.")
             return
 
@@ -665,6 +734,7 @@ class FieldAgent:
         stuck_pattern = len(self.evasion_fail_events) >= EVASION_FAIL_THRESHOLD
         with self.lock:
             self.veto_events.clear()
+        self.forward_since = None
         self.state = "COACHING"
         self.coach_action = None
         self.coach_apply_until = 0.0
@@ -678,6 +748,7 @@ class FieldAgent:
 
     def _begin_evasion(self, reason):
         now = time.time()
+        self.forward_since = None
         self.evasion_fail_events.append(now)
         _prune_older_than(self.evasion_fail_events, EVASION_FAIL_WINDOW, now)
         if len(self.evasion_fail_events) >= EVASION_FAIL_THRESHOLD:
@@ -702,6 +773,44 @@ class FieldAgent:
         for payload in suggestions:
             self._apply_coach_suggestion(payload)
 
+    # ---------- look-around head scan ----------
+
+    def _handle_scanning_tick(self, now):
+        # Stationary the whole time - hold an explicit stop so the
+        # arbiter doesn't fall through to some stale lower-priority
+        # intent while our head is turned.
+        self.publish_intent({"direction": "stop"})
+        if now < self.scan_dwell_until:
+            return
+
+        # Dwell at this angle is over - record what's visible here.
+        snap = self._snapshot() or {}
+        objects = snap.get("objects", {})
+        labels = sorted({
+            o.get("label") for o in objects.get("items", [])
+            if o.get("label") and not objects.get("stale", True)
+        })
+        self.scan_sightings.append({"pan": SCAN_PAN_ANGLES[self.scan_index], "labels": labels})
+
+        self.scan_index += 1
+        if self.scan_index < len(SCAN_PAN_ANGLES):
+            self.publish_look(SCAN_PAN_ANGLES[self.scan_index])
+            self.scan_dwell_until = now + SCAN_DWELL_SEC
+            return
+
+        # Sweep complete - recenter, remember, publish, announce, roll.
+        self.publish_look(0, 0)
+        self.last_room_scan = {"scanned_at": now, "sightings": self.scan_sightings}
+        self.bus.publish("picarx/exploration/room_scan", self.last_room_scan)
+
+        seen = sorted({label for s in self.scan_sightings for label in s["labels"]})
+        if seen:
+            self.announce(f"I looked around and I can see: {', '.join(seen)}. Off I go.", force=True)
+        else:
+            self.announce("I looked around but didn't recognize anything. Exploring anyway.", force=True)
+        self.state = "CRUISING"
+        self.last_wander = now
+
     # ---------- exploration behavior ----------
 
     def explore_tick(self):
@@ -710,6 +819,10 @@ class FieldAgent:
         with self.lock:
             _prune_older_than(self.veto_events, VETO_WINDOW, now)
             veto_count = len(self.veto_events)
+
+        if self.state == "SCANNING":
+            self._handle_scanning_tick(now)
+            return
 
         if self.state == "COACHING":
             self._handle_coaching_tick(now)
@@ -764,7 +877,15 @@ class FieldAgent:
         # --- Handle a vision-flagged approaching object (covers the
         # ultrasonic's blind spots - this is the fix for driving
         # straight into things the distance sensor never saw) ---
-        if vision_obstacle is not None:
+        # Cross-checked against the ultrasonic: a fresh, clearly-long
+        # distance reading means the frame-filling detection is the
+        # room itself (wall/sofa/floor), not a point-blank obstacle -
+        # see VISION_OBSTACLE_ULTRASONIC_CLEAR_CM.
+        ultrasonic_says_clear = (
+            distance is not None and not distance_stale
+            and distance > VISION_OBSTACLE_ULTRASONIC_CLEAR_CM
+        )
+        if vision_obstacle is not None and not ultrasonic_says_clear:
             label = vision_obstacle.get("label", "something")
             if label == "something":
                 self.announce("Something's right in front of me, backing away.")
@@ -776,6 +897,8 @@ class FieldAgent:
         # --- Handle Trustworthiness of Sensor Data ---
         if distance is None or distance_stale or distance < 0:
             # Fallback cautious crawl if we are blind
+            if self._note_forward_and_check_stuck(now, snap):
+                return
             self.publish_intent({"direction": "forward", "speed": 15})
             return
 
@@ -802,7 +925,33 @@ class FieldAgent:
             return
 
         # --- Standard Base Case ---
+        if self._note_forward_and_check_stuck(now, snap):
+            return
         self.publish_intent({"direction": "forward", "speed": 25})
+
+    def _note_forward_and_check_stuck(self, now, snap):
+        """Physical stuck detection: continuously commanding forward
+        while the camera view stays static means the wheels are pushing
+        against something below the ultrasonic beam (or spinning in
+        place). Returns True if it triggered an evasion (tick consumed).
+        Any visibly-moving scene sample restarts the window, so firing
+        requires STUCK_AFTER_SEC of forward with a frozen view."""
+        if self.forward_since is None:
+            self.forward_since = now
+            return False
+        if now - self.forward_since < STUCK_AFTER_SEC:
+            return False
+        objects = (snap or {}).get("objects", {})
+        motion = objects.get("scene_motion")
+        if objects.get("stale", True) or motion is None:
+            return False  # no usable vision signal - can't judge, keep driving
+        if motion >= STUCK_MOTION_THRESHOLD:
+            self.forward_since = now  # scene is changing - genuinely moving
+            return False
+        self.forward_since = None
+        self.announce("I've been pushing forward but the view isn't changing. I think I'm stuck, backing off.")
+        self._begin_evasion("no_visual_motion")
+        return True
 
     # ---------- main loop ----------
 

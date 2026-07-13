@@ -129,6 +129,14 @@ class EventLogger:
     def on_coach_episode(self, payload):
         self.log_event("picarx/coach/episode", payload)
 
+    def on_room_scan(self, payload):
+        # One row per completed look-around head sweep (field_agent):
+        # what was visible at each camera pan angle. Low volume (one
+        # per "explore" command), and it's the robot's only durable
+        # record of room layout - the starting point for any future
+        # spatial memory/mapping work.
+        self.log_event("picarx/exploration/room_scan", payload)
+
     def on_world_state(self, payload):
         # Always keep the freshest snapshot around for the timer loop
         # to write out on its own schedule.
@@ -167,6 +175,7 @@ class EventLogger:
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
+        self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 
         threading.Thread(target=self.snapshot_loop, daemon=True).start()

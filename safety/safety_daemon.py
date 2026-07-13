@@ -125,10 +125,33 @@ def check_battery():
         print(f"Battery read error: {e}")
 
 def is_safe(action):
+    direction = action.get("direction")
+
+    # Only FORWARD motion needs sensor checks. This matters for two
+    # reasons beyond correctness:
+    #
+    #  - The cliff sensors are front-mounted IR reflectance sensors.
+    #    Running the cliff check on "backward" meant a dark patch of
+    #    floor (carpet seam, shadow) that false-reads as a cliff would
+    #    veto the robot's own backward escape from that very spot -
+    #    the observed "says backing away but never moves" freeze. A
+    #    front-detected cliff/obstacle is escaped BY reversing; the
+    #    sensors can't see behind the robot either way, so vetoing
+    #    reverse never protected anything.
+    #  - "stop" must never be vetoable (it IS the safe state), and
+    #    "turn" only moves the steering servo. Skipping the 3-sample
+    #    grayscale read (~30ms of sleeps + hardware-lock contention
+    #    with the 50Hz MotionSmoother) for all of these also removes
+    #    most of this daemon's measured CPU load - the arbiter
+    #    re-sends the active action at 10Hz, so is_safe used to run
+    #    the full sensor suite ten times a second even while stopped.
+    if direction in ("stop", "turn", "backward", "look"):
+        return True, "ok"
+
     with hardware_lock:
         distance = px.ultrasonic.read()
 
-    if action.get("direction") == "forward" and (0 < distance < SAFE_DISTANCE_CM):
+    if direction == "forward" and (0 < distance < SAFE_DISTANCE_CM):
         return False, f"obstacle at {distance}cm"
 
     # Grayscale/cliff sensors are IR reflectance sensors, not true
@@ -163,11 +186,18 @@ def is_safe(action):
 
     return True, "ok"
 
+# Camera head servo limits - clamped here (the sole hardware gate)
+# so no upstream module can ever command the servos past their
+# physical range regardless of what arrives on the socket.
+CAM_PAN_RANGE = (-80, 80)
+CAM_TILT_RANGE = (-30, 60)
+
+
 def execute(action):
     """Updates the targets for the motion thread instead of blocking hardware."""
     d = action.get("direction")
     speed = action.get("speed", 30)
-    
+
     if d == "forward":
         motion.update_targets(speed=speed)
     elif d == "backward":
@@ -176,6 +206,14 @@ def execute(action):
         motion.update_targets(speed=0)
     elif d == "turn":
         motion.update_targets(angle=action.get("angle", 0))
+    elif d == "look":
+        # Camera pan/tilt only - never touches drive motors or
+        # steering, so it doesn't go through the MotionSmoother.
+        pan = max(CAM_PAN_RANGE[0], min(CAM_PAN_RANGE[1], int(action.get("pan", 0))))
+        tilt = max(CAM_TILT_RANGE[0], min(CAM_TILT_RANGE[1], int(action.get("tilt", 0))))
+        with hardware_lock:
+            px.set_cam_pan_angle(pan)
+            px.set_cam_tilt_angle(tilt)
 
 def main():
     if os.path.exists(SOCKET_PATH):
