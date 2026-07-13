@@ -44,6 +44,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+from semantic_store import SemanticStore
 
 import threading
 import queue
@@ -98,6 +99,9 @@ class Companion:
         self.work_queue = queue.Queue()
         self._client = None
         self._warned_no_key = False
+        # Read-only view of what reflection.py has learned; fail-soft
+        # (returns [] until the first reflection has ever run).
+        self.semantic = SemanticStore(readonly=True)
 
     # ---------- memory persistence ----------
 
@@ -180,6 +184,14 @@ class Companion:
         if battery.get("voltage") is not None:
             low_note = " (low)" if battery.get("low") else ""
             parts.append(f"battery {battery['voltage']:.1f}V{low_note}")
+
+        # Fold in a couple of long-term learned facts (from reflection.py's
+        # semantic store) so conversation can draw on more than the last
+        # few seconds of sensors. One tiny read-only SELECT per utterance.
+        facts = self.semantic.recent_facts(limit=2)
+        if facts:
+            remembered = "; ".join(f"{f['subject']}: {f['fact']}" for f in facts)
+            parts.append(f"long-term memory notes: {remembered}")
 
         return "; ".join(parts)
 
