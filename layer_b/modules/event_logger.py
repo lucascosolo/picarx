@@ -147,6 +147,15 @@ class EventLogger:
         # logging every publish is already change-triggered, not periodic.
         self.log_event("picarx/exploration/uncertainty_map", payload)
 
+    def on_active_goal(self, payload):
+        # Goal adoptions and clears (goal_manager). Low volume - at
+        # most one every few minutes while exploring.
+        self.log_event("picarx/exploration/active_goal", payload)
+
+    def on_goal_progress(self, payload):
+        # One row per finished subgoal episode: reached or abandoned.
+        self.log_event("picarx/exploration/goal_progress", payload)
+
     def on_hypothesis(self, payload):
         # One row per resolved sensor-disagreement probe (field_agent):
         # what was ambiguous, what the test found. Reflection turns
@@ -203,6 +212,8 @@ class EventLogger:
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
         self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
+        self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
+        self.bus.subscribe("picarx/exploration/goal_progress", self.on_goal_progress)
         self.bus.subscribe("picarx/decision", self.on_decision)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 

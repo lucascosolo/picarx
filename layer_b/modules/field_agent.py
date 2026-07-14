@@ -99,6 +99,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+from spatial_store import SpatialStore
 
 import sqlite3
 import json
@@ -325,6 +326,13 @@ class FieldAgent:
         # old spatially-blind behavior.
         self.current_location = None       # last location_change payload
         self.uncertainty_scores = {}       # location_id -> score
+        self.spatial = SpatialStore(readonly=True)  # map queries for spoken reports
+
+        # Active exploration subgoal (goal_manager.py, optional): if a
+        # scan spots any of the goal place's landmark labels, wander
+        # leans toward that side until the goal changes.
+        self.active_goal = None            # last active_goal payload (or None)
+        self.goal_bias_angle = None        # signed angle toward last goal sighting
 
         # Cross-thread inboxes (bus callbacks append, explore_tick/
         # _perception_tick drain under self.lock).
@@ -456,6 +464,11 @@ class FieldAgent:
         with self.lock:
             self.uncertainty_scores = scores
 
+    def on_active_goal(self, payload):
+        with self.lock:
+            self.active_goal = payload if payload.get("location_id") is not None else None
+            self.goal_bias_angle = None  # re-derived from the next scan
+
     def _location_context(self):
         """Compact {id,label,score} of where we are, or None."""
         with self.lock:
@@ -522,6 +535,10 @@ class FieldAgent:
 
         if "object" in text or "what's around" in text or "whats around" in text or "what do you notice" in text:
             self.report_objects()
+            return
+
+        if "where are you" in text or "map" in text or "places" in text:
+            self.report_map()
             return
 
         if "what do you see" in text or "status" in text or "report" in text:
@@ -609,6 +626,31 @@ class FieldAgent:
             else:
                 descriptions.append(f"a {label} I've been tracking for a bit")
         self.announce(f"I currently see {len(items)}: " + ", ".join(descriptions) + ".", force=True)
+
+    def report_map(self):
+        """Spoken summary of the spatial map: where am I, how much of
+        the world do I know, what's still mysterious. All read-only
+        and fail-soft (no spatial modules -> honest 'no map yet')."""
+        count = self.spatial.location_count()
+        if count == 0:
+            self.announce("I haven't built a map yet. Tell me to explore and I'll start one.",
+                          force=True)
+            return
+        parts = [f"I know {count} place{'s' if count != 1 else ''}"]
+        loc = self._location_context()
+        if loc and loc.get("label"):
+            parts.append(f"right now I believe I'm at {loc['label']}")
+        with self.lock:
+            scores = dict(self.uncertainty_scores)
+            goal = dict(self.active_goal) if self.active_goal else None
+        if scores:
+            mystery_id = max(scores, key=scores.get)
+            mystery = self.spatial.get_location(mystery_id)
+            if mystery and scores[mystery_id] >= 0.3:
+                parts.append(f"the place I understand least is {mystery['label']}")
+        if goal:
+            parts.append(f"my current mission is to reach {goal.get('label')}")
+        self.announce(". ".join(parts) + ".", force=True)
 
     def report_history(self):
         try:
@@ -1126,6 +1168,7 @@ class FieldAgent:
                                "distance_cm": scan_distance}
         self.bus.publish("picarx/exploration/room_scan", self.last_room_scan)
         self.preferred_escape_angle = self._escape_angle_from_scan()
+        self.goal_bias_angle = self._goal_angle_from_scan()
         self.last_scan_at = now
         self.state = "CRUISING"
         self.last_wander = now
@@ -1148,6 +1191,25 @@ class FieldAgent:
         if left == right:
             return None
         return -30 if left < right else 30
+
+    def _goal_angle_from_scan(self):
+        """If the last sweep saw any of the active goal's landmark
+        labels, return a signed angle toward the side they appeared on
+        (None when no goal, no match, or it was dead ahead). This is
+        the only steering the goal system gets - purely a lean."""
+        with self.lock:
+            goal = dict(self.active_goal) if self.active_goal else None
+        targets = set((goal or {}).get("target_labels") or [])
+        if not targets:
+            return None
+        weighted = 0
+        for s in self.scan_sightings:
+            hits = targets.intersection(s["labels"])
+            if hits and s["pan"]:
+                weighted += (1 if s["pan"] > 0 else -1) * len(hits)
+        if weighted == 0:
+            return None
+        return 25 if weighted > 0 else -25
 
     # ---------- exploration behavior ----------
 
@@ -1309,6 +1371,17 @@ class FieldAgent:
         """Pick the next wander steering angle, curiosity-aware when the
         spatial modules are up. Returns (angle, reason) - the reason is
         the honest explanation that goes into the decision journal."""
+        # An active subgoal whose landmarks were sighted outranks
+        # curiosity drift: we know which way progress is.
+        with self.lock:
+            goal = dict(self.active_goal) if self.active_goal else None
+            goal_angle = self.goal_bias_angle
+        if goal is not None and goal_angle is not None and random.random() < CURIOSITY_BIAS_PROB:
+            side = 1 if goal_angle > 0 else -1
+            angle = side * random.randint(12, 25)
+            return angle, (f"leaning toward {goal.get('label')} - "
+                           f"its landmarks were sighted on that side")
+
         loc = self._location_context()
         settled = (loc is not None and loc.get("uncertainty") is not None
                    and loc["uncertainty"] < CURIOSITY_SETTLED_SCORE)
@@ -1361,6 +1434,7 @@ class FieldAgent:
         self.bus.subscribe("picarx/coach/suggestion", self.on_coach_suggestion)
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
+        self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)
