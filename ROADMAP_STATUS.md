@@ -83,6 +83,27 @@ veto logic is untouched (its veto *replies* gained a machine-readable
   supply. New voice commands: "what's playing", "list stations". An
   unknown dial says so instead of silently defaulting.
 
+## Follow-up: live station search + web console + mic kill-switch
+
+- **Live radio search** (`radio_browser.py`, stdlib-only client for the
+  free radio-browser.info directory, per its API guidelines: DNS server
+  discovery, speaking User-Agent, play-click reporting). "radio find
+  soft rock" searches by tag then name (top-voted, broken streams
+  filtered), plays the first hit, and "next station" cycles the
+  RESULTS until you like one. Saved dials/names still work and switch
+  back to the saved list.
+- **Web console** (`modules/web_console.py` + `web_ui/console.html`,
+  stdlib HTTP server on port 8088): phone/laptop control panel for
+  loud rooms. Every button/text box submits the exact phrase to
+  `picarx/audio/heard` — the same bytes the mic would publish — so the
+  web path exercises the identical pipeline as voice. Live status
+  (battery, distance, location, mission, radio) plus a heard/spoken
+  log, polled every 2 s. LAN-only, no auth: don't port-forward it.
+- **Mic kill-switch**: `picarx/audio/mic_control {"enabled": bool}` —
+  audio_nodes keeps draining the capture pipe but decodes nothing, so
+  a loud room (or the radio itself) can't fire false commands; state
+  echoes on `picarx/audio/mic_state` and the console shows a toggle.
+
 ## Resource footprint
 
 Steady-state additions are three mostly-sleeping processes

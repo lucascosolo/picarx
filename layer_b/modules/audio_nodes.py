@@ -190,7 +190,7 @@ class EnergyGate:
 # Digital gain applied to every captured chunk before anything else
 # sees it - see the module docstring for why this exists. 1.0 = no
 # change. Tune with AUDIO_DEBUG_LEVELS=1 alongside SILENCE_RMS_THRESHOLD.
-AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "1.0"))
+AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "12.0"))
 
 
 def _apply_gain(data, gain):
@@ -303,6 +303,11 @@ class AudioNode:
     def __init__(self):
         self.bus = Bus()
         self.mute_until = 0.0   # mic ignored while our own TTS is playing (see speak())
+        # Remote mic kill-switch (picarx/audio/mic_control) - lets the
+        # web console silence STT entirely in a loud room (or while the
+        # radio plays) so background noise can't fire false commands.
+        # Speech OUT is unaffected; only recognition is gated.
+        self.mic_enabled = True
 
         # TTS: shell out to espeak directly per call, rather than using
         # pyttsx3. pyttsx3's espeak driver has a known issue on Linux
@@ -385,8 +390,18 @@ class AudioNode:
         except (FileNotFoundError, subprocess.SubprocessError) as e:
             print(f"Audio node: could not enable speakers via '{cmd}': {e}")
 
+    def on_mic_control(self, payload):
+        enabled = bool(payload.get("enabled", True))
+        if enabled != self.mic_enabled:
+            self.mic_enabled = enabled
+            print(f"Audio node: microphone {'enabled' if enabled else 'disabled'} remotely")
+        # Always answer with current state so UIs can sync on connect.
+        self.bus.publish("picarx/audio/mic_state",
+                         {"enabled": self.mic_enabled, "ts": time.time()})
+
     def run(self):
         self.bus.subscribe("picarx/audio/speak", self.handle_speak_request)
+        self.bus.subscribe("picarx/audio/mic_control", self.on_mic_control)
         self._enable_speakers()
 
         if not self.model:
@@ -428,6 +443,12 @@ class AudioNode:
                 break
 
             now = time.time()
+
+            # Remotely disabled (web console kill-switch): keep reading
+            # so the arecord pipe never backs up, but decode nothing.
+            if not self.mic_enabled:
+                prebuffer.clear()
+                continue
 
             # Our own TTS is playing (or just finished) - drop the
             # chunk entirely: no decode, no gate/floor update (the

@@ -109,9 +109,28 @@ def _tune_payload(m, text):
     return {"command": "play", "dial": dial} if dial else None
 
 
+# Words that aren't part of the genre/name in a search utterance:
+# "radio find some soft rock for me please" -> keywords "soft rock".
+_FIND_FILLER = {"radio", "station", "stations", "find", "search", "look",
+                "for", "a", "an", "some", "me", "please", "the", "up",
+                "on", "of", "to", "my", "play"}
+
+
+def _find_payload(m, text):
+    words = [w for w in re.findall(r"[a-z0-9]+", text) if w not in _FIND_FILLER]
+    if not words or all(w.isdigit() for w in words):
+        return None  # nothing searchable / it's a dial - let later rules tune it
+    return {"command": "find", "keywords": " ".join(words)}
+
+
 RULES = [
     (re.compile(r"\b(?:stop|pause|turn off|kill)\b.*\bradio\b|\bradio off\b"),
      "picarx/tools/radio", lambda m, t: {"command": "stop"}),
+    # Live directory search: needs a find/search word AND radio/station
+    # in the utterance ("radio find soft rock", "find me a jazz station").
+    (re.compile(r"\b(?:find|search)\b(?=.*\b(?:radio|station)\b)|"
+                r"\b(?:radio|station)\b(?=.*\b(?:find|search)\b)"),
+     "picarx/tools/radio", _find_payload),
     (re.compile(r"\bwhat(?:'s| is)?\s+playing\b|\bradio status\b"),
      "picarx/tools/radio", lambda m, t: {"command": "status"}),
     (re.compile(r"\blist\b.*\bstations?\b|\bwhat stations\b"),
@@ -136,9 +155,11 @@ RULES = [
 TOOL_DESCRIPTIONS = [
     {"name": "radio", "topic": "picarx/tools/radio",
      "say": "play radio / stop radio / next station / station <name> / "
-            "tune to <number> / what's playing / list stations",
-     "description": "streams internet radio through my speaker; tune by a "
-                    "dial number you've mapped to a stream"},
+            "tune to <number> / radio find <genre or name> / "
+            "what's playing / list stations",
+     "description": "streams internet radio through my speaker; tune saved "
+                    "dials, or search the live radio-browser.info directory "
+                    "by keyword and cycle results with next station"},
 ]
 
 

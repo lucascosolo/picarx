@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX Console</title>
+<style>
+  :root { --bg:#14171c; --card:#1d2229; --fg:#e8eaed; --dim:#9aa3ad;
+          --accent:#4fa3ff; --ok:#39c26d; --warn:#e0a03c; --off:#d05555; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.45 system-ui, sans-serif; padding:12px; max-width:640px;
+         margin-inline:auto; }
+  h1 { font-size:1.15rem; margin:2px 0 10px; }
+  .card { background:var(--card); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .card h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--dim); margin:0 0 8px; }
+  .grid { display:flex; flex-wrap:wrap; gap:8px; }
+  button { background:#2a323d; color:var(--fg); border:0; border-radius:8px;
+           padding:10px 14px; font-size:.95rem; cursor:pointer; }
+  button:active { background:var(--accent); }
+  button.danger { background:#54333a; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  input[type=text] { flex:1; background:#10141a; color:var(--fg);
+           border:1px solid #333b46; border-radius:8px; padding:10px; font-size:.95rem; }
+  #mic { font-weight:600; }
+  #mic.on  { background:var(--ok); color:#08130c; }
+  #mic.off { background:var(--off); color:#180808; }
+  .stat { display:flex; justify-content:space-between; padding:2px 0;
+          border-bottom:1px solid #262d36; font-size:.9rem; }
+  .stat:last-child { border-bottom:0; }
+  .stat span:first-child { color:var(--dim); }
+  #log { font:12.5px/1.5 ui-monospace, monospace; max-height:240px; overflow-y:auto; }
+  #log div { padding:1px 0; }
+  #log .robot { color:var(--accent); }
+  #log .you, #log .heard { color:var(--ok); }
+  #conn { float:right; font-size:.75rem; color:var(--dim); }
+</style>
+</head>
+<body>
+<h1>PicarX Console <span id="conn">connecting…</span></h1>
+
+<div class="card">
+  <h2>Microphone</h2>
+  <button id="mic" class="on" onclick="toggleMic()">MIC ON</button>
+  <span style="color:var(--dim);font-size:.85rem;margin-left:8px">
+    disable in loud rooms / while radio plays</span>
+</div>
+
+<div class="card">
+  <h2>Robot</h2>
+  <div class="grid">
+    <button onclick="say('explore')">Explore</button>
+    <button class="danger" onclick="say('stop')">STOP</button>
+    <button onclick="say('status')">Status</button>
+    <button onclick="say('what do you notice')">Objects</button>
+    <button onclick="say('map')">Map</button>
+    <button onclick="say('why did you do that')">Why?</button>
+    <button onclick="say('history')">History</button>
+    <button onclick="say('battery')">Battery</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Radio</h2>
+  <div class="grid">
+    <button onclick="say('play radio')">Play</button>
+    <button onclick="say('stop radio')">Stop</button>
+    <button onclick="say('next station')">Next</button>
+    <button onclick="say(\"what's playing\")">Now playing</button>
+    <button onclick="say('list stations')">Saved list</button>
+  </div>
+  <div class="row">
+    <input type="text" id="dial" placeholder="dial e.g. 98.7" inputmode="decimal">
+    <button onclick="tune()">Tune</button>
+  </div>
+  <div class="row">
+    <input type="text" id="q" placeholder="search e.g. soft rock">
+    <button onclick="find()">Find</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Say anything (as if heard by the mic)</h2>
+  <div class="row">
+    <input type="text" id="free" placeholder="robot, how are you feeling?">
+    <button onclick="freeSay()">Send</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="stat"><span>Battery</span><span id="s-batt">–</span></div>
+  <div class="stat"><span>Obstacle distance</span><span id="s-dist">–</span></div>
+  <div class="stat"><span>Location</span><span id="s-loc">–</span></div>
+  <div class="stat"><span>Mission</span><span id="s-goal">–</span></div>
+  <div class="stat"><span>Radio</span><span id="s-radio">–</span></div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <div id="log"></div>
+</div>
+
+<script>
+let micOn = true;
+
+async function post(path, body) {
+  try { await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                           body: JSON.stringify(body)}); }
+  catch (e) { /* poll loop shows disconnect */ }
+}
+function say(text) { post('/say', {text}); }
+function freeSay() { const el = document.getElementById('free');
+  if (el.value.trim()) { say(el.value.trim()); el.value=''; } }
+function tune() { const el = document.getElementById('dial');
+  if (el.value.trim()) say('tune to ' + el.value.trim()); }
+function find() { const el = document.getElementById('q');
+  if (el.value.trim()) { say('radio find ' + el.value.trim()); el.value=''; } }
+function toggleMic() { post('/mic', {enabled: !micOn}); }
+
+function esc(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
+
+async function poll() {
+  try {
+    const r = await fetch('/state'); const s = await r.json();
+    document.getElementById('conn').textContent = 'connected';
+    micOn = s.mic_enabled;
+    const mic = document.getElementById('mic');
+    mic.textContent = micOn ? 'MIC ON' : 'MIC OFF';
+    mic.className = micOn ? 'on' : 'off';
+    document.getElementById('s-batt').textContent =
+      s.battery_v ? s.battery_v.toFixed(2) + ' V' + (s.battery_low ? ' (LOW)' : '') : '–';
+    document.getElementById('s-dist').textContent =
+      s.distance_cm != null ? s.distance_cm.toFixed(0) + ' cm' : '–';
+    document.getElementById('s-loc').textContent = s.location.label || 'unknown';
+    document.getElementById('s-goal').textContent = s.goal.label || 'none';
+    document.getElementById('s-radio').textContent =
+      s.radio.playing ? (s.radio.station + (s.radio.dial ? ' ('+s.radio.dial+')' : '')) : 'off';
+    document.getElementById('log').innerHTML = s.log.map(e =>
+      `<div class="${e.kind}">${e.t} ${e.kind==='robot'?'🤖':'🗣'} ${esc(e.text)}</div>`).join('');
+  } catch (e) {
+    document.getElementById('conn').textContent = 'disconnected';
+  }
+}
+setInterval(poll, 2000); poll();
+</script>
+</body>
+</html>
