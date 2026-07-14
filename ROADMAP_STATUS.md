@@ -1,0 +1,99 @@
+# Exploration & Memory Roadmap — Implementation Status
+
+All four phases of the roadmap are implemented, plus the three
+overarching goals (emergence, introspection, practical tools) woven
+through them. Everything is additive, MQTT-first, and fail-soft: any
+new module can crash or be disabled in `module_registry.json` and the
+robot degrades to exactly its previous behavior. The safety daemon's
+veto logic is untouched (its veto *replies* gained a machine-readable
+`reason_code`, nothing else).
+
+## What was built
+
+| Capability | Where | Notes |
+|---|---|---|
+| 1. Topological location graph | `spatial_store.py`, `modules/location_graph.py` | Places = perceptual fingerprints of head sweeps (side-tagged labels + ultrasonic range bucket) — honest for a platform with no odometry. Edges from consecutive distinct scans. |
+| 2. Curiosity-driven exploration | `modules/explorer.py`, `field_agent.py` | Per-place uncertainty (novelty/staleness/veto-trouble/coach-unpredictability). Wander leans away from well-understood spots; uniform random when modules absent. |
+| 3. Temporal pattern mining | `pattern_miner.py`, `modules/reflection.py`, `semantic.db patterns` table | Pure Python, no LLM, runs in idle windows even without an API key. ≥3 occurrences and ≥70% confidence required; patterns age out of coach prompts after 7 days. |
+| 4. Failure-mode-specific recovery | `safety/safety_daemon.py`, `field_agent.py`, `coach.py` | Stable `reason_code` (obstacle/cliff/reverse_limit) → situation keys split per failure mode; old keys warm-start new ones via embedding transfer. |
+| 5. Multi-modal situation context | `coach.py` | Embedding text now includes co-present objects, tight/open space, battery, place. Per-situation-type transfer thresholds (novelty 0.70, collision 0.78). |
+| 6. Active hypothesis testing | `field_agent.py` (probe state) | Ultrasonic-vs-vision disagreement triggers a bounded creep (speed 12 ≤ the 15 cap, 0.7 s < 1 s, ≥16 cm, ≤1/min; safety veto still underneath). Outcomes → `picarx/exploration/hypothesis` → reflection. |
+| 7. Long-horizon goals | `modules/goal_manager.py`, `field_agent.py` | Subgoal = least-understood reachable place; reached/abandoned episodes; 3 abandonments ⇒ unreachable (persisted). Purely advisory — never publishes movement intents. |
+| 8. Spatial uncertainty output | `modules/explorer.py` → `data/uncertainty_map.json` + `picarx/exploration/uncertainty_map` | Rich per-place components for human review; published only on material change. Voice: "map" / "where are you". |
+
+## The three overarching goals
+
+- **Emergence:** coach runs deliberate experiments on 10% of
+  non-urgent queries ("suggest something unlike anything tried here"),
+  tagged `experimental` and narrated as experiments. Surprises (proven
+  arm fails / written-off arm succeeds) publish `picarx/coach/surprise`;
+  reflection is prompted to turn them into concrete "what if" *idea*
+  facts, which flow back into future coach prompts automatically.
+- **Introspection:** a decision journal (`picarx/decision`, persisted
+  in events.db) records every wander choice, probe, goal adoption, and
+  coach strategy pick **with the reason at decision time**. Voice
+  command "why" / "why did you do that" reads it back. Coach
+  suggestions carry honest confidence (observed success rate or
+  "guess"), and the spoken narration is calibrated to it.
+- **Practical tools:** `modules/tools_registry.py` is a data-driven
+  voice→topic router (`picarx/tools/available` for discovery);
+  `modules/radio.py` streams internet radio (SomaFM defaults in
+  `data/radio_stations.json`, editable) through the existing speaker
+  via mpv/ffplay/mplayer — degrading to a spoken "no radio capability"
+  when no player/network exists. field_agent ignores tool keywords so
+  "stop radio" never trips the robot-wide "stop".
+
+## Deliberate deviations from the roadmap text
+
+- **`locations`/`patterns` tables:** locations live in a new
+  `spatial.db` (owner: location_graph) rather than inside
+  `semantic.db`, preserving the codebase's documented
+  one-writer-per-database rule. `patterns` DID go into `semantic.db`
+  because reflection (its sole writer) is also the miner.
+- **Hypothesis probes don't round-trip through the coach.** The probe
+  is a fixed, hard-bounded template in field_agent — a deterministic
+  micro-test needs no LLM call (resource-light goal) and no new
+  arbiter mode. Outcomes still feed coach indirectly via
+  reflection-mined facts.
+- **Goal episodes aren't bandit outcomes.** goal_progress events are
+  digested by reflection into facts instead of feeding coach arms —
+  goals are advisory biases, not maneuvers, so success attribution to
+  a specific arm would be noise.
+- **No web dashboard.** `data/uncertainty_map.json` + the spoken map
+  report cover human review without a web stack on the Pi.
+
+## Resource footprint
+
+Steady-state additions are three mostly-sleeping processes
+(location_graph, explorer, goal_manager — each wakes on rare events or
+a 15–60 s timer), one scoring pass over a tiny SQLite table per
+minute, and zero new LLM calls in the hot path. Pattern mining runs
+only in idle windows. The only new LLM cost is the ~10% experiment
+rounds, which *replace* cache hits, and those are capped by the
+existing fail-state cooldowns. No new Python dependencies; mpv (or
+ffplay/mplayer) is optional and only for radio.
+
+## Verifying on the robot
+
+1. **Location graph:** say "explore"; after a few scans check
+   `spatial.db` (`SELECT label, visit_count FROM locations`) and
+   listen for "I think this is somewhere new."
+2. **Curiosity:** watch stdout for wander reasons ("...is already well
+   understood, drifting toward the clearer side").
+3. **Patterns:** after ≥30 min including some vetoes, check
+   `semantic.db`: `SELECT * FROM patterns` (or run
+   `python3 pattern_miner.py` directly — read-only, prints findings).
+4. **Failure modes:** trigger an ultrasonic veto vs. a cliff veto;
+   coach_policy.json grows keys like `collision_loop:...:obstacle`.
+5. **Hypothesis probe:** put a thin/angled obstacle the camera can't
+   classify in front; expect "Testing carefully" then a resolution.
+6. **Goals:** once ≥2 places are known, expect "New mission: find my
+   way back to place N"; `data/goal_state.json` records failures.
+7. **Introspection:** ask "why" after any of the above; ask "map".
+8. **Tools:** "what tools do you have", "play radio", "next station",
+   "stop radio" (needs mpv: `sudo apt install mpv`).
+
+Note: the orchestrator runs `layer_b/modules/`; the root-level
+`field_agent.py`/`coach.py`/`audio_nodes.py` copies are kept in sync
+with `modules/` as of this work (the modules/ copies had fallen behind
+the newer root copies — both now match).

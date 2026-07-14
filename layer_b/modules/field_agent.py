@@ -128,6 +128,12 @@ INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
 # with or without a wake phrase, since they're matched earlier above.
 WAKE_PHRASES = ("robot", "hey robot", "computer")
 
+# Utterances containing these are TOOL commands (tools_registry.py
+# routes them to their own modules). They must be ignored here so that
+# e.g. "stop radio" reaches the radio instead of tripping the
+# robot-wide "stop". Movement/safety words never appear in this list.
+TOOL_KEYWORDS = ("radio", "station", "tools")
+
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker
 
@@ -501,6 +507,11 @@ class FieldAgent:
         self.handle_voice_command(text)
 
     def handle_voice_command(self, text):
+        # Tool commands belong to tools_registry.py / their tool module.
+        if any(k in text for k in TOOL_KEYWORDS):
+            print(f"(tool command, leaving it to the tools registry): '{text}'")
+            return
+
         # Only an explicit "explore" starts driving. "start" was too loose -
         # STT mishearing background noise/TV as "start" could auto-launch
         # exploration on its own, which is exactly the unwanted

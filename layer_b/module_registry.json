@@ -12,5 +12,7 @@
   {"name": "reflection", "version": "0.1", "entrypoint": "reflection.py", "enabled": true},
   {"name": "location_graph", "version": "0.1", "entrypoint": "location_graph.py", "enabled": true},
   {"name": "explorer", "version": "0.1", "entrypoint": "explorer.py", "enabled": true},
-  {"name": "goal_manager", "version": "0.1", "entrypoint": "goal_manager.py", "enabled": true}
+  {"name": "goal_manager", "version": "0.1", "entrypoint": "goal_manager.py", "enabled": true},
+  {"name": "tools_registry", "version": "0.1", "entrypoint": "tools_registry.py", "enabled": true},
+  {"name": "radio", "version": "0.1", "entrypoint": "radio.py", "enabled": true}
 ]
