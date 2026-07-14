@@ -129,6 +129,12 @@ class EventLogger:
     def on_coach_episode(self, payload):
         self.log_event("picarx/coach/episode", payload)
 
+    def on_coach_surprise(self, payload):
+        # Rare by construction (a proven arm failing / a written-off
+        # arm succeeding): the raw material for reflection's "what
+        # should have worked but didn't" ideation.
+        self.log_event("picarx/coach/surprise", payload)
+
     def on_room_scan(self, payload):
         # One row per completed look-around head sweep (field_agent):
         # what was visible at each camera pan angle. Low volume (one
@@ -208,6 +214,7 @@ class EventLogger:
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
+        self.bus.subscribe("picarx/coach/surprise", self.on_coach_surprise)
         self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)

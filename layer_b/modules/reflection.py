@@ -74,6 +74,7 @@ INTERESTING_TOPICS = (
     "picarx/exploration/location_change",
     "picarx/exploration/hypothesis",
     "picarx/exploration/goal_progress",
+    "picarx/coach/surprise",
     "picarx/action/result",
 )
 
@@ -87,6 +88,11 @@ stable properties of the environment or its interactions ("the area with the sof
 tvmonitor causes repeated collisions", "escape maneuvers that reverse work better than
 turning here", "someone often asks about the battery"). Do NOT restate single transient
 events, speculate beyond the data, or include timestamps.
+
+Up to 2 of the entries may instead use the subject "idea": a specific, safe
+"what if ..." experiment the digest genuinely motivates (especially anything marked
+SURPRISE - something that should have worked but didn't, or vice versa). Ideas feed
+future coaching decisions, so keep them concrete and actionable, never fanciful.
 
 Reply with a JSON array only, no prose:
 [{{"subject": "<short topic, e.g. 'living room' or 'escape tactics'>",
@@ -161,6 +167,9 @@ class Reflection:
             if p.get("changed"):
                 return f"moved to known place: {p.get('label')} (visit {p.get('visit_count')})"
             return None  # re-confirming the same spot is noise at this altitude
+        if topic == "picarx/coach/surprise":
+            return (f"SURPRISE [{p.get('situation_key')}]: {p.get('kind')} "
+                    f"(prior success rate {p.get('prior_rate')})")
         if topic == "picarx/exploration/goal_progress":
             return (f"exploration subgoal '{p.get('label')}' {p.get('status')} "
                     f"after {p.get('elapsed')}s")

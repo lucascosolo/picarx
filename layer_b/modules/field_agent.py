@@ -537,6 +537,10 @@ class FieldAgent:
             self.report_objects()
             return
 
+        if "why" in text and ("why did you" in text or text.strip() == "why"):
+            self.report_why()
+            return
+
         if "where are you" in text or "map" in text or "places" in text:
             self.report_map()
             return
@@ -652,6 +656,38 @@ class FieldAgent:
             parts.append(f"my current mission is to reach {goal.get('label')}")
         self.announce(". ".join(parts) + ".", force=True)
 
+    def report_why(self):
+        """Self-explanation from the decision journal: read back the
+        most recent logged decisions WITH the reasons recorded at the
+        moment they were made - evidence, not reconstruction."""
+        rows = []
+        try:
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT payload_json FROM events WHERE topic = ? ORDER BY id DESC LIMIT 3",
+                    ("picarx/decision",)).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"Why query failed: {e}")
+        decisions = []
+        for (payload_json,) in rows:
+            try:
+                d = json.loads(payload_json)
+            except json.JSONDecodeError:
+                continue
+            if d.get("reason"):
+                decisions.append(d)
+        if not decisions:
+            self.announce("I haven't recorded any decisions yet.", force=True)
+            return
+        latest = decisions[0]
+        speech = f"My last decision was {latest.get('kind', 'a choice')}: {latest['reason']}"
+        if len(decisions) > 1:
+            speech += f". Before that, {decisions[1].get('kind', 'a choice')}: {decisions[1]['reason']}"
+        self.announce(speech + ".", force=True)
+
     def report_history(self):
         try:
             conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
@@ -761,6 +797,8 @@ class FieldAgent:
         steps = self._normalize_steps(payload)
         rationale = payload.get("rationale")
         cached = payload.get("cached")
+        confidence = payload.get("confidence")
+        experimental = payload.get("experimental", False)
         now = time.time()
 
         if query_id == self.coach_query_id:
@@ -773,7 +811,8 @@ class FieldAgent:
             self.last_coach_situation_key = payload.get("situation_key")
             self.coach_query_id = None
             print(f"Coach suggestion (urgent, cached={cached}): {steps} - {rationale}")
-            self.announce(self._coach_speech(steps, rationale, cached), force=True)
+            self.announce(self._coach_speech(steps, rationale, cached, confidence, experimental),
+                          force=True)
         elif query_id == self.watch_query_id:
             # Novelty reactions stay simple: run the first step only.
             self.watch_coach_action = steps[0]["action"]
@@ -783,7 +822,8 @@ class FieldAgent:
             self.watch_situation_key = payload.get("situation_key")
             self.watch_query_id = None
             print(f"Coach suggestion (watch, cached={cached}): {steps[0]} - {rationale}")
-            self.announce(self._coach_speech(steps, rationale, cached), force=True)
+            self.announce(self._coach_speech(steps, rationale, cached, confidence, experimental),
+                          force=True)
 
     @staticmethod
     def _normalize_steps(payload):
@@ -805,11 +845,20 @@ class FieldAgent:
         return steps or [{"action": {"direction": "stop"}, "duration": DEFAULT_COACH_DURATION}]
 
     @staticmethod
-    def _coach_speech(steps, rationale, cached):
+    def _coach_speech(steps, rationale, cached, confidence=None, experimental=False):
         # Spoken so the user can hear the LLM coach is actually engaged.
-        # Names the source (fresh model call vs. remembered past advice)
-        # and reads back the coach's own rationale when there is one.
-        source = "From memory, I've learned to" if cached else "The coach is advising me to"
+        # Names the source (fresh model call vs. remembered past advice),
+        # is honest about how sure it is (confidence = the arm's actual
+        # observed success rate; None = untested guess), and flags
+        # deliberate experiments as such.
+        if experimental:
+            source = "Let me try an experiment - something I've never done here. I'll"
+        elif cached and confidence is not None and confidence >= 0.75:
+            source = "I know what works here. I'll"
+        elif cached:
+            source = "From memory, though I'm not certain, I'll"
+        else:
+            source = "I'm guessing, but the coach suggests I"
         verbs = {"backward": "back away", "forward": "go forward",
                  "stop": "hold still", "turn": "turn"}
         moves = [verbs.get((s.get("action") or {}).get("direction"), "move") for s in steps]

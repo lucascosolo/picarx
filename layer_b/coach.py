@@ -98,6 +98,20 @@ UCB_C = 1.4                   # exploration bonus weight (classic UCB1 uses sqrt
 RETIRE_MIN_FAILURES = 3        # need at least this many failures to consider retiring
 RETIRE_MAX_SUCCESS_RATE = 0.2  # ...and a success rate at or below this
 
+# Emergent-behavior knobs. NOVELTY_RATE: fraction of queries where,
+# instead of exploiting a learned arm, the LLM is explicitly asked for
+# a maneuver UNLIKE anything tried before (tagged experimental, spoken
+# as an experiment, tracked like any arm - the safety layer bounds it
+# exactly like everything else). Kept low per the roadmap so curiosity
+# never crowds out reliability. One experimental slot may exceed
+# MAX_ARMS_PER_SITUATION; growth stays bounded and retirement culls.
+NOVELTY_RATE = 0.10
+# Surprise detection: an arm this proven failing (or this disproven
+# succeeding) is worth an event of its own for reflection to chew on.
+SURPRISE_MIN_PULLS = 4
+SURPRISE_HIGH_RATE = 0.7
+SURPRISE_LOW_RATE = 0.2
+
 # Semantic transfer: when a NEW situation has no arms, borrow from the
 # nearest known situation if their embeddings are at least this similar.
 # Per situation type: novelty reactions are low-stakes so they transfer
@@ -413,12 +427,12 @@ class Coach:
         except Exception:
             return []
 
-    def _query_llm(self, payload, situation_key):
+    def _query_llm(self, payload, situation_key, experiment=False):
         client = self._get_client()
         if client is None:
             return None
 
-        user_message = json.dumps({
+        message = {
             "situation": payload.get("situation"),
             "label": payload.get("label"),
             "extra": payload.get("extra"),
@@ -426,7 +440,13 @@ class Coach:
             "already_tried_here": self._tried_before(situation_key),
             "things_ive_learned": self._learned_facts(),
             "learned_patterns": self._learned_patterns(),
-        })
+        }
+        if experiment:
+            message["experiment_request"] = (
+                "This is an EXPERIMENT round: propose a maneuver clearly different "
+                "from everything in already_tried_here - something plausible that "
+                "has never been attempted in this situation.")
+        user_message = json.dumps(message)
 
         try:
             response = client.messages.create(
@@ -488,6 +508,13 @@ class Coach:
     def on_query(self, payload):
         self.work_queue.put(payload)
 
+    @staticmethod
+    def _arm_confidence(arm):
+        """Honest confidence in an arm: its observed success rate, or
+        None when it has never been pulled (a guess is a guess)."""
+        pulls = arm.get("successes", 0) + arm.get("failures", 0)
+        return round(arm["successes"] / pulls, 2) if pulls else None
+
     def _handle_query(self, payload):
         query_id = payload.get("query_id")
         if not query_id:
@@ -504,17 +531,32 @@ class Coach:
                 if neighbor:
                     self._seed_from_neighbor(situation_key, neighbor, payload)
                     arm_sig = self._select_arm(situation_key)
-            chosen_arm = dict(self.policy[situation_key]["arms"][arm_sig]) if arm_sig else None
+            entry = self.policy.get(situation_key)
+            # Occasionally step outside the learned playbook on purpose
+            # (see NOVELTY_RATE) - but only where there IS a playbook to
+            # step outside of, and never for urgent queries, where the
+            # robot is stuck and reliability beats curiosity.
+            experiment = (
+                arm_sig is not None
+                and not payload.get("urgent")
+                and len(entry["arms"]) <= MAX_ARMS_PER_SITUATION
+                and random.random() < NOVELTY_RATE
+            )
+            chosen_arm = dict(entry["arms"][arm_sig]) if (arm_sig and not experiment) else None
 
         if chosen_arm is not None:
+            confidence = self._arm_confidence(chosen_arm)
             print(f"Coach: exploiting learned arm for {situation_key} (no LLM call)")
+            self._publish_decision(situation_key, "exploit_learned_arm",
+                                   f"best UCB1 arm here (observed success {confidence})")
             self._dispatch_suggestion(
                 query_id, situation_key, arm_sig, chosen_arm["steps"],
-                chosen_arm.get("rationale", "known-good response"), cached=True, query_payload=payload,
+                chosen_arm.get("rationale", "known-good response"), cached=True,
+                query_payload=payload, confidence=confidence,
             )
             return
 
-        result = self._query_llm(payload, situation_key)
+        result = self._query_llm(payload, situation_key, experiment=experiment)
         if result is None:
             print(f"Coach: no suggestion available for {situation_key} (no key/response, no learned arm yet)")
             return
@@ -530,13 +572,32 @@ class Coach:
             })
             arm["rationale"] = rationale
             arm["last_updated"] = now
+            if experiment:
+                arm["experimental"] = True
             self._ensure_embedding(situation_key, payload)
         self._save_policy()
 
+        self._publish_decision(
+            situation_key,
+            "experiment" if experiment else "ask_llm",
+            "deliberately trying something outside the learned playbook" if experiment
+            else "no reliable learned arm yet - asking the model")
         self._dispatch_suggestion(query_id, situation_key, arm_sig, steps, rationale,
-                                   cached=False, query_payload=payload)
+                                   cached=False, query_payload=payload,
+                                   experimental=experiment)
 
-    def _dispatch_suggestion(self, query_id, situation_key, arm_sig, steps, rationale, cached, query_payload):
+    def _publish_decision(self, situation_key, choice, reason):
+        # Same decision-journal topic the field agent uses; event_logger
+        # persists it, so "why did you pick that maneuver?" has a real
+        # answer.
+        self.bus.publish("picarx/decision", {
+            "source": "coach", "kind": "suggestion_strategy",
+            "choice": choice, "reason": reason,
+            "situation_key": situation_key, "ts": time.time(),
+        })
+
+    def _dispatch_suggestion(self, query_id, situation_key, arm_sig, steps, rationale,
+                             cached, query_payload, confidence=None, experimental=False):
         with self.lock:
             self.pending_queries[query_id] = {
                 "situation_key": situation_key,
@@ -544,6 +605,7 @@ class Coach:
                 "steps": steps,
                 "rationale": rationale,
                 "cached": cached,
+                "experimental": experimental,
                 "query_payload": query_payload,
                 "issued_at": time.time(),
             }
@@ -557,6 +619,11 @@ class Coach:
             "duration": first["duration"],
             "rationale": rationale,
             "cached": cached,
+            # Introspection: how sure are we (observed success rate of a
+            # learned arm; None = pure guess), and is this a deliberate
+            # experiment? field_agent phrases its narration off these.
+            "confidence": confidence,
+            "experimental": experimental,
         })
 
     # ---------- inbound: outcomes ----------
@@ -566,6 +633,7 @@ class Coach:
         situation_key = payload.get("situation_key")
         success = bool(payload.get("success"))
 
+        surprise = None
         with self.lock:
             pending = self.pending_queries.pop(query_id, None)
             if pending is None or pending["situation_key"] != situation_key:
@@ -573,6 +641,17 @@ class Coach:
             entry = self.policy.setdefault(situation_key, {"arms": {}})
             arm = entry["arms"].get(pending["arm_sig"])
             if arm is not None:
+                # Judge surprise against the record BEFORE this outcome:
+                # a proven maneuver failing (or a written-off one
+                # working) is exactly the "this should have worked but
+                # didn't" signal reflection feeds on.
+                prior_rate = self._arm_confidence(arm)
+                pulls = arm["successes"] + arm["failures"]
+                if pulls >= SURPRISE_MIN_PULLS and prior_rate is not None:
+                    if not success and prior_rate >= SURPRISE_HIGH_RATE:
+                        surprise = {"kind": "proven_arm_failed", "prior_rate": prior_rate}
+                    elif success and prior_rate <= SURPRISE_LOW_RATE:
+                        surprise = {"kind": "written_off_arm_succeeded", "prior_rate": prior_rate}
                 if success:
                     arm["successes"] += 1
                 else:
@@ -580,6 +659,17 @@ class Coach:
                     self._maybe_retire_arm(entry, pending["arm_sig"])
                 arm["last_updated"] = time.time()
         self._save_policy()
+
+        if surprise is not None:
+            print(f"Coach: SURPRISE - {surprise['kind']} for {situation_key} "
+                  f"(prior rate {surprise['prior_rate']})")
+            self.bus.publish("picarx/coach/surprise", {
+                **surprise,
+                "situation_key": situation_key,
+                "rationale": pending["rationale"],
+                "steps": pending["steps"],
+                "ts": time.time(),
+            })
         print(f"Coach: recorded {'success' if success else 'failure'} for {situation_key}")
 
         query_payload = pending["query_payload"]
@@ -592,6 +682,7 @@ class Coach:
             "steps": pending["steps"],
             "rationale": pending["rationale"],
             "cached": pending["cached"],
+            "experimental": pending.get("experimental", False),
             "success": success,
             "issued_at": pending["issued_at"],
             "finished_at": time.time(),
