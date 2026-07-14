@@ -189,7 +189,7 @@ class EnergyGate:
 # Digital gain applied to every captured chunk before anything else
 # sees it - see the module docstring for why this exists. 1.0 = no
 # change. Tune with AUDIO_DEBUG_LEVELS=1 alongside SILENCE_RMS_THRESHOLD.
-AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "12.0"))
+AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "1.0"))
 
 
 def _apply_gain(data, gain):
