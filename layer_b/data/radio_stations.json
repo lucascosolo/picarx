@@ -14,5 +14,15 @@
  {
   "name": "lush",
   "url": "http://ice1.somafm.com/lush-128-mp3"
+ },
+ {
+  "dial": "98.7",
+  "name": "the dove",
+  "url": "http://987thedove.com"
+ },
+ {
+  "dial": "101.5",
+  "name": "example dial one oh one five (edit me)",
+  "url": "http://ice1.somafm.com/bootliquor-128-mp3"
  }
 ]
