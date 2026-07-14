@@ -100,7 +100,11 @@ RETIRE_MAX_SUCCESS_RATE = 0.2  # ...and a success rate at or below this
 
 # Semantic transfer: when a NEW situation has no arms, borrow from the
 # nearest known situation if their embeddings are at least this similar.
+# Per situation type: novelty reactions are low-stakes so they transfer
+# eagerly; collision escapes are safety-adjacent so they transfer only
+# on a much closer match.
 EMBED_SIMILARITY_THRESHOLD = 0.72
+EMBED_THRESHOLD_BY_SITUATION = {"novel_object": 0.70, "collision_loop": 0.78}
 
 MAX_STEPS = 4                 # cap on how many actions one maneuver may chain
 
@@ -224,12 +228,38 @@ class Coach:
 
     @staticmethod
     def _situation_text(payload):
-        """Natural-language description of a situation, for embedding."""
+        """Natural-language description of a situation, for embedding.
+        Multi-modal on purpose: co-present objects, open/tight space,
+        battery state and place all shape which past experience is
+        genuinely 'similar' - a sofa in a tight corner on low battery
+        is closer to a couch in a tight corner than to a sofa in open
+        floor, whatever the labels say."""
+        ctx = payload.get("context") or {}
+        bits = []
+        labels = sorted({o.get("label") for o in (ctx.get("objects") or []) if o.get("label")})
+        if labels:
+            bits.append(f"with {', '.join(labels[:5])} visible")
+        distance = ctx.get("distance_cm")
+        if distance is not None and not ctx.get("distance_stale", True):
+            if distance < 50:
+                bits.append("in a tight space")
+            elif distance > 150:
+                bits.append("in open space")
+        if (ctx.get("battery") or {}).get("low"):
+            bits.append("on low battery")
+        place = (ctx.get("location") or {}).get("label")
+        if place:
+            bits.append(f"at {place}")
+        suffix = (" " + " ".join(bits)) if bits else ""
+
         situation = payload.get("situation", "unknown")
         if situation == "novel_object":
-            return f"unfamiliar {payload.get('label') or 'object'} seen ahead while exploring"
-        reason = (payload.get("extra") or {}).get("reason", "unknown")
-        return f"robot stuck, collision loop, reason {reason}"
+            return f"unfamiliar {payload.get('label') or 'object'} seen ahead while exploring{suffix}"
+        extra = payload.get("extra") or {}
+        reason = extra.get("reason", "unknown")
+        mode = extra.get("failure_mode")
+        mode_txt = f" after a {mode} veto" if mode else ""
+        return f"robot stuck, collision loop, reason {reason}{mode_txt}{suffix}"
 
     @staticmethod
     def _sequence_signature(steps):
@@ -297,7 +327,9 @@ class Coach:
         query_vec = self.embedder.encode(self._situation_text(payload))
         if not query_vec:
             return None
-        best_key, best_sim = None, EMBED_SIMILARITY_THRESHOLD
+        threshold = EMBED_THRESHOLD_BY_SITUATION.get(
+            payload.get("situation"), EMBED_SIMILARITY_THRESHOLD)
+        best_key, best_sim = None, threshold
         for key, entry in self.policy.items():
             if key == situation_key or not entry.get("arms") or not entry.get("embedding"):
                 continue

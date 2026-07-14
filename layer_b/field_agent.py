@@ -172,6 +172,22 @@ CRUISE_SCAN_INTERVAL = 25.0    # re-glance around at least this often while crui
 STUCK_AFTER_SEC = 4.0          # this long of continuous forward with a static view -> stuck
 STUCK_MOTION_THRESHOLD = 3.0   # scene_motion below this counts as "static"
 
+# Active hypothesis testing: when the ultrasonic reports an obstacle
+# but fresh vision sees NOTHING (no tracked objects, nothing filling
+# the frame), the sensors disagree - it might be a phantom reading
+# (glancing echo, sensor noise) or something vision can't recognize.
+# Instead of always evading, occasionally run a bounded micro-probe:
+# creep forward very slowly and watch whether the reading tracks like
+# a real surface. Hard-bounded per the roadmap's safety mitigations
+# (speed <= 15, movement < 1s) and the safety daemon still vetoes at
+# its own SAFE_DISTANCE_CM underneath us, so the worst case of a wrong
+# guess is a vetoed creep - which itself resolves the hypothesis.
+PROBE_SPEED = 12               # <= the roadmap's low-speed probing cap of 15
+PROBE_CREEP_SEC = 0.7          # < 1s of actual movement
+PROBE_SETTLE_SEC = 0.4         # hold still before/after to get clean readings
+PROBE_COOLDOWN = 60.0          # at most one probe a minute
+PROBE_MIN_DISTANCE_CM = 16     # below this, don't probe - just evade
+
 # Curiosity bias (explorer.py's uncertainty scores, all fail-soft):
 # when the CURRENT location scores below this - i.e. it's already well
 # understood - wander steering leans toward the side the last scan
@@ -288,6 +304,13 @@ class FieldAgent:
 
         # Physical stuck detection state (see STUCK_AFTER_SEC).
         self.forward_since = None      # when the current uninterrupted forward run began
+
+        # Hypothesis-testing probe state (see PROBE_* above).
+        self.probe_stage = 0           # 0 settle, 1 creep, 2 settle+judge
+        self.probe_until = 0.0
+        self.probe_d0 = None           # ultrasonic reading that started the probe
+        self.probe_started_at = 0.0
+        self.last_probe_at = 0.0
 
         # Wander state (mirrors the old reflex explorer's behavior,
         # now expressed as intents instead of direct socket calls)
@@ -945,6 +968,98 @@ class FieldAgent:
         self.state_until = now + 0.25
         self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
 
+    # ---------- active hypothesis testing (sensor disagreement probes) ----------
+
+    def _maybe_start_probe(self, now, snap, distance):
+        """Start a micro-probe if the ultrasonic says obstacle but fresh
+        vision sees an empty scene. Returns True if the probe started
+        (tick consumed); False means fall through to normal evasion."""
+        if now - self.last_probe_at < PROBE_COOLDOWN:
+            return False
+        if distance < PROBE_MIN_DISTANCE_CM:
+            return False
+        objects = (snap or {}).get("objects", {})
+        vision_disagrees = (not objects.get("stale", True)
+                            and not objects.get("close_object")
+                            and not objects.get("items"))
+        if not vision_disagrees:
+            return False
+        self.state = "PROBING"
+        self.probe_stage = 0
+        self.probe_until = now + PROBE_SETTLE_SEC
+        self.probe_d0 = distance
+        self.probe_started_at = now
+        self.last_probe_at = now
+        self.forward_since = None
+        self.announce("My distance sensor says something's there but I can't see it. Testing carefully.")
+        self.publish_decision(
+            "hypothesis_probe", {"d0": distance},
+            "ultrasonic reports an obstacle but fresh vision sees nothing - "
+            "creeping forward slowly to find out which sensor is right")
+        self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+        return True
+
+    def _handle_probe_tick(self, now):
+        # A veto during the probe settles it immediately: the safety
+        # layer's own sensors agree something is really there.
+        with self.lock:
+            vetoed = any(t > self.probe_started_at for t in self.veto_events)
+        if vetoed:
+            self._finish_probe(now, "real_obstacle", None,
+                               "the safety layer vetoed the creep - it's real")
+            return
+        if now < self.probe_until:
+            if self.probe_stage == 1:
+                self.publish_intent({"direction": "forward", "speed": PROBE_SPEED},
+                                    priority=EVADE_PRIORITY)
+            else:
+                self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+            return
+        self.probe_stage += 1
+        if self.probe_stage == 1:
+            self.probe_until = now + PROBE_CREEP_SEC
+        elif self.probe_stage == 2:
+            self.probe_until = now + PROBE_SETTLE_SEC
+            self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+        else:
+            snap = self._snapshot() or {}
+            d1 = None
+            if snap.get("distance_cm") is not None and not snap.get("distance_stale", True):
+                d1 = snap["distance_cm"]
+            if d1 is not None and d1 <= self.probe_d0 + 2:
+                # Reading held (or closed in) while we moved toward it -
+                # behaves like a real surface.
+                self._finish_probe(now, "real_obstacle", d1,
+                                   "the reading tracked like a real surface while creeping")
+            elif d1 is not None and d1 > self.probe_d0 + 15:
+                self._finish_probe(now, "phantom_reading", d1,
+                                   "the path opened right up - the reading was a phantom")
+            else:
+                self._finish_probe(now, "inconclusive", d1,
+                                   "couldn't get a clean second reading - treating it as real to be safe")
+
+    def _finish_probe(self, now, resolution, d1, why):
+        outcome = {
+            "question": "ultrasonic_obstacle_vs_empty_vision",
+            "resolution": resolution,
+            "d0": self.probe_d0,
+            "d1": d1,
+            "location": self._location_context(),
+            "ts": now,
+        }
+        self.bus.publish("picarx/exploration/hypothesis", outcome)
+        self.publish_decision("hypothesis_resolved", {"resolution": resolution}, why,
+                              d0=self.probe_d0, d1=d1)
+        print(f"Hypothesis probe: {resolution} (d0={self.probe_d0}, d1={d1}) - {why}")
+        if resolution == "phantom_reading":
+            self.announce("False alarm - the way is actually clear.")
+            self.state = "CRUISING"
+            self.last_wander = now
+            return
+        # real_obstacle / inconclusive both get the normal escape.
+        self.announce("It's really there. Backing away.")
+        self._begin_evasion("ultrasonic")
+
     # ---------- perception (always runs, independent of explore_mode) ----------
 
     def _perception_tick(self):
@@ -1051,6 +1166,10 @@ class FieldAgent:
             self._handle_coaching_tick(now)
             return
 
+        if self.state == "PROBING":
+            self._handle_probe_tick(now)
+            return
+
         if self.watch_coach_action is not None:
             if now < self.watch_action_until:
                 self.publish_intent(self.watch_coach_action, priority=WATCH_PRIORITY, ttl=0.6)
@@ -1149,6 +1268,8 @@ class FieldAgent:
 
         # --- Handle New Obstacle Detection ---
         if distance < OBSTACLE_DISTANCE_CM:
+            if self._maybe_start_probe(now, snap, distance):
+                return
             self.announce("Obstacle ahead, backing away.")
             self._begin_evasion("ultrasonic")
             return

@@ -72,6 +72,7 @@ INTERESTING_TOPICS = (
     "picarx/coach/episode",
     "picarx/exploration/room_scan",
     "picarx/exploration/location_change",
+    "picarx/exploration/hypothesis",
     "picarx/action/result",
 )
 
@@ -159,6 +160,10 @@ class Reflection:
             if p.get("changed"):
                 return f"moved to known place: {p.get('label')} (visit {p.get('visit_count')})"
             return None  # re-confirming the same spot is noise at this altitude
+        if topic == "picarx/exploration/hypothesis":
+            where = (p.get("location") or {}).get("label") or "unknown place"
+            return (f"sensor hypothesis test at {where}: {p.get('question')} "
+                    f"resolved to {p.get('resolution')}")
         if topic == "picarx/action/result":
             result = p.get("result") or {}
             if result.get("status") == "vetoed":

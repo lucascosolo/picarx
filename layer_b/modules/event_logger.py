@@ -147,6 +147,13 @@ class EventLogger:
         # logging every publish is already change-triggered, not periodic.
         self.log_event("picarx/exploration/uncertainty_map", payload)
 
+    def on_hypothesis(self, payload):
+        # One row per resolved sensor-disagreement probe (field_agent):
+        # what was ambiguous, what the test found. Reflection turns
+        # repeated resolutions into durable facts ("that corner gives
+        # phantom ultrasonic readings").
+        self.log_event("picarx/exploration/hypothesis", payload)
+
     def on_decision(self, payload):
         # The decision journal: every non-trivial choice any module
         # makes, with its stated reason. This is what lets the robot
@@ -195,6 +202,7 @@ class EventLogger:
         self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
+        self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
         self.bus.subscribe("picarx/decision", self.on_decision)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 
