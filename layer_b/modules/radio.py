@@ -40,12 +40,31 @@ import time
 
 STATIONS_PATH = "/home/picarx/layer_b/data/radio_stations.json"
 
+# Hardware honesty: there is no FM tuner on this robot, so a "dial"
+# (e.g. "98.7") is NOT a radio frequency being received - it's a label
+# you attach to an internet stream so you can ask for a station the way
+# you'd say it out loud. Most real FM stations also stream online; put
+# the stream URL of YOUR local 98.7 here and "tune to 98.7" plays it.
+# Edit this file (data/radio_stations.json) to map your own dials.
+# The two dial entries below are EXAMPLES using public streams - change
+# their urls to your actual local stations.
 DEFAULT_STATIONS = [
     {"name": "groove salad", "url": "http://ice1.somafm.com/groovesalad-128-mp3"},
     {"name": "drone zone", "url": "http://ice1.somafm.com/dronezone-128-mp3"},
     {"name": "secret agent", "url": "http://ice1.somafm.com/secretagent-128-mp3"},
     {"name": "lush", "url": "http://ice1.somafm.com/lush-128-mp3"},
+    {"dial": "98.7", "name": "example dial ninety eight seven (edit me)",
+     "url": "http://ice1.somafm.com/indiepop-128-mp3"},
+    {"dial": "101.5", "name": "example dial one oh one five (edit me)",
+     "url": "http://ice1.somafm.com/bootliquor-128-mp3"},
 ]
+
+
+def _norm_dial(value):
+    """Compare dials loosely: '98.7', '98 7', ' 98.70 ' all match."""
+    if value is None:
+        return None
+    return "".join(ch for ch in str(value) if ch.isdigit() or ch == ".").strip(".")
 
 # Preference order; all take a bare URL and play to the default ALSA out.
 PLAYERS = (
@@ -83,9 +102,11 @@ class Radio:
         self.bus.publish("picarx/audio/speak", {"text": text, "ts": time.time()})
 
     def _publish_state(self, playing):
+        station = self.stations[self.index]
         self.bus.publish("picarx/tools/radio_state", {
             "playing": playing,
-            "station": self.stations[self.index]["name"] if playing else None,
+            "station": station["name"] if playing else None,
+            "dial": station.get("dial") if playing else None,
             "ts": time.time(),
         })
 
@@ -115,6 +136,26 @@ class Radio:
             self.proc = None
             return False
 
+    # ---------- station lookup ----------
+
+    def _phrase(self, station):
+        dial = station.get("dial")
+        return f"{station['name']} on {dial}" if dial else station["name"]
+
+    def _find_by_dial(self, dial):
+        want = _norm_dial(dial)
+        for i, s in enumerate(self.stations):
+            if _norm_dial(s.get("dial")) == want:
+                return i
+        return None
+
+    def _find_by_name(self, name):
+        wanted = name.lower()
+        for i, s in enumerate(self.stations):
+            if wanted in s.get("name", "").lower():
+                return i
+        return None
+
     # ---------- commands ----------
 
     def on_command(self, payload):
@@ -131,23 +172,40 @@ class Radio:
                 self._say("Radio off.")
             return
 
+        if command == "list":
+            names = ", ".join(self._phrase(s) for s in self.stations)
+            self._say(f"I have {len(self.stations)} stations: {names}.")
+            return
+
+        if command == "status":
+            if self.proc is not None:
+                self._say(f"Now playing {self._phrase(self.stations[self.index])}.")
+            else:
+                self._say("The radio is off.")
+            return
+
         if command == "next" and self.proc is not None:
             self.index = (self.index + 1) % len(self.stations)
+        elif command == "play" and payload.get("dial"):
+            idx = self._find_by_dial(payload["dial"])
+            if idx is None:
+                self._say(f"I don't have a station saved for {payload['dial']}. "
+                          f"Add its stream to my stations file and I'll tune there.")
+                return
+            self.index = idx
         elif command == "play" and payload.get("station"):
-            wanted = payload["station"].lower()
-            for i, s in enumerate(self.stations):
-                if wanted in s["name"].lower():
-                    self.index = i
-                    break
-            else:
+            idx = self._find_by_name(payload["station"])
+            if idx is None:
                 self._say(f"I don't know a station called {payload['station']}. "
-                          f"Playing {self.stations[self.index]['name']} instead.")
+                          f"Playing {self._phrase(self.stations[self.index])} instead.")
+            else:
+                self.index = idx
         elif command not in ("play", "next"):
             return
 
         self._stop_player()
         if self._start_player():
-            self._say(f"Tuning to {self.stations[self.index]['name']}.")
+            self._say(f"Tuning to {self._phrase(self.stations[self.index])}.")
             self._publish_state(True)
         else:
             self._say("I couldn't start the radio stream.")

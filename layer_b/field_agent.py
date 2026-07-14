@@ -132,7 +132,7 @@ WAKE_PHRASES = ("robot", "hey robot", "computer")
 # routes them to their own modules). They must be ignored here so that
 # e.g. "stop radio" reaches the radio instead of tripping the
 # robot-wide "stop". Movement/safety words never appear in this list.
-TOOL_KEYWORDS = ("radio", "station", "tools")
+TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm")
 
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker

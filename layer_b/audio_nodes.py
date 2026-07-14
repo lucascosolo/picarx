@@ -70,6 +70,7 @@ sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 
 import array
+import math
 import time
 import json
 import subprocess
@@ -216,6 +217,88 @@ def _chunk_rms(data):
     return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
+# --- voice-band noise filter (resource-light, streaming) ---
+# Steady background noise in a room is dominated by energy OUTSIDE the
+# band human speech actually lives in: HVAC/fan/traffic rumble below
+# ~150 Hz and hiss/clatter above ~4 kHz. Two cascaded second-order
+# biquads (a high-pass then a low-pass, RBJ cookbook, Butterworth Q)
+# strip both, so what reaches the energy gate and Kaldi is mostly
+# voice. This directly fixes "the gate won't open in a noisy room":
+# the tracked noise floor stops being inflated by rumble the mic can't
+# even use. Cost is a few multiply-adds per sample - ~160k mult/sec at
+# our chunk rate, negligible next to a single decode step. Entirely
+# fail-soft and env-toggleable; if disabled or it errors, audio passes
+# through untouched and behaviour is exactly as before.
+BANDPASS_ENABLED = os.environ.get("AUDIO_BANDPASS", "1") not in ("0", "", "false", "no")
+BANDPASS_HP_HZ = float(os.environ.get("AUDIO_BANDPASS_HP", "150"))   # kill rumble below this
+BANDPASS_LP_HZ = float(os.environ.get("AUDIO_BANDPASS_LP", "4000"))  # kill hiss above this
+SAMPLE_RATE = 16000
+
+
+class _Biquad:
+    """One second-order section, Direct Form II transposed, float state."""
+    def __init__(self, b0, b1, b2, a1, a2):
+        self.b0, self.b1, self.b2, self.a1, self.a2 = b0, b1, b2, a1, a2
+        self.z1 = 0.0
+        self.z2 = 0.0
+
+    @classmethod
+    def highpass(cls, fc, fs, q=0.7071):
+        w0 = 2.0 * math.pi * fc / fs
+        cw, sw = math.cos(w0), math.sin(w0)
+        alpha = sw / (2.0 * q)
+        a0 = 1.0 + alpha
+        return cls((1.0 + cw) / 2.0 / a0, -(1.0 + cw) / a0, (1.0 + cw) / 2.0 / a0,
+                   (-2.0 * cw) / a0, (1.0 - alpha) / a0)
+
+    @classmethod
+    def lowpass(cls, fc, fs, q=0.7071):
+        w0 = 2.0 * math.pi * fc / fs
+        cw, sw = math.cos(w0), math.sin(w0)
+        alpha = sw / (2.0 * q)
+        a0 = 1.0 + alpha
+        return cls((1.0 - cw) / 2.0 / a0, (1.0 - cw) / a0, (1.0 - cw) / 2.0 / a0,
+                   (-2.0 * cw) / a0, (1.0 - alpha) / a0)
+
+
+class _PassThrough:
+    """Null filter used when AUDIO_BANDPASS is disabled."""
+    def process(self, data):
+        return data
+
+
+class VoiceBandFilter:
+    """Cascaded high-pass + low-pass over a raw 16-bit PCM chunk stream.
+    State persists across chunks so there's no per-chunk edge click."""
+    def __init__(self, fs=SAMPLE_RATE, hp=BANDPASS_HP_HZ, lp=BANDPASS_LP_HZ):
+        # Only build sections that make sense for the rate (lp must be
+        # below Nyquist); clamp defensively so bad env values fail soft.
+        self.sections = []
+        if 20.0 < hp < fs / 2.0:
+            self.sections.append(_Biquad.highpass(hp, fs))
+        if 20.0 < lp < fs / 2.0 and lp > hp:
+            self.sections.append(_Biquad.lowpass(lp, fs))
+
+    def process(self, data):
+        if not self.sections or not data:
+            return data
+        try:
+            samples = array.array("h", data)
+        except ValueError:
+            return data
+        for bq in self.sections:
+            b0, b1, b2, a1, a2 = bq.b0, bq.b1, bq.b2, bq.a1, bq.a2
+            z1, z2 = bq.z1, bq.z2
+            for i, x in enumerate(samples):
+                y = b0 * x + z1
+                z1 = b1 * x - a1 * y + z2
+                z2 = b2 * x - a2 * y
+                # clamp back to int16
+                samples[i] = 32767 if y > 32767 else (-32768 if y < -32768 else int(y))
+            bq.z1, bq.z2 = z1, z2
+        return samples.tobytes()
+
+
 class AudioNode:
     def __init__(self):
         self.bus = Bus()
@@ -330,6 +413,9 @@ class AudioNode:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
 
         gate = EnergyGate()
+        voice_filter = VoiceBandFilter() if BANDPASS_ENABLED else _PassThrough()
+        print(f"Audio node: voice-band filter {'on' if BANDPASS_ENABLED else 'off'} "
+              f"({BANDPASS_HP_HZ:.0f}-{BANDPASS_LP_HZ:.0f} Hz)")
         prebuffer = deque(maxlen=PREBUFFER_CHUNKS)
         self._last_stop_reflex_at = 0.0
         gate_was_open = False
@@ -352,6 +438,10 @@ class AudioNode:
                 prebuffer.clear()
                 continue
 
+            # Strip out-of-band noise FIRST (on the raw chunk), then
+            # apply gain - so the gain amplifies mostly voice instead of
+            # rumble, and the gate below keys on voice-band energy.
+            data = voice_filter.process(data)
             data = _apply_gain(data, AUDIO_GAIN)
             rms = _chunk_rms(data)
 

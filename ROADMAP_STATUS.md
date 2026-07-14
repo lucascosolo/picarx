@@ -62,6 +62,27 @@ veto logic is untouched (its veto *replies* gained a machine-readable
 - **No web dashboard.** `data/uncertainty_map.json` + the spoken map
   report cover human review without a web stack on the Pi.
 
+## Follow-up: mic reliability + radio dial tuning
+
+- **Voice-band noise filter** (`modules/audio_nodes.py`): two cascaded
+  biquads (high-pass ~150 Hz, low-pass ~4 kHz, Butterworth Q) run on
+  each raw capture chunk *before* gain, so steady out-of-band room
+  noise (fan/HVAC/traffic rumble, hiss) no longer inflates the energy
+  gate's noise floor or clips under gain. A few multiply-adds per
+  sample — negligible next to one decode. Env-toggleable
+  (`AUDIO_BANDPASS=0`) and cutoffs tunable (`AUDIO_BANDPASS_HP` /
+  `_LP`); fail-soft to pass-through. Measured: 60 Hz rumble knocked to
+  ~16 % of voice level, 1 kHz speech preserved within 0.1 %.
+- **Radio dial tuning**: stations may carry a `"dial"` (e.g. `"98.7"`)
+  in `data/radio_stations.json`. "tune to ninety-eight point seven"
+  (or "98.7", "one oh two point five", etc.) is parsed by
+  `tools_registry.parse_dial` — handling both grouped ("ninety eight")
+  and digit-by-digit ("one oh two") spoken forms plus literal digits —
+  and the radio plays the stream mapped to that dial. No FM tuner
+  exists on this hardware; a dial is an alias to an internet stream you
+  supply. New voice commands: "what's playing", "list stations". An
+  unknown dial says so instead of silently defaulting.
+
 ## Resource footprint
 
 Steady-state additions are three mostly-sleeping processes
