@@ -38,6 +38,8 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 from semantic_store import SemanticStore
+from spatial_store import SpatialStore
+import pattern_miner
 
 import json
 import sqlite3
@@ -45,6 +47,12 @@ import time
 import threading
 
 EVENTS_DB_PATH = "/home/picarx/layer_b/data/events.db"
+
+# Non-LLM analysis (pattern mining + spatial connectivity facts) is
+# pure Python but still only worth re-running occasionally.
+ANALYSIS_COOLDOWN = 1800.0
+# An edge traversed at least this often becomes a durable layout fact.
+CONNECTIVITY_MIN_TRAVERSALS = 2
 
 CHECK_INTERVAL = 60.0          # how often the idle/eligibility check runs
 IDLE_AFTER_SEC = 180.0         # no movement/speech/coach activity for this long = idle
@@ -63,6 +71,7 @@ INTERESTING_TOPICS = (
     "picarx/audio/heard",
     "picarx/coach/episode",
     "picarx/exploration/room_scan",
+    "picarx/exploration/location_change",
     "picarx/action/result",
 )
 
@@ -88,6 +97,7 @@ class Reflection:
     def __init__(self):
         self.bus = Bus()
         self.store = SemanticStore(readonly=False)
+        self.spatial = SpatialStore(readonly=True)  # location_graph owns spatial.db
         self.lock = threading.Lock()
         self.last_activity = time.time()
         self._client = None
@@ -143,6 +153,12 @@ class Reflection:
             parts = [f"{s.get('pan')}deg:{','.join(s.get('labels') or ['-'])}"
                      for s in p.get("sightings", [])]
             return "room scan: " + " | ".join(parts)
+        if topic == "picarx/exploration/location_change":
+            if p.get("is_new"):
+                return f"discovered a new place: {p.get('label')}"
+            if p.get("changed"):
+                return f"moved to known place: {p.get('label')} (visit {p.get('visit_count')})"
+            return None  # re-confirming the same spot is noise at this altitude
         if topic == "picarx/action/result":
             result = p.get("result") or {}
             if result.get("status") == "vetoed":
@@ -206,6 +222,46 @@ class Reflection:
             print(f"Reflection: LLM extraction failed: {e}")
             return None
 
+    # ---------- offline analysis (pure Python, no LLM, no API key) ----------
+
+    def try_analyze(self, now=None):
+        """Pattern mining + spatial-connectivity facts. Runs on the
+        same idle windows as LLM reflection but does NOT need a key -
+        a robot with no API access still consolidates statistics.
+        Returns True if it ran (for tests)."""
+        now = now if now is not None else time.time()
+        with self.lock:
+            idle_for = now - self.last_activity
+        if idle_for < IDLE_AFTER_SEC:
+            return False
+        last_run = float(self.store.get_meta("last_analysis_at", 0) or 0)
+        if now - last_run < ANALYSIS_COOLDOWN:
+            return False
+
+        patterns = pattern_miner.mine_patterns(EVENTS_DB_PATH)
+        for p in patterns:
+            self.store.upsert_pattern(p["condition"], p["outcome"],
+                                      p["frequency"], p["confidence"])
+
+        # Room connectivity, straight from the location graph: an edge
+        # crossed repeatedly is a stable property of the house.
+        connectivity = 0
+        for a, b, traversals in self.spatial.edge_list():
+            if traversals < CONNECTIVITY_MIN_TRAVERSALS:
+                continue
+            loc_a, loc_b = self.spatial.get_location(a), self.spatial.get_location(b)
+            if loc_a and loc_b:
+                self.store.upsert_fact(
+                    "layout", f"{loc_a['label']} connects to {loc_b['label']}",
+                    confidence=min(0.9, 0.5 + 0.1 * traversals), source="location_graph")
+                connectivity += 1
+
+        self.store.set_meta("last_analysis_at", now)
+        if patterns or connectivity:
+            print(f"Reflection: offline analysis stored {len(patterns)} patterns, "
+                  f"{connectivity} connectivity facts")
+        return True
+
     # ---------- one reflection attempt ----------
 
     def try_reflect(self, now=None):
@@ -260,6 +316,7 @@ class Reflection:
         while True:
             time.sleep(CHECK_INTERVAL)
             try:
+                self.try_analyze()
                 self.try_reflect()
             except Exception as e:
                 print(f"Reflection: cycle error: {e}")

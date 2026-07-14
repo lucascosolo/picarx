@@ -310,8 +310,18 @@ def main():
                     print(f"Socket reply error (executed): {se}")
             else:
                 motion.emergency_stop()
+                # reason_code is a STABLE machine-readable failure type
+                # alongside the human-readable reason - the learning
+                # layer keys recovery tactics on it, so these codes must
+                # never change once shipped: obstacle | cliff |
+                # reverse_limit | unknown.
+                code = ("obstacle" if reason.startswith("obstacle")
+                        else "cliff" if "cliff" in reason
+                        else "reverse_limit" if "reverse" in reason
+                        else "unknown")
                 try:
-                    conn.sendall(json.dumps({"status": "vetoed", "reason": reason}).encode())
+                    conn.sendall(json.dumps({"status": "vetoed", "reason": reason,
+                                             "reason_code": code}).encode())
                 except Exception as se:
                     print(f"Socket reply error (vetoed): {se}")
                     

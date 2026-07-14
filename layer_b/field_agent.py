@@ -306,6 +306,8 @@ class FieldAgent:
         # Cross-thread inboxes (bus callbacks append, explore_tick/
         # _perception_tick drain under self.lock).
         self.veto_events = deque()
+        self.last_veto_code = None   # reason_code of the most recent veto
+        self.last_veto_at = 0.0
         self.pending_novel_objects = deque()
         self.pending_suggestions = deque()
 
@@ -406,6 +408,11 @@ class FieldAgent:
             return
         with self.lock:
             self.veto_events.append(time.time())
+            # Remember WHAT kind of veto it was: recovery tactics for a
+            # cliff are different from an unseen obstacle, so the coach
+            # gets told which failure mode it's actually escaping.
+            self.last_veto_code = result.get("reason_code", "unknown")
+            self.last_veto_at = time.time()
 
     # ---------- inbound: coach ----------
 
@@ -914,9 +921,15 @@ class FieldAgent:
         self.coach_action_started_at = now
         self.announce("I keep running into something. Let me get some advice.", force=True)
         self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
+        # Which sensor-level failure actually caused this? Only trust a
+        # veto code from the recent past - a stale one from minutes ago
+        # describes a different problem.
+        with self.lock:
+            failure_mode = self.last_veto_code if (now - self.last_veto_at) < 10.0 else None
         self._start_coach_query(
             situation="collision_loop", urgent=True,
-            extra={"reason": reason, "stuck_pattern": stuck_pattern},
+            extra={"reason": reason, "stuck_pattern": stuck_pattern,
+                   "failure_mode": failure_mode},
         )
 
     def _begin_evasion(self, reason):

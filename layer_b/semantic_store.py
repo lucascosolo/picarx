@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    frequency INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    UNIQUE(condition, outcome)
+);
 """
 
 
@@ -95,6 +105,17 @@ class SemanticStore:
         rows = self._query("SELECT COUNT(*) FROM facts")
         return rows[0][0] if rows else 0
 
+    def top_patterns(self, limit=5, max_age_sec=7 * 86400):
+        """Mined event-sequence patterns, freshest + most confident
+        first. Old patterns age out of the results (the world changes;
+        the roadmap's spurious-correlation mitigation) but stay stored."""
+        rows = self._query(
+            "SELECT condition, outcome, frequency, confidence FROM patterns "
+            "WHERE last_seen >= ? ORDER BY confidence DESC, frequency DESC LIMIT ?",
+            (time.time() - max_age_sec, limit))
+        return [{"condition": c, "outcome": o, "frequency": f, "confidence": conf}
+                for c, o, f, conf in rows]
+
     # ---------- writer side (reflection.py only) ----------
 
     def upsert_fact(self, subject, fact, confidence=0.5, source="reflection"):
@@ -109,6 +130,23 @@ class SemanticStore:
                  confidence = MAX(confidence, excluded.confidence),
                  updated_at = excluded.updated_at""",
             (subject.strip()[:80], fact.strip()[:300], float(confidence), source, now, now))
+        self.conn.commit()
+
+    def upsert_pattern(self, condition, outcome, frequency, confidence):
+        """Patterns are aggregate statistics over a window, so a re-mine
+        REPLACES frequency/confidence rather than accumulating them."""
+        if self.readonly:
+            raise RuntimeError("SemanticStore opened readonly - only reflection.py writes")
+        now = time.time()
+        self.conn.execute(
+            """INSERT INTO patterns (condition, outcome, frequency, confidence, first_seen, last_seen)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(condition, outcome) DO UPDATE SET
+                 frequency = excluded.frequency,
+                 confidence = excluded.confidence,
+                 last_seen = excluded.last_seen""",
+            (condition.strip()[:120], outcome.strip()[:200],
+             int(frequency), float(confidence), now, now))
         self.conn.commit()
 
     def get_meta(self, key, default=None):

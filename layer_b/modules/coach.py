@@ -147,8 +147,11 @@ steps to perform back to back:
 
 Use a single step when a single move is genuinely enough; use several when the car
 must actually reposition. You may be told what has already been tried here and
-whether it worked - prefer maneuvers unlike the ones that have failed. The safety
-layer vetoes anything truly unsafe, so suggest a real corrective maneuver.
+whether it worked - prefer maneuvers unlike the ones that have failed. You may also
+receive "learned_patterns" (statistics mined from the car's own history) and the
+failure mode that triggered this (obstacle / cliff / reverse_limit) - a cliff needs
+a different escape than an unseen obstacle, so weigh both. The safety layer vetoes
+anything truly unsafe, so suggest a real corrective maneuver.
 """
 
 
@@ -207,8 +210,17 @@ class Coach:
         situation = payload.get("situation", "unknown")
         if situation == "novel_object":
             return f"novel_object:{payload.get('label') or 'unknown'}"
-        reason = (payload.get("extra") or {}).get("reason", "unknown")
-        return f"{situation}:{reason}"
+        extra = payload.get("extra") or {}
+        reason = extra.get("reason", "unknown")
+        key = f"{situation}:{reason}"
+        # Failure-mode-specific recovery: a cliff veto and an unseen-
+        # obstacle veto need different escapes, so they learn under
+        # different keys. Older keys without the suffix stay valid (and
+        # seed the new ones through embedding transfer).
+        failure_mode = extra.get("failure_mode")
+        if failure_mode:
+            key = f"{key}:{failure_mode}"
+        return key
 
     @staticmethod
     def _situation_text(payload):
@@ -359,6 +371,16 @@ class Coach:
         except Exception:
             return []
 
+    def _learned_patterns(self, limit=4):
+        """Mined event-sequence patterns (reflection's offline analysis),
+        fail-soft like facts. Only fresh, high-confidence ones surface."""
+        try:
+            return [f"{p['condition']}: {p['outcome']} "
+                    f"({p['confidence']:.0%} over {p['frequency']} episodes)"
+                    for p in self.semantic.top_patterns(limit=limit)]
+        except Exception:
+            return []
+
     def _query_llm(self, payload, situation_key):
         client = self._get_client()
         if client is None:
@@ -371,6 +393,7 @@ class Coach:
             "context": payload.get("context"),
             "already_tried_here": self._tried_before(situation_key),
             "things_ive_learned": self._learned_facts(),
+            "learned_patterns": self._learned_patterns(),
         })
 
         try:
