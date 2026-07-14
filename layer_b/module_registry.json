@@ -9,5 +9,7 @@
   {"name": "companion", "version": "0.1", "entrypoint": "companion.py", "enabled": true},
   {"name": "field_agent", "version": "0.1", "entrypoint": "field_agent.py", "enabled": true},
   {"name": "debug_monitor", "version": "0.1", "entrypoint": "debug_monitor.py", "enabled": true},
-  {"name": "reflection", "version": "0.1", "entrypoint": "reflection.py", "enabled": true}
+  {"name": "reflection", "version": "0.1", "entrypoint": "reflection.py", "enabled": true},
+  {"name": "location_graph", "version": "0.1", "entrypoint": "location_graph.py", "enabled": true},
+  {"name": "explorer", "version": "0.1", "entrypoint": "explorer.py", "enabled": true}
 ]

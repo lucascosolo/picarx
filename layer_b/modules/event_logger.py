@@ -137,6 +137,23 @@ class EventLogger:
         # spatial memory/mapping work.
         self.log_event("picarx/exploration/room_scan", payload)
 
+    def on_location_change(self, payload):
+        # One row per resolved scan (location_graph): which known place
+        # the robot decided it was in, or that it minted a new one.
+        self.log_event("picarx/exploration/location_change", payload)
+
+    def on_uncertainty_map(self, payload):
+        # explorer.py only publishes when scores materially move, so
+        # logging every publish is already change-triggered, not periodic.
+        self.log_event("picarx/exploration/uncertainty_map", payload)
+
+    def on_decision(self, payload):
+        # The decision journal: every non-trivial choice any module
+        # makes, with its stated reason. This is what lets the robot
+        # answer "why did you do that?" from evidence instead of
+        # confabulating - and lets reflection notice its own habits.
+        self.log_event("picarx/decision", payload)
+
     def on_world_state(self, payload):
         # Always keep the freshest snapshot around for the timer loop
         # to write out on its own schedule.
@@ -176,6 +193,9 @@ class EventLogger:
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
         self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
+        self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
+        self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
+        self.bus.subscribe("picarx/decision", self.on_decision)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 
         threading.Thread(target=self.snapshot_loop, daemon=True).start()

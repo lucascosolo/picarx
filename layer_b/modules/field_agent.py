@@ -172,6 +172,15 @@ CRUISE_SCAN_INTERVAL = 25.0    # re-glance around at least this often while crui
 STUCK_AFTER_SEC = 4.0          # this long of continuous forward with a static view -> stuck
 STUCK_MOTION_THRESHOLD = 3.0   # scene_motion below this counts as "static"
 
+# Curiosity bias (explorer.py's uncertainty scores, all fail-soft):
+# when the CURRENT location scores below this - i.e. it's already well
+# understood - wander steering leans toward the side the last scan
+# found clearer, to drift somewhere newer instead of re-pacing a known
+# patch. At or above it (still learning here, or no explorer running)
+# wander stays uniform random, which is exactly the old behavior.
+CURIOSITY_SETTLED_SCORE = 0.45
+CURIOSITY_BIAS_PROB = 0.7      # biased wanders still keep 30% pure randomness
+
 # Evasion/coaching priorities - both outrank normal exploring (5), and
 # COACH_PRIORITY outranks the canned evasion sequence (8) too, since a
 # coach-directed maneuver during a fail state should win over whatever
@@ -286,6 +295,14 @@ class FieldAgent:
         self.wander_interval = random.uniform(5.0, 10.0)
         self.steering_active_until = 0
 
+        # Spatial context (location_graph.py + explorer.py, both
+        # optional): where the robot currently believes it is, and how
+        # uncertain each known place still is. None/empty when those
+        # modules aren't running - every use below falls back to the
+        # old spatially-blind behavior.
+        self.current_location = None       # last location_change payload
+        self.uncertainty_scores = {}       # location_id -> score
+
         # Cross-thread inboxes (bus callbacks append, explore_tick/
         # _perception_tick drain under self.lock).
         self.veto_events = deque()
@@ -301,6 +318,7 @@ class FieldAgent:
         self.coach_steps = None
         self.coach_step_index = 0
         self.coach_step_until = 0.0
+        self.coach_motion_max = None   # peak scene_motion seen during the maneuver
         self.coach_action_started_at = 0.0
         self.last_coach_query_id_used = None
         self.last_coach_situation_key = None
@@ -344,7 +362,10 @@ class FieldAgent:
             return
         self.last_announcement_at = now
         print(f"Field Agent says: {text}")
-        self.bus.publish("picarx/audio/speak", {"text": text})
+        # ts lets audio_nodes drop announcements that sat in the playback
+        # queue too long - narrating a decision from 20 seconds ago while
+        # already doing something else is worse than staying quiet.
+        self.bus.publish("picarx/audio/speak", {"text": text, "ts": now})
 
     # ---------- inbound: world state ----------
 
@@ -391,6 +412,41 @@ class FieldAgent:
     def on_coach_suggestion(self, payload):
         with self.lock:
             self.pending_suggestions.append(payload)
+
+    # ---------- inbound: spatial context (optional modules) ----------
+
+    def on_location_change(self, payload):
+        with self.lock:
+            self.current_location = payload
+        if payload.get("is_new"):
+            self.announce(f"I think this is somewhere new. I'll call it {payload.get('label')}.")
+
+    def on_uncertainty_map(self, payload):
+        scores = {e["id"]: e["score"] for e in payload.get("locations", [])}
+        with self.lock:
+            self.uncertainty_scores = scores
+
+    def _location_context(self):
+        """Compact {id,label,score} of where we are, or None."""
+        with self.lock:
+            loc = dict(self.current_location) if self.current_location else None
+            scores = self.uncertainty_scores
+        if not loc:
+            return None
+        return {"id": loc.get("location_id"), "label": loc.get("label"),
+                "uncertainty": scores.get(loc.get("location_id"))}
+
+    # ---------- decision journal ----------
+
+    def publish_decision(self, kind, choice, reason, **extra):
+        """Introspection hook: every non-trivial choice goes onto the
+        bus with WHY it was made (event_logger persists them), so
+        'why did you do that?' has a real answer instead of a shrug."""
+        self.bus.publish("picarx/decision", {
+            "source": SOURCE_NAME, "kind": kind, "choice": choice,
+            "reason": reason, "location": self._location_context(),
+            "ts": time.time(), **extra,
+        })
 
     # ---------- inbound: voice ----------
 
@@ -599,6 +655,7 @@ class FieldAgent:
                 "objects": snap.get("objects", {}).get("items", []),
                 "last_action": snap.get("last_action"),
                 "battery": snap.get("battery"),
+                "location": self._location_context(),
             },
             "extra": extra or {},
         }
@@ -638,6 +695,7 @@ class FieldAgent:
             self.coach_steps = steps
             self.coach_step_index = 0
             self.coach_step_until = now + steps[0]["duration"]
+            self.coach_motion_max = None
             self.coach_action_started_at = now
             self.last_coach_query_id_used = query_id
             self.last_coach_situation_key = payload.get("situation_key")
@@ -694,9 +752,24 @@ class FieldAgent:
         return f"{source} {maneuver}."
         # else: stale/unknown query id (already timed out or superseded) - ignore
 
+    def _episode_moved(self, steps, motion_max):
+        """Did the robot actually GO anywhere during a maneuver? "No veto"
+        alone is not success: pushing against something the sensors can't
+        see (table edge above the ultrasonic beam) never vetoes, so every
+        useless maneuver got recorded as a win, the bandit reinforced it,
+        and the robot proudly re-announced learned no-ops forever. Require
+        visual evidence of motion whenever the maneuver contains any
+        moving step. No vision signal at all -> benefit of the doubt."""
+        if steps and all(s["action"].get("direction") == "stop" for s in steps):
+            return True  # a pure hold-still maneuver is supposed to not move
+        if motion_max is None:
+            return True
+        return motion_max >= STUCK_MOTION_THRESHOLD
+
     def _finish_coach_episode(self, now):
         with self.lock:
-            succeeded = not any(t > self.coach_action_started_at for t in self.veto_events)
+            veto_free = not any(t > self.coach_action_started_at for t in self.veto_events)
+        succeeded = veto_free and self._episode_moved(self.coach_steps, self.coach_motion_max)
         query_id = self.last_coach_query_id_used
         situation_key = self.last_coach_situation_key
         self.coach_steps = None
@@ -766,11 +839,26 @@ class FieldAgent:
                 self.state_until = now + 0.25
                 self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
                 return
+            # Safe holding reflex while waiting: brief stop, ease back,
+            # then hold stop. The back-off is bounded WELL under the
+            # safety daemon's 2s continuous-reverse cap so the reflex
+            # itself never generates reverse-limit vetoes.
             if now < self.coach_action_started_at + 0.3:
                 self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
-            else:
+            elif now < self.coach_action_started_at + 1.8:
                 self.publish_intent({"direction": "backward", "speed": 25}, priority=COACH_PRIORITY)
+            else:
+                self.publish_intent({"direction": "stop"}, priority=COACH_PRIORITY)
             return
+
+        # Sample movement evidence while the maneuver runs (see
+        # _episode_moved - this is what tells a real escape apart from
+        # uselessly grinding against an unseen obstacle).
+        snap = self._snapshot() or {}
+        motion = (snap.get("objects") or {}).get("scene_motion")
+        if motion is not None:
+            self.coach_motion_max = motion if self.coach_motion_max is None \
+                else max(self.coach_motion_max, motion)
 
         # Run the suggested step sequence back to back: hold each step
         # until its duration elapses, then advance to the next; finish
@@ -898,8 +986,16 @@ class FieldAgent:
             return
 
         # Sweep complete - recenter, remember, publish, set escape bias, roll.
+        # The forward ultrasonic reading rides along (the sensor is
+        # body-fixed, so one reading covers the whole stationary sweep):
+        # location_graph folds it into the place fingerprint so two
+        # featureless scans can still tell a tight corner from open floor.
         self.publish_look(0, 0)
-        self.last_room_scan = {"scanned_at": now, "sightings": self.scan_sightings}
+        scan_distance = None
+        if snap.get("distance_cm") is not None and not snap.get("distance_stale", True):
+            scan_distance = snap["distance_cm"]
+        self.last_room_scan = {"scanned_at": now, "sightings": self.scan_sightings,
+                               "distance_cm": scan_distance}
         self.bus.publish("picarx/exploration/room_scan", self.last_room_scan)
         self.preferred_escape_angle = self._escape_angle_from_scan()
         self.last_scan_at = now
@@ -1061,8 +1157,9 @@ class FieldAgent:
 
         # --- Handle Periodic Spontaneous Wandering ---
         if now - self.last_wander > self.wander_interval:
-            angle = random.randint(-25, 25)
-            print(f"Wandering with angle: {angle}")
+            angle, reason = self._choose_wander_angle()
+            print(f"Wandering with angle: {angle} ({reason})")
+            self.publish_decision("wander", {"angle": angle}, reason)
             self.publish_intent({"direction": "turn", "angle": angle})
             self.steering_active_until = now + 1.5
             self.wander_interval = random.uniform(5.0, 15.0)
@@ -1073,6 +1170,29 @@ class FieldAgent:
         if self._note_forward_and_check_stuck(now, snap):
             return
         self.publish_intent({"direction": "forward", "speed": 25})
+
+    def _choose_wander_angle(self):
+        """Pick the next wander steering angle, curiosity-aware when the
+        spatial modules are up. Returns (angle, reason) - the reason is
+        the honest explanation that goes into the decision journal."""
+        loc = self._location_context()
+        settled = (loc is not None and loc.get("uncertainty") is not None
+                   and loc["uncertainty"] < CURIOSITY_SETTLED_SCORE)
+        if settled and self.preferred_escape_angle is not None \
+                and random.random() < CURIOSITY_BIAS_PROB:
+            # Well-understood spot: lean toward the side the last sweep
+            # found clearer, to drift somewhere with more left to learn.
+            side = 1 if self.preferred_escape_angle > 0 else -1
+            angle = side * random.randint(8, 25)
+            return angle, (f"{loc['label']} is already well understood "
+                           f"(uncertainty {loc['uncertainty']:.2f}), drifting toward the clearer side")
+        angle = random.randint(-25, 25)
+        if loc is None or loc.get("uncertainty") is None:
+            return angle, "no spatial map available, wandering at random"
+        if settled:
+            return angle, "well-known area but keeping some randomness"
+        return angle, (f"still learning {loc['label']} "
+                       f"(uncertainty {loc['uncertainty']:.2f}), poking around it at random")
 
     def _note_forward_and_check_stuck(self, now, snap):
         """Physical stuck detection: continuously commanding forward
@@ -1105,6 +1225,8 @@ class FieldAgent:
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/suggestion", self.on_coach_suggestion)
+        self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
+        self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)

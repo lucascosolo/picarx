@@ -245,7 +245,7 @@ class AudioNode:
     # though it works fine from an interactive login shell. Card index
     # from `aplay -l`: card 0 is the HifiBerry DAC HAT (the real
     # speaker output); cards 2/3 are just the Pi's HDMI outputs.
-    AUDIO_OUT_DEVICE = "plughw:1,0"
+    AUDIO_OUT_DEVICE = "plug:robot_speaker"
 
     def speak(self, text):
         print(f"PiCar Speaking: {text}")
@@ -269,10 +269,23 @@ class AudioNode:
         finally:
             self.mute_until = time.time() + SELF_SPEECH_MUTE_TAIL_SEC
 
+    # Announcements older than this on arrival get dropped instead of
+    # spoken. aplay playback is blocking and serial, so during a busy
+    # stretch (fail-state loop) speak requests stack up in the MQTT
+    # callback queue and play long after the moment they described -
+    # the robot ends up narrating decisions from half a minute ago while
+    # visibly doing something else. Stale narration is worse than none.
+    SPEAK_MAX_AGE_SEC = 6.0
+
     def handle_speak_request(self, payload):
         text = payload.get("text", "")
-        if text:
-            self.speak(text)
+        if not text:
+            return
+        ts = payload.get("ts")
+        if ts is not None and (time.time() - float(ts)) > self.SPEAK_MAX_AGE_SEC:
+            print(f"(dropping stale queued announcement: {text})")
+            return
+        self.speak(text)
 
     def _enable_speakers(self):
         # The robot_hat speaker amp is gated by a GPIO switch that comes
@@ -305,7 +318,7 @@ class AudioNode:
         # Card index from `arecord -l`: card 1 is the USB PnP Sound Device (the mic).
         cmd = [
             "arecord",
-            "-D", "plughw:0,0",
+            "-D", "plug:robot_mic",
             "-f", "S16_LE",
             "-c", "1",
             "-r", "16000",

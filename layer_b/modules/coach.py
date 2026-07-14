@@ -110,6 +110,11 @@ DEFAULT_SPEED = 25
 DEFAULT_ANGLE = 0
 DEFAULT_DURATION = 1.5
 MIN_DURATION, MAX_DURATION = 0.3, 3.0
+# The safety daemon hard-vetoes continuous reverse beyond 2.0s (no rear
+# sensor - see MAX_CONTINUOUS_REVERSE_SEC there). Cap reverse steps below
+# that so a suggested maneuver never generates its own reverse-limit
+# vetoes (which would also wrongly mark the episode as failed).
+MAX_BACKWARD_DURATION = 1.8
 MIN_SPEED, MAX_SPEED = 10, 40
 MIN_ANGLE, MAX_ANGLE = -30, 30
 ALLOWED_DIRECTIONS = {"forward", "backward", "stop", "turn"}
@@ -394,7 +399,8 @@ class Coach:
             action["speed"] = max(MIN_SPEED, min(MAX_SPEED, int(parsed.get("speed", DEFAULT_SPEED))))
         elif direction == "turn":
             action["angle"] = max(MIN_ANGLE, min(MAX_ANGLE, int(parsed.get("angle", DEFAULT_ANGLE))))
-        duration = max(MIN_DURATION, min(MAX_DURATION, float(parsed.get("duration", DEFAULT_DURATION))))
+        max_dur = MAX_BACKWARD_DURATION if direction == "backward" else MAX_DURATION
+        duration = max(MIN_DURATION, min(max_dur, float(parsed.get("duration", DEFAULT_DURATION))))
         return {"action": action, "duration": duration}
 
     @classmethod
