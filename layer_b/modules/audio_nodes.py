@@ -73,6 +73,7 @@ import array
 import math
 import time
 import json
+import queue
 import subprocess
 import threading
 from collections import deque
@@ -156,6 +157,59 @@ RESEED_RMS_WINDOW = 40          # chunks (~5s) of recent rms kept for the reseed
 # own announcements (which, during a busy exploration session, is a
 # near-continuous stream) - burning decode CPU and keeping the gate open.
 SELF_SPEECH_MUTE_TAIL_SEC = 0.4
+
+# ---------------------------------------------------------------------
+# Text-to-speech: Kokoro (local neural TTS) with a seamless espeak fallback
+# ---------------------------------------------------------------------
+# The robot's primary voice is Kokoro - a small, natural-sounding local
+# neural TTS run through kokoro-onnx, played out with sounddevice. It is a
+# drop-in replacement for the old robotic espeak voice, but espeak is KEPT
+# as an always-available fallback: if the Kokoro model files are missing,
+# the engine fails to initialize, or a runtime error happens mid-synthesis,
+# speech transparently falls back to espeak so the robot never goes mute
+# (and if even espeak is unavailable, we log and carry on - never crash).
+#
+# ------------------------------- SETUP (manual, NOT auto-downloaded) ------
+# The model + voice binaries are large and are NOT in git and NOT fetched
+# automatically. To enable the Kokoro voice on the robot:
+#
+#   1. Install the Python deps into the robot's environment:
+#          pip install kokoro-onnx sounddevice
+#      sounddevice needs PortAudio at the system level:
+#          sudo apt-get install -y libportaudio2
+#
+#   2. Download the QUANTIZED model + the voices pack from the kokoro-onnx
+#      releases page (https://github.com/thewh1teagle/kokoro-onnx/releases):
+#          kokoro-v1.0.int8.onnx   (quantized model, ~90 MB - int8 keeps the
+#                                    Pi's CPU/RAM budget; the fp32
+#                                    kokoro-v1.0.onnx also works if preferred)
+#          voices-v1.0.bin         (all voices in one file, ~27 MB)
+#
+#   3. Drop both into the models dir, alongside the vision models, in a
+#      new kokoro/ subfolder:
+#          /home/picarx/layer_b/modules/models/kokoro/
+#              kokoro-v1.0.int8.onnx
+#              voices-v1.0.bin
+#
+# Any of the paths / the default voice can be overridden with the env vars
+# below (same pattern as VOSK_MODEL_PATH). Nice voices to try in
+# voices-v1.0.bin: af_heart, af_bella, af_sarah (US female), am_adam (US
+# male), bf_emma (British female). Pick one with KOKORO_VOICE.
+KOKORO_DIR = os.environ.get(
+    "KOKORO_DIR", "/home/picarx/layer_b/modules/models/kokoro")
+KOKORO_MODEL_PATH = os.environ.get(
+    "KOKORO_MODEL_PATH", os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx"))
+KOKORO_VOICES_PATH = os.environ.get(
+    "KOKORO_VOICES_PATH", os.path.join(KOKORO_DIR, "voices-v1.0.bin"))
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
+KOKORO_LANG = os.environ.get("KOKORO_LANG", "en-us")
+KOKORO_SPEED = float(os.environ.get("KOKORO_SPEED", "1.0"))
+
+# Optional PortAudio output device for sounddevice (index or name substring).
+# Unset -> PortAudio's default. Set this if Kokoro speech comes out of the
+# wrong sink (the espeak fallback targets ALSA plug:robot_speaker directly).
+_tts_out = os.environ.get("TTS_OUTPUT_DEVICE")
+TTS_OUTPUT_DEVICE = int(_tts_out) if _tts_out and _tts_out.lstrip("-").isdigit() else _tts_out
 
 
 class EnergyGate:
@@ -328,14 +382,19 @@ class AudioNode:
         # Speech OUT is unaffected; only recognition is gated.
         self.mic_enabled = True
 
-        # TTS: shell out to espeak directly per call, rather than using
-        # pyttsx3. pyttsx3's espeak driver has a known issue on Linux
-        # where the engine's internal event loop only reliably runs
-        # once per process - a second engine.say()/runAndWait() call
-        # silently does nothing (no exception), which is why speech
-        # worked once at startup and then went silent for every
-        # subsequent picarx/audio/speak message. Calling espeak fresh
-        # each time avoids that class of bug entirely.
+        # TTS output path: a single dedicated worker thread drains a queue
+        # and plays one clip at a time. Callers (the picarx/audio/speak bus
+        # handler, the startup announcement) only ENQUEUE and return
+        # immediately, so no bus callback or system task ever blocks on
+        # playback. Serializing in one worker preserves the "one utterance
+        # at a time" behavior the old blocking aplay path had for free.
+        # Primary engine is Kokoro (see _init_kokoro); espeak is the
+        # always-available fallback. espeak is still shelled out fresh per
+        # call rather than via pyttsx3, whose espeak driver goes silent
+        # after the first utterance in a process.
+        self._tts_queue = queue.Queue()
+        self._tts_worker_started = False
+        self._init_kokoro()
 
         # Initialize local STT Model
         if not os.path.exists(MODEL_PATH):
@@ -360,27 +419,107 @@ class AudioNode:
     # speaker output); cards 2/3 are just the Pi's HDMI outputs.
     AUDIO_OUT_DEVICE = "plug:robot_speaker"
 
+    # ---------- TTS: Kokoro primary, espeak fallback ----------
+
+    def _init_kokoro(self):
+        """Load the Kokoro neural TTS engine, fail-soft. Sets self.kokoro to
+        the loaded engine, or None if the model files are absent or the
+        engine can't be imported/loaded - in which case every utterance
+        simply uses the espeak fallback. Never raises."""
+        self.kokoro = None
+        if not (os.path.exists(KOKORO_MODEL_PATH) and os.path.exists(KOKORO_VOICES_PATH)):
+            print(f"Kokoro TTS files not found ({KOKORO_MODEL_PATH} / "
+                  f"{KOKORO_VOICES_PATH}); using the espeak voice. See the SETUP "
+                  f"block in audio_nodes.py to enable the neural voice.")
+            return
+        try:
+            from kokoro_onnx import Kokoro
+            self.kokoro = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
+            print(f"Kokoro TTS active (voice '{KOKORO_VOICE}', {KOKORO_LANG}).")
+        except Exception as e:
+            print(f"Kokoro TTS failed to initialize ({e}); falling back to espeak.")
+            self.kokoro = None
+
+    def _ensure_tts_worker(self):
+        """Start the single serial playback worker on first use (idempotent)."""
+        if self._tts_worker_started:
+            return
+        self._tts_worker_started = True
+        threading.Thread(target=self._tts_worker, name="tts-worker", daemon=True).start()
+
     def speak(self, text):
+        """Public in-process speech entrypoint. Enqueues TEXT for the serial
+        TTS worker and returns immediately (non-blocking) - the actual
+        synthesis/playback happens off this thread so nothing else stalls.
+        The picarx/audio/speak bus topic (handle_speak_request) is unchanged,
+        so the companion LLM and every other publisher keep working as-is."""
+        if not text:
+            return
+        self._ensure_tts_worker()
+        self._tts_queue.put((text, None))
+
+    def _tts_worker(self):
+        """Drain the TTS queue, one utterance at a time. Playback is serial
+        here (so utterances never overlap) while callers only ever enqueue."""
+        while True:
+            try:
+                text, ts = self._tts_queue.get()
+            except Exception:
+                continue
+            # Drop announcements that went stale while queued: playback is
+            # serial, so during a busy stretch old lines would otherwise play
+            # long after the moment they described (same rule as at enqueue).
+            if ts is not None and (time.time() - ts) > self.SPEAK_MAX_AGE_SEC:
+                print(f"(dropping stale queued announcement: {text})")
+                continue
+            self._render_and_play(text)
+
+    def _render_and_play(self, text):
+        """Speak TEXT: Kokoro first, espeak fallback, never crash. Manages the
+        self-mic mute around playback (the mic sits next to the speaker, so
+        without this the robot decodes its own voice and holds the gate open)."""
         print(f"PiCar Speaking: {text}")
-        # Mute our own mic for the duration of playback (+ a short
-        # reverb tail): the mic sits right next to the speaker, so
-        # without this every announcement gets captured, holds the
-        # energy gate open, and burns a full STT decode on our own
-        # voice. Set BEFORE playback starts and refreshed after, since
-        # playback is blocking and this handler runs on the MQTT
-        # callback thread while the mic loop keeps consuming chunks.
         self.mute_until = float("inf")
         try:
-            espeak_proc = subprocess.Popen(["espeak", "--stdout", text], stdout=subprocess.PIPE)
-            subprocess.run(
-                ["aplay", "-D", self.AUDIO_OUT_DEVICE, "-q"],
-                stdin=espeak_proc.stdout,
-                check=False,
-            )
-            espeak_proc.stdout.close()
-            espeak_proc.wait()
+            if self.kokoro is not None:
+                try:
+                    self._speak_kokoro(text)
+                    return
+                except Exception as e:
+                    print(f"Kokoro TTS runtime error ({e}); using espeak for this line.")
+            try:
+                self._speak_espeak(text)
+            except Exception as e:
+                # Both engines are down. Log clearly and carry on - a mute
+                # robot is bad, a crashed audio node is worse.
+                print(f"TTS failed on both Kokoro and espeak ({e}); staying silent.")
         finally:
             self.mute_until = time.time() + SELF_SPEECH_MUTE_TAIL_SEC
+
+    def _speak_kokoro(self, text):
+        """Synthesize with Kokoro and play through sounddevice. sd.play is
+        itself non-blocking (PortAudio streams on its own thread); we sd.wait
+        here only so THIS worker serializes clips - no external caller waits."""
+        import sounddevice as sd
+        samples, sample_rate = self.kokoro.create(
+            text, voice=KOKORO_VOICE, speed=KOKORO_SPEED, lang=KOKORO_LANG)
+        if TTS_OUTPUT_DEVICE is not None:
+            sd.play(samples, sample_rate, device=TTS_OUTPUT_DEVICE)
+        else:
+            sd.play(samples, sample_rate)
+        sd.wait()
+
+    def _speak_espeak(self, text):
+        """Fallback voice: shell espeak --stdout into aplay on the robot
+        speaker (the proven ALSA path). Fresh process per call on purpose."""
+        espeak_proc = subprocess.Popen(["espeak", "--stdout", text], stdout=subprocess.PIPE)
+        subprocess.run(
+            ["aplay", "-D", self.AUDIO_OUT_DEVICE, "-q"],
+            stdin=espeak_proc.stdout,
+            check=False,
+        )
+        espeak_proc.stdout.close()
+        espeak_proc.wait()
 
     # Announcements older than this on arrival get dropped instead of
     # spoken. aplay playback is blocking and serial, so during a busy
@@ -398,7 +537,11 @@ class AudioNode:
         if ts is not None and (time.time() - float(ts)) > self.SPEAK_MAX_AGE_SEC:
             print(f"(dropping stale queued announcement: {text})")
             return
-        self.speak(text)
+        # Enqueue for the serial worker (non-blocking). Carry ts so a clip
+        # that goes stale WHILE queued during a busy stretch is dropped at
+        # dequeue too, not just here at enqueue.
+        self._ensure_tts_worker()
+        self._tts_queue.put((text, float(ts) if ts is not None else None))
 
     def _enable_speakers_once(self):
         """Assert the amp-enable GPIO once. Returns True if the command
@@ -447,6 +590,7 @@ class AudioNode:
         self.bus.subscribe("picarx/audio/speak", self.handle_speak_request)
         self.bus.subscribe("picarx/audio/mic_control", self.on_mic_control)
         self._enable_speakers()
+        self._ensure_tts_worker()
 
         if not self.model:
             print("Audio node running in output-only mode.")
