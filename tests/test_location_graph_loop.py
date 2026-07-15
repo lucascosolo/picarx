@@ -71,6 +71,30 @@ class LocationGraphLoopTest(unittest.TestCase):
         self._maybe_clear(location_id=None)
         self.assertEqual(self._veto(), 5)
 
+    def test_maybe_clear_journals_a_map_update(self):
+        self._maybe_clear()
+        decisions = self.lg.bus.of("picarx/decision")
+        self.assertEqual(len(decisions), 1)
+        d = decisions[0]
+        self.assertEqual(d["source"], "location_graph")
+        self.assertEqual(d["kind"], "map_update")
+        self.assertEqual(d["choice"]["change"], "veto_relaxed")
+        self.assertEqual(d["choice"]["veto_count"], 4)
+        self.assertIn("place 4 (chair)", d["reason"])   # human-readable why
+        self.assertEqual(d["location"], {"id": 1, "label": "place 4 (chair)"})
+
+    def test_no_journal_when_already_floored(self):
+        # A location already at 0 has nothing to relax -> no journal spam.
+        self.w.conn.execute("UPDATE locations SET veto_count = 0 WHERE id = 1")
+        self.w.conn.commit()
+        self._maybe_clear()
+        self.assertEqual(self.lg.bus.of("picarx/decision"), [])
+        self.assertEqual(self._veto(), 0)
+
+    def test_still_blocked_writes_no_journal(self):
+        self._maybe_clear(resolution="still_blocked")
+        self.assertEqual(self.lg.bus.of("picarx/decision"), [])
+
     def test_delivered_through_bus_subscription(self):
         # Wire the real subscription and deliver like the broker would.
         bus = harness.FakeBus()

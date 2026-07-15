@@ -111,14 +111,27 @@ class LocationGraph:
         if loc_id is not None:
             self.store.note_coach_outcome(loc_id, bool(payload.get("success")))
 
+    # ---------- decision journal ----------
+
+    def publish_decision(self, kind, choice, reason, location=None):
+        """Mirror field_agent's journal convention: a non-trivial map change
+        lands on picarx/decision WITH the reason it happened, so the robot
+        can answer 'why did you do that?' from event_logger's record instead
+        of confabulating."""
+        self.bus.publish("picarx/decision", {
+            "source": "location_graph", "kind": kind, "choice": choice,
+            "reason": reason, "location": location, "ts": time.time(),
+        })
+
     # ---------- inbound: physical hypothesis outcomes (map decay) ----------
 
     def on_hypothesis(self, payload):
         """A VetoProneLocationProbe resolving 'maybe_clear' means the spot
         that kept vetoing us re-tested clean - ease its veto_count so the
-        robot can eventually stop treating it as blocked. Other hypothesis
+        robot can eventually stop treating it as blocked, and journal WHY so
+        'why did you go back in there?' has a real answer. Other hypothesis
         types (and 'still_blocked') are ignored. Fail-soft on a payload
-        missing the location id."""
+        missing / naming an unknown location."""
         if payload.get("question") != VETO_PRONE_QUESTION:
             return
         if payload.get("resolution") != MAYBE_CLEAR:
@@ -130,11 +143,23 @@ class LocationGraph:
             loc_id = (payload.get("location") or {}).get("id")
         if loc_id is None:
             return
-        self.store.relax_veto(loc_id, VETO_RELAX_STEP)
+        # One read up front yields both the label (for the reason) and the
+        # count. Skip entirely if there's nothing left to relax, so a floored
+        # location can't spam the journal with non-events - and the new count
+        # is computed locally, no second read.
         loc = self.store.get_location(loc_id)
-        remaining = loc["veto_count"] if loc else "?"
-        print(f"Location graph: {loc['label'] if loc else loc_id} re-tested clear - "
-              f"eased veto_count to {remaining}")
+        if loc is None or loc["veto_count"] <= 0:
+            return
+        label = loc["label"]
+        self.store.relax_veto(loc_id, VETO_RELAX_STEP)
+        remaining = max(0, loc["veto_count"] - VETO_RELAX_STEP)
+        print(f"Location graph: {label} re-tested clear - eased veto_count to {remaining}")
+        self.publish_decision(
+            "map_update",
+            {"location_id": loc_id, "change": "veto_relaxed", "veto_count": remaining},
+            f"I relaxed my caution about {label} because a physical test showed "
+            f"it might be clear now",
+            location={"id": loc_id, "label": label})
 
     # ---------- main loop ----------
 

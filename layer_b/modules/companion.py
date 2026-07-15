@@ -506,7 +506,9 @@ class Companion:
         if entries:
             reply = entries[0]["fact"]
         else:
-            when = "yesterday" if "yesterday" in text.lower() else "today"
+            # Derive the word from the date we already resolved rather than
+            # re-lowercasing and re-scanning the utterance.
+            when = "today" if date == time.strftime("%Y-%m-%d") else "yesterday"
             reply = f"I don't have my thoughts on {when} put together yet."
         now = time.time()
         with self.lock:

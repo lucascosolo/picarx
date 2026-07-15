@@ -1,0 +1,81 @@
+Final polish: map-update journaling + non-destructive optimization pass
+=======================================================================
+
+BASE: origin/master (hypothesis->map loop + 48-test suite already merged).
+
+PART 1 - LOG MAP UPDATES TO THE DECISION JOURNAL
+------------------------------------------------
+When relax_veto actually decrements a location's veto_count (a
+VetoProneLocationProbe resolved "maybe_clear"), location_graph now records
+WHY on the decision journal, so the robot can explain itself.
+
+* layer_b/modules/location_graph.py
+  - New publish_decision(kind, choice, reason, location) helper that mirrors
+    field_agent's exact journal convention: {source, kind, choice, reason,
+    location, ts} on picarx/decision. event_logger already persists that
+    topic and field_agent's "why" reader reads it back, so a query like
+    "why did you go back into that room?" now answers:
+      "My last decision was map_update: I relaxed my caution about
+       place 4 (chair) because a physical test showed it might be clear now."
+  - on_hypothesis publishes a "map_update" decision (choice change=
+    "veto_relaxed", the new veto_count) after a successful relax.
+  - It only journals a REAL change: if the location is already floored at 0
+    there is nothing to relax, so it returns early instead of spamming the
+    journal with non-events.
+
+PART 2 - LOGIC / SYNTAX / EFFICIENCY POLISH (strictly non-destructive)
+---------------------------------------------------------------------
+Reviewed all six roadmap files. Behaviour is unchanged and the off-robot
+suite stays green (now 51: the original 48 + 3 for the new journaling).
+
+Concrete changes made:
+* location_graph.on_hypothesis - fewer DB reads: was relax-then-read
+  (read AFTER the write, only for a log line); now reads ONCE up front to
+  get both label and count, computes the new count locally (no second
+  read), and short-circuits the no-op case. Same behaviour on every path
+  the tests exercise; strictly less work.
+* companion._maybe_answer_episode - streamlined string work in the handler:
+  the "no episode yet" branch derived today/yesterday by re-lowercasing and
+  re-scanning the utterance; it now derives the word from the date already
+  resolved (one strftime compare). Identical output.
+
+Reviewed and deliberately LEFT UNCHANGED (documented so the audit is
+visible):
+* field_agent._maybe_start_veto_prone_probe does a live spatial get_location
+  per cruise tick after its 90s cooldown. Caching it (e.g. off the
+  location_change payload's veto_count) is the obvious optimization, but
+  that value is a stale snapshot: a within-visit veto increment would be
+  missed, so the probe would fire at a DIFFERENT time. That is an
+  observable behaviour change (and would force rewriting a passing test),
+  so it was rejected under the strict boundary. The read is an indexed
+  primary-key lookup on a tiny table - negligible on the Pi 4.
+* semantic_store.py, spatial_store.py, reflection.py, field_agent's
+  HypothesisTask framework: audited for unused imports, dead code left from
+  the refactor (the old PROBING state / probe_* fields / _handle_probe_tick
+  were already removed cleanly), redundant type checks, and obsolete
+  comments. None found - the isinstance/int guards on LLM JSON in reflection
+  and the fail-soft guards are all load-bearing, not redundant. No changes.
+
+STRICT-BOUNDARY CHECKLIST
+-------------------------
+- Single-writer rule intact: location_graph remains the SOLE writer to
+  spatial.db; field_agent only reports findings on the bus.
+- Fail-soft intact: on_hypothesis still no-ops on a missing/unknown
+  location; readers still degrade to empty.
+- Motion path untouched; no LLM/fuzzy path can start motion.
+- No observable behaviour change; all 51 off-robot tests pass.
+
+CURRENT STATE
+-------------
+- Loop verified end to end: field_agent probe -> maybe_clear ->
+  spatial.db veto_count decrement -> map_update journal entry -> answerable
+  by the "why" reader.
+- tests/test_location_graph_loop.py adds: journals a map_update,
+  no journal when already floored, still_blocked writes no journal.
+
+SUGGESTED NEXT STEPS
+--------------------
+- reflection could fold "map_update" decisions into the self-model
+  ("I've been learning that place 4 isn't as bad as I thought").
+- A slow time-based veto_count decay (in addition to re-test decay) would
+  let places unlearn even when the robot never revisits to probe them.
