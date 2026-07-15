@@ -205,6 +205,19 @@ PROBE_CREEP_SEC = 0.7          # < 1s of actual movement
 PROBE_SETTLE_SEC = 0.4         # hold still before/after to get clean readings
 PROBE_COOLDOWN = 60.0          # at most one probe a minute
 PROBE_MIN_DISTANCE_CM = 16     # below this, don't probe - just evade
+PROBE_TIMEOUT = 5.0            # hard upper bound on the whole probe (safety net)
+
+# Second hypothesis: a location the map says keeps vetoing us. Before
+# cruising into it normally, creep in slowly (speed <= 10, under the probe
+# cap) and STOP a safe buffer early, then just watch: if the safety daemon
+# doesn't flag anything for VETO_PROBE_CLEAR_SEC, the area might be clear
+# now. The daemon stays the ONLY thing that physically stops the robot -
+# this test never bypasses it, it only asks it a question.
+VETO_PRONE_THRESHOLD = 3          # veto_count that marks a place "veto-prone"
+VETO_PRONE_PROBE_COOLDOWN = 90.0  # min seconds between veto-prone probes
+VETO_PROBE_SPEED = 10             # hard speed cap for the careful approach
+VETO_PROBE_APPROACH_SEC = 1.0     # brief slow creep in, then stop early
+VETO_PROBE_CLEAR_SEC = 3.0        # no veto for this long -> "might be clear"
 
 # Curiosity bias (explorer.py's uncertainty scores, all fail-soft):
 # when the CURRENT location scores below this - i.e. it's already well
@@ -279,6 +292,228 @@ FAIL_STATE_COOLDOWN = 8.0        # min seconds between fail-state episodes
 MAX_CONSECUTIVE_FAILURES = 3     # give up and wait for a human after this many straight failures
 
 
+# ---------------------------------------------------------------------
+# Active physical hypothesis testing (generic framework)
+# ---------------------------------------------------------------------
+# The robot occasionally has a QUESTION about the physical world it can
+# only answer by carefully doing something and watching the result -
+# "is that ultrasonic blip real or a phantom?", "is this spot that keeps
+# stopping me still blocked?". Each such test is a HypothesisTask: a
+# small, bounded, single-at-a-time state machine.
+#
+# INVARIANTS every task must uphold (the point of the shared base):
+#   - Standard lifecycle fields: type, state (init -> testing ->
+#     resolving), started_at, timeout. Nothing runs unbounded.
+#   - It NEVER issues a motion command the safety daemon can't veto, and
+#     never touches the safety socket. The daemon is the only thing that
+#     physically stops the robot; a task only asks it questions by
+#     moving slowly and watching for its vetoes.
+#   - Every resolution goes out the SAME way (resolve()): the
+#     picarx/exploration/hypothesis topic plus a decision-journal entry,
+#     so the existing contract holds no matter how many task types exist.
+class HypothesisTask:
+    TYPE = "hypothesis"
+    QUESTION = "hypothesis"
+    START_KIND = "hypothesis_probe"
+
+    def __init__(self, agent, now, timeout):
+        self.agent = agent
+        self.type = self.TYPE
+        self.state = "init"          # init -> testing -> resolving
+        self.started_at = now
+        self.timeout = timeout
+        self.resolution = None
+
+    # --- lifecycle template: the agent calls run() once per tick ---
+    def run(self, now):
+        """Advance one tick. Returns True while still running, False once
+        resolved. Enforces the shared timeout before delegating to the
+        task-specific tick(), so no subclass can run past its bound."""
+        if self.state == "resolving":
+            return False
+        if now - self.started_at > self.timeout:
+            self.on_timeout(now)
+            return False
+        self.state = "testing"
+        return self.tick(now)
+
+    # --- to be provided by subclasses ---
+    def start_choice(self):
+        """Small dict describing what set this probe off (decision journal)."""
+        return {}
+
+    def tick(self, now):
+        raise NotImplementedError
+
+    def on_timeout(self, now):
+        """Default: an unfinished probe is treated as unresolved-and-safe."""
+        self.resolve(now, "inconclusive",
+                     "hypothesis timed out before resolving - treating as unresolved")
+
+    def follow_up(self, now):
+        """What the agent should do after this task resolves (evade, cruise,
+        ...). Default: nothing - just go back to cruising."""
+        self.agent.state = "CRUISING"
+        self.agent.last_wander = now
+
+    # --- shared helpers ---
+    def _vetoed_since_start(self):
+        """Did the safety daemon veto any of OUR intents since the probe
+        began? That is the physical answer we are listening for."""
+        with self.agent.lock:
+            return any(t > self.started_at for t in self.agent.veto_events)
+
+    def resolve(self, now, resolution, why, **details):
+        """Single exit point for EVERY hypothesis type: publish the
+        outcome on picarx/exploration/hypothesis and mirror it into the
+        decision journal, exactly as the original probe did."""
+        self.state = "resolving"
+        self.resolution = resolution
+        self.agent.bus.publish("picarx/exploration/hypothesis", {
+            "question": self.QUESTION,
+            "resolution": resolution,
+            "location": self.agent._location_context(),
+            "ts": now,
+            **details,
+        })
+        self.agent.publish_decision("hypothesis_resolved",
+                                    {"resolution": resolution}, why, **details)
+        print(f"Hypothesis [{self.type}]: {resolution} - {why}")
+
+
+class SensorDisagreementProbe(HypothesisTask):
+    """Original probe, migrated verbatim: the ultrasonic reports an
+    obstacle but fresh vision sees nothing. Creep forward very slowly and
+    see whether the reading tracks like a real surface, closes in (real),
+    or opens up (phantom). A safety-daemon veto during the creep resolves
+    it immediately as real."""
+    TYPE = "sensor_disagreement"
+    QUESTION = "ultrasonic_obstacle_vs_empty_vision"
+
+    def __init__(self, agent, now, d0):
+        super().__init__(agent, now, timeout=PROBE_TIMEOUT)
+        self.d0 = d0                  # ultrasonic reading that started the probe
+        self.d1 = None
+        self.stage = 0                # 0 settle, 1 creep, 2 settle+judge
+        self.stage_until = now + PROBE_SETTLE_SEC
+
+    def start_choice(self):
+        return {"d0": self.d0}
+
+    def tick(self, now):
+        agent = self.agent
+        if self._vetoed_since_start():
+            self.resolve(now, "real_obstacle",
+                         "the safety layer vetoed the creep - it's real",
+                         d0=self.d0, d1=None)
+            return False
+        if now < self.stage_until:
+            if self.stage == 1:
+                agent.publish_intent({"direction": "forward", "speed": PROBE_SPEED},
+                                     priority=EVADE_PRIORITY)
+            else:
+                agent.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+            return True
+        self.stage += 1
+        if self.stage == 1:
+            self.stage_until = now + PROBE_CREEP_SEC
+            return True
+        if self.stage == 2:
+            self.stage_until = now + PROBE_SETTLE_SEC
+            agent.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+            return True
+        # stage 3: judge the second reading against the first.
+        snap = agent._snapshot() or {}
+        d1 = None
+        if snap.get("distance_cm") is not None and not snap.get("distance_stale", True):
+            d1 = snap["distance_cm"]
+        self.d1 = d1
+        if d1 is not None and d1 <= self.d0 + 2:
+            self.resolve(now, "real_obstacle",
+                         "the reading tracked like a real surface while creeping",
+                         d0=self.d0, d1=d1)
+        elif d1 is not None and d1 > self.d0 + 15:
+            self.resolve(now, "phantom_reading",
+                         "the path opened right up - the reading was a phantom",
+                         d0=self.d0, d1=d1)
+        else:
+            self.resolve(now, "inconclusive",
+                         "couldn't get a clean second reading - treating it as real to be safe",
+                         d0=self.d0, d1=d1)
+        return False
+
+    def follow_up(self, now):
+        agent = self.agent
+        if self.resolution == "phantom_reading":
+            agent.announce("False alarm - the way is actually clear.")
+            agent.state = "CRUISING"
+            agent.last_wander = now
+            return
+        # real_obstacle / inconclusive both get the normal escape.
+        agent.announce("It's really there. Backing away.")
+        agent._begin_evasion("ultrasonic")
+
+
+class VetoProneLocationProbe(HypothesisTask):
+    """Second hypothesis: this place has vetoed us repeatedly before, so
+    the map calls it veto-prone. Question: "is this area still blocked?"
+    Approach VERY slowly (speed <= 10) for a brief moment, then STOP a
+    safe distance early and simply watch. If the safety daemon flags an
+    obstacle, it is still blocked; if nothing is flagged for the whole
+    watch window, the area MIGHT be clear now. We never decide "clear" by
+    driving through it - only by the daemon staying silent."""
+    TYPE = "veto_prone_location"
+    QUESTION = "is_veto_prone_area_still_blocked"
+
+    def __init__(self, agent, now, location_id, veto_count):
+        super().__init__(agent, now, timeout=VETO_PROBE_CLEAR_SEC)
+        self.location_id = location_id
+        self.veto_count = veto_count
+
+    def start_choice(self):
+        return {"location_id": self.location_id, "veto_count": self.veto_count}
+
+    def tick(self, now):
+        agent = self.agent
+        if self._vetoed_since_start():
+            self.resolve(now, "still_blocked",
+                         "the safety daemon flagged an obstacle - the area is still blocked",
+                         location_id=self.location_id, veto_count=self.veto_count)
+            return False
+        if now - self.started_at < VETO_PROBE_APPROACH_SEC:
+            # Creep in slowly. Speed is hard-capped and the safety daemon
+            # still owns the actual stop - this only nudges toward the spot.
+            agent.publish_intent({"direction": "forward", "speed": VETO_PROBE_SPEED},
+                                 priority=EVADE_PRIORITY)
+        else:
+            # Stop a safe distance early and just listen for a veto until
+            # the watch window (the task timeout) elapses.
+            agent.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+        return True
+
+    def on_timeout(self, now):
+        # The window closing with no veto IS the resolution here (re-check
+        # once more so a veto landing right at the edge still counts).
+        if self._vetoed_since_start():
+            self.resolve(now, "still_blocked",
+                         "the safety daemon flagged an obstacle - the area is still blocked",
+                         location_id=self.location_id, veto_count=self.veto_count)
+        else:
+            self.resolve(now, "maybe_clear",
+                         "no veto for the full watch window - the area might be clear now",
+                         location_id=self.location_id, veto_count=self.veto_count)
+
+    def follow_up(self, now):
+        agent = self.agent
+        if self.resolution == "maybe_clear":
+            agent.announce("No block this time. This spot might be clear now.")
+            agent.state = "CRUISING"
+            agent.last_wander = now
+            return
+        agent.announce("Still blocked here. Backing away.")
+        agent._begin_evasion("veto_prone_location")
+
+
 class FieldAgent:
     def __init__(self):
         self.bus = Bus()
@@ -298,7 +533,7 @@ class FieldAgent:
         # thread (the run() loop) - bus callbacks only ever feed the
         # lock-protected inboxes below, never touch state directly,
         # so there's no cross-thread race on the state machine itself.
-        self.state = "CRUISING"  # "CRUISING", "SCANNING", "EVADING", "COACHING"
+        self.state = "CRUISING"  # CRUISING, SCANNING, EVADING, COACHING, HYPOTHESIS
         self.evade_stage = 0     # 0:stop 1:pre-turn 2:reverse-arc 3:straighten+go
         self.evade_angle = 0     # steering angle held through the reverse arc
         self.state_until = 0.0
@@ -324,12 +559,12 @@ class FieldAgent:
         # Physical stuck detection state (see STUCK_AFTER_SEC).
         self.forward_since = None      # when the current uninterrupted forward run began
 
-        # Hypothesis-testing probe state (see PROBE_* above).
-        self.probe_stage = 0           # 0 settle, 1 creep, 2 settle+judge
-        self.probe_until = 0.0
-        self.probe_d0 = None           # ultrasonic reading that started the probe
-        self.probe_started_at = 0.0
-        self.last_probe_at = 0.0
+        # Active-hypothesis framework state (see HypothesisTask). At most
+        # one bounded, safety-daemon-gated probe runs at a time (None when
+        # not testing); the last_*_at fields rate-limit each trigger.
+        self.hypothesis = None               # current HypothesisTask, or None
+        self.last_probe_at = 0.0             # sensor-disagreement probe cooldown
+        self.last_veto_prone_probe_at = 0.0  # veto-prone location probe cooldown
 
         # Wander state (mirrors the old reflex explorer's behavior,
         # now expressed as intents instead of direct socket calls)
@@ -1133,12 +1368,24 @@ class FieldAgent:
         self.state_until = now + 0.25
         self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
 
-    # ---------- active hypothesis testing (sensor disagreement probes) ----------
+    # ---------- active hypothesis testing (generic framework) ----------
 
-    def _maybe_start_probe(self, now, snap, distance):
-        """Start a micro-probe if the ultrasonic says obstacle but fresh
-        vision sees an empty scene. Returns True if the probe started
-        (tick consumed); False means fall through to normal evasion."""
+    def _start_hypothesis(self, task, announce, decision_reason):
+        """Enter the single shared HYPOTHESIS state with `task` as the
+        active probe: announce it, log why on the decision journal (same
+        'hypothesis_probe' kind as before), and hold a stop so nothing
+        stale drives us while the probe's own state machine takes over."""
+        self.hypothesis = task
+        self.state = "HYPOTHESIS"
+        self.forward_since = None
+        self.announce(announce)
+        self.publish_decision(task.START_KIND, task.start_choice(), decision_reason)
+        self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+
+    def _maybe_start_sensor_probe(self, now, snap, distance):
+        """Sensor-disagreement hypothesis: ultrasonic says obstacle but
+        fresh vision sees an empty scene. Returns True if the probe
+        started (tick consumed); False means fall through to evasion."""
         if now - self.last_probe_at < PROBE_COOLDOWN:
             return False
         if distance < PROBE_MIN_DISTANCE_CM:
@@ -1149,81 +1396,46 @@ class FieldAgent:
                             and not objects.get("items"))
         if not vision_disagrees:
             return False
-        self.state = "PROBING"
-        self.probe_stage = 0
-        self.probe_until = now + PROBE_SETTLE_SEC
-        self.probe_d0 = distance
-        self.probe_started_at = now
         self.last_probe_at = now
-        self.forward_since = None
-        self.announce("My distance sensor says something's there but I can't see it. Testing carefully.")
-        self.publish_decision(
-            "hypothesis_probe", {"d0": distance},
-            "ultrasonic reports an obstacle but fresh vision sees nothing - "
-            "creeping forward slowly to find out which sensor is right")
-        self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
+        self._start_hypothesis(
+            SensorDisagreementProbe(self, now, distance),
+            announce="My distance sensor says something's there but I can't see it. Testing carefully.",
+            decision_reason=("ultrasonic reports an obstacle but fresh vision sees nothing - "
+                             "creeping forward slowly to find out which sensor is right"))
         return True
 
-    def _handle_probe_tick(self, now):
-        # A veto during the probe settles it immediately: the safety
-        # layer's own sensors agree something is really there.
-        with self.lock:
-            vetoed = any(t > self.probe_started_at for t in self.veto_events)
-        if vetoed:
-            self._finish_probe(now, "real_obstacle", None,
-                               "the safety layer vetoed the creep - it's real")
-            return
-        if now < self.probe_until:
-            if self.probe_stage == 1:
-                self.publish_intent({"direction": "forward", "speed": PROBE_SPEED},
-                                    priority=EVADE_PRIORITY)
-            else:
-                self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
-            return
-        self.probe_stage += 1
-        if self.probe_stage == 1:
-            self.probe_until = now + PROBE_CREEP_SEC
-        elif self.probe_stage == 2:
-            self.probe_until = now + PROBE_SETTLE_SEC
-            self.publish_intent({"direction": "stop"}, priority=EVADE_PRIORITY)
-        else:
-            snap = self._snapshot() or {}
-            d1 = None
-            if snap.get("distance_cm") is not None and not snap.get("distance_stale", True):
-                d1 = snap["distance_cm"]
-            if d1 is not None and d1 <= self.probe_d0 + 2:
-                # Reading held (or closed in) while we moved toward it -
-                # behaves like a real surface.
-                self._finish_probe(now, "real_obstacle", d1,
-                                   "the reading tracked like a real surface while creeping")
-            elif d1 is not None and d1 > self.probe_d0 + 15:
-                self._finish_probe(now, "phantom_reading", d1,
-                                   "the path opened right up - the reading was a phantom")
-            else:
-                self._finish_probe(now, "inconclusive", d1,
-                                   "couldn't get a clean second reading - treating it as real to be safe")
+    def _maybe_start_veto_prone_probe(self, now):
+        """Veto-prone-location hypothesis: the near path is clear, but the
+        map says this place keeps vetoing us. Before cruising in normally,
+        test whether it's still blocked. Returns True if the probe started.
+        Fail-soft: no spatial map / unknown place -> never triggers."""
+        if now - self.last_veto_prone_probe_at < VETO_PRONE_PROBE_COOLDOWN:
+            return False
+        loc = self._location_context()
+        if not loc or loc.get("id") is None:
+            return False
+        location = self.spatial.get_location(loc["id"])
+        if not location or location.get("veto_count", 0) < VETO_PRONE_THRESHOLD:
+            return False
+        veto_count = location["veto_count"]
+        self.last_veto_prone_probe_at = now
+        self._start_hypothesis(
+            VetoProneLocationProbe(self, now, loc["id"], veto_count),
+            announce="I've been blocked here before. Let me test carefully if it's still blocked.",
+            decision_reason=(f"approaching {loc.get('label')}, which has vetoed me "
+                             f"{veto_count} times - testing whether it is still blocked"))
+        return True
 
-    def _finish_probe(self, now, resolution, d1, why):
-        outcome = {
-            "question": "ultrasonic_obstacle_vs_empty_vision",
-            "resolution": resolution,
-            "d0": self.probe_d0,
-            "d1": d1,
-            "location": self._location_context(),
-            "ts": now,
-        }
-        self.bus.publish("picarx/exploration/hypothesis", outcome)
-        self.publish_decision("hypothesis_resolved", {"resolution": resolution}, why,
-                              d0=self.probe_d0, d1=d1)
-        print(f"Hypothesis probe: {resolution} (d0={self.probe_d0}, d1={d1}) - {why}")
-        if resolution == "phantom_reading":
-            self.announce("False alarm - the way is actually clear.")
+    def _handle_hypothesis_tick(self, now):
+        """Drive the active HypothesisTask one tick. When it resolves, run
+        its follow-up (evade / resume cruising) and leave HYPOTHESIS."""
+        task = self.hypothesis
+        if task is None:
             self.state = "CRUISING"
-            self.last_wander = now
             return
-        # real_obstacle / inconclusive both get the normal escape.
-        self.announce("It's really there. Backing away.")
-        self._begin_evasion("ultrasonic")
+        if not task.run(now):
+            self.hypothesis = None
+            task.follow_up(now)
 
     # ---------- perception (always runs, independent of explore_mode) ----------
 
@@ -1351,8 +1563,8 @@ class FieldAgent:
             self._handle_coaching_tick(now)
             return
 
-        if self.state == "PROBING":
-            self._handle_probe_tick(now)
+        if self.state == "HYPOTHESIS":
+            self._handle_hypothesis_tick(now)
             return
 
         if self.watch_coach_action is not None:
@@ -1453,10 +1665,18 @@ class FieldAgent:
 
         # --- Handle New Obstacle Detection ---
         if distance < OBSTACLE_DISTANCE_CM:
-            if self._maybe_start_probe(now, snap, distance):
+            if self._maybe_start_sensor_probe(now, snap, distance):
                 return
             self.announce("Obstacle ahead, backing away.")
             self._begin_evasion("ultrasonic")
+            return
+
+        # --- Veto-prone location hypothesis ---
+        # The near path is clear (obstacle checks above already returned),
+        # but the map says this spot keeps stopping us. Before cruising in
+        # normally, run the careful, safety-daemon-gated "is it still
+        # blocked?" test instead of just driving forward.
+        if self._maybe_start_veto_prone_probe(now):
             return
 
         # --- Periodic look-around while cruising ---
