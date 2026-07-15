@@ -67,9 +67,9 @@ class CompanionToolTest(unittest.TestCase):
         # Companion must NEVER emit a raw motion primitive.
         self.assertEqual(self.c.bus.of("picarx/intent/move"), [])
 
-    def test_share_connection_publishes(self):
+    def test_share_connection_publishes_bluetooth(self):
         self.c._execute_tool("share_connection", {"name": "Pixel"})
-        msg = self.c.bus.last(companion.NETWORK_CONNECT_TOPIC)
+        msg = self.c.bus.last(companion.BLUETOOTH_CONNECT_TOPIC)
         self.assertEqual(msg["name"], "Pixel")
 
     def test_unknown_tool(self):

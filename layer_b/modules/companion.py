@@ -20,8 +20,8 @@ LLM-backed chat layer) is deliberate and should not be blurred.
 It does expose a small set of LLM TOOLS (see TOOLS) that let the model
 ACT by TOGGLING other daemons over picarx/tools/* topics - never by
 emitting motion. schedule_reminder arms reminder_daemon, share_connection
-asks network_daemon to join a phone hotspot, and start/stop_following flip
-follow_daemon's mode. Even start_following only sets a switch: follow_daemon
+asks bluetooth_daemon to tether to a paired phone, and start/stop_following
+flip follow_daemon's mode. Even start_following only sets a switch: follow_daemon
 generates the actual motion deterministically from vision and every command
 still flows through the safety daemon, so "motion never starts from raw LLM
 output" holds - the model chooses a behaviour, not a maneuver.
@@ -166,7 +166,7 @@ EPISODE_TRIGGERS = (
 MAX_TOOL_ROUNDS = 3          # bound the tool<->model round-trips per utterance
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
 FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
-NETWORK_CONNECT_TOPIC = "picarx/tools/network/connect"
+BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 
 TOOLS = [
     {"name": "schedule_reminder",
@@ -196,12 +196,14 @@ TOOLS = [
      "description": "Stop following the person.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "share_connection",
-     "description": "Join the person's phone hotspot for internet when there is no "
-                    "wifi, so radio and chat keep working. Use when they offer to "
-                    "share their phone's connection, or when you're offline.",
+     "description": "Get internet by tethering over BLUETOOTH to the person's "
+                    "already-paired phone, so radio and chat keep working where "
+                    "there is no wifi. Use when they offer to share their phone's "
+                    "connection, or when you're offline. (Wifi networks are managed "
+                    "with the system's own tools, not this.)",
      "input_schema": {"type": "object", "properties": {
          "name": {"type": "string",
-                  "description": "optional saved hotspot name or SSID to use"}},
+                  "description": "optional saved phone name to tether to"}},
          "required": []}},
 ]
 
@@ -644,8 +646,8 @@ class Companion:
                 req = {}
                 if tool_input.get("name"):
                     req["name"] = tool_input["name"]
-                self.bus.publish(NETWORK_CONNECT_TOPIC, req)
-                return "Trying to join the phone's hotspot."
+                self.bus.publish(BLUETOOTH_CONNECT_TOPIC, req)
+                return "Trying to tether over Bluetooth to the phone."
         except Exception as e:
             print(f"Companion: tool '{name}' failed: {e}")
             return "That didn't work."

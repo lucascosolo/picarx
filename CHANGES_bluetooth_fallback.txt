@@ -1,0 +1,79 @@
+Replace wifi-hotspot fallback with Bluetooth tethering
+======================================================
+
+BASE: origin/master (7ed3a6d - has the tool layer + network_daemon).
+
+WHY
+---
+The wifi network_daemon joined a phone's WIFI hotspot via nmcli, but the
+Pi's own system config auto-spins-up a wifi hotspot whenever it can't reach
+the internet (so a laptop can still reach the robot). Those two fight over
+the single wifi radio, and the auto-hotspot won - the phone-hotspot join
+never stuck. Wifi is better left to the OS's own tools anyway. So: remove
+the wifi module, and move the "share my phone's connection" fallback onto a
+transport that doesn't touch the wifi radio at all - BLUETOOTH PAN.
+
+WHAT CHANGED
+------------
+* REMOVED layer_b/modules/tools/network_daemon.py (and tests/
+  test_network_daemon.py). Wifi is now managed only with system tools
+  (see below).
+* ADDED layer_b/modules/tools/bluetooth_daemon.py - tethers to an
+  already-paired phone over Bluetooth PAN via nmcli (command templated by
+  BT_CONNECT_CMD, default "nmcli device connect {mac}"; swap for
+  "bt-network -c {mac} nap" if you use bluez-tools). Same shape as before:
+  a spoken request (picarx/tools/bluetooth/connect), plus a connectivity
+  monitor with auto-failover after an offline grace period. Bluetooth never
+  touches the wifi radio, so it coexists with the auto-hotspot failsafe.
+  Fully fail-soft (no nmcli / no config / not paired -> announced, never
+  raised). Config: data/bluetooth.json (editable template written on first
+  run) holding paired-phone MAC(s).
+* companion.py: the share_connection LLM tool now publishes to
+  picarx/tools/bluetooth/connect and its description says it tethers over
+  Bluetooth (and that wifi is handled by system tools). Topic constant
+  renamed NETWORK_CONNECT_TOPIC -> BLUETOOTH_CONNECT_TOPIC.
+* module_registry.json: network_daemon entry -> bluetooth_daemon.
+* Tests: test_bluetooth_daemon.py added (config load/merge/corrupt, device
+  pick, PAN connect argv incl. template, offline<->online, auto-failover
+  gating, no-wifi-in-command); test_companion_tools.py updated for the new
+  topic. Suite: 104 tests, all green.
+
+ADDING A WIFI NETWORK TO THE PI (system tools - no module needed)
+-----------------------------------------------------------------
+NetworkManager (Raspberry Pi OS Bookworm+):
+    sudo nmcli device wifi list                         # see what's around
+    sudo nmcli device wifi connect "<SSID>" password "<PW>"
+    # it's saved and auto-reconnects; prefer home over others with:
+    sudo nmcli connection modify "<SSID>" connection.autoconnect-priority 10
+    nmcli connection show                               # list saved networks
+    sudo nmcli connection delete "<SSID>"               # forget one
+Headless alternative (raspi-config): sudo raspi-config -> System Options ->
+Wireless LAN. (Older wpa_supplicant images: add the network block to
+/etc/wpa_supplicant/wpa_supplicant.conf and `wpa_cli reconfigure`.)
+
+ONE-TIME BLUETOOTH PAIRING (for the tethering fallback)
+-------------------------------------------------------
+1. On the phone: turn on "Bluetooth tethering".
+2. On the Pi, pair + trust the phone once:
+     bluetoothctl
+       scan on                       # note the phone's MAC
+       pair AA:BB:CC:DD:EE:FF
+       trust AA:BB:CC:DD:EE:FF
+       quit
+3. Put the MAC in data/bluetooth.json:
+     {"devices": [{"mac": "AA:BB:CC:DD:EE:FF", "name": "MyPhone"}],
+      "auto_failover": true, "check_interval": 20, "offline_grace": 60}
+Then "share your connection" (or the automatic failover) tethers over BT.
+
+STRICT-BOUNDARY / INVARIANTS
+----------------------------
+- No motion, no DB writers, fail-soft throughout - unchanged.
+- Bluetooth path is isolated from the wifi radio, so it does not interfere
+  with the OS wifi auto-hotspot failsafe.
+
+SUGGESTED NEXT STEPS
+--------------------
+- Optionally auto-discover a trusted, already-paired phone from
+  `bluetoothctl devices` instead of hand-entering the MAC.
+- A spoken "am I online?" status tool that reports the current transport
+  (home wifi / auto-hotspot / bluetooth tether).
