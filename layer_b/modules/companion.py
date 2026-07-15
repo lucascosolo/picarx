@@ -11,12 +11,20 @@ that doesn't match one of those gets published to
 picarx/audio/unhandled instead of silently doing nothing - that's
 this module's entire job: turn it into a natural spoken reply.
 
-This module never controls the robot. It cannot publish movement
-intents at all - if someone asks it to drive somewhere in
-conversation, its system prompt tells it to point them at the actual
-command words instead of trying to comply itself. That split (fast
-local safety-relevant commands vs. this slower, LLM-backed chat
-layer) is deliberate and should not be blurred.
+This module never publishes a movement primitive. It cannot drive the
+wheels directly - if someone asks it to drive somewhere in conversation,
+its system prompt tells it to point them at the actual command words
+instead. That split (fast local safety-relevant commands vs. this slower,
+LLM-backed chat layer) is deliberate and should not be blurred.
+
+It does expose a small set of LLM TOOLS (see TOOLS) that let the model
+ACT by TOGGLING other daemons over picarx/tools/* topics - never by
+emitting motion. schedule_reminder arms reminder_daemon, share_connection
+asks network_daemon to join a phone hotspot, and start/stop_following flip
+follow_daemon's mode. Even start_following only sets a switch: follow_daemon
+generates the actual motion deterministically from vision and every command
+still flows through the safety daemon, so "motion never starts from raw LLM
+output" holds - the model chooses a behaviour, not a maneuver.
 
 Each reply is grounded with a short snapshot of picarx/state/world
 (face/objects/distance/battery) folded into the prompt, so it can
@@ -146,6 +154,56 @@ EPISODE_TRIGGERS = (
     "what did you do", "what have you done", "what happened", "summarize",
     "summarise", "recap", "tell me about your day", "how was your day",
 )
+
+# ---------- LLM tools (companion is the only module that runs a tool loop) ----------
+# These let the model ACT, not just talk. Crucially they only ever TOGGLE
+# other daemons via picarx/tools/* mode topics - companion never publishes a
+# motion primitive itself, so the "motion never starts from raw LLM output"
+# invariant holds: start_following just flips a switch, and follow_daemon
+# generates the actual movement deterministically from vision, every command
+# still gated by the safety daemon. Reminders and network-sharing issue no
+# motion at all.
+MAX_TOOL_ROUNDS = 3          # bound the tool<->model round-trips per utterance
+REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
+FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
+NETWORK_CONNECT_TOPIC = "picarx/tools/network/connect"
+
+TOOLS = [
+    {"name": "schedule_reminder",
+     "description": "Set a spoken reminder for the person for later. Use when they "
+                    "ask to be reminded of something after a delay or at a time. "
+                    "You know the current time from the system prompt.",
+     "input_schema": {"type": "object", "properties": {
+         "message": {"type": "string",
+                     "description": "what to remind them about, in a few plain words"},
+         "delay_minutes": {"type": "number",
+                           "description": "minutes from now to fire the reminder"},
+         "at": {"type": "string",
+                "description": "exact local time instead of a delay, e.g. '18:30' "
+                               "or '2026-07-15 18:30'"}},
+         "required": ["message"]}},
+    {"name": "start_following",
+     "description": "Start physically following the person around, driving to keep "
+                    "them centered in view. This MOVES the robot, so only call it "
+                    "when you are VERY CONFIDENT the person is clearly, explicitly "
+                    "asking to be followed right now (e.g. 'follow me', 'come with "
+                    "me', 'walk with me'). If it's ambiguous, casual, hypothetical, "
+                    "or just talk ABOUT following, do NOT call it - reply in words "
+                    "and let them confirm. Movement stays under the safety system "
+                    "and can be stopped anytime.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "stop_following",
+     "description": "Stop following the person.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "share_connection",
+     "description": "Join the person's phone hotspot for internet when there is no "
+                    "wifi, so radio and chat keep working. Use when they offer to "
+                    "share their phone's connection, or when you're offline.",
+     "input_schema": {"type": "object", "properties": {
+         "name": {"type": "string",
+                  "description": "optional saved hotspot name or SSID to use"}},
+         "required": []}},
+]
 
 SYSTEM_PROMPT = """You are the voice and personality of a small autonomous robot car (PiCar-X).
 You are friendly, a little playful, and curious about the world you're rolling around in.
@@ -380,16 +438,18 @@ class Companion:
         return [f["fact"] for f in self.semantic.facts_for("self", limit=SELF_MODEL_MAX)]
 
     def _compose_system_prompt(self):
-        """Base personality + a DYNAMIC self-model block, so the robot's
-        conversational voice is grounded in what it has actually learned
-        about itself rather than only the fixed prompt string. Costs one
-        tiny read-only SELECT, no API call. Falls back to the plain prompt
-        before the first self-model exists."""
+        """Base personality + the current local date/time + a DYNAMIC
+        self-model block, so the robot's conversational voice is grounded
+        in what it has actually learned about itself and knows what time it
+        is (needed for time-aware replies and the schedule_reminder tool).
+        Costs one tiny read-only SELECT, no API call."""
+        prompt = (SYSTEM_PROMPT + "\n\nThe current local date and time is "
+                  + time.strftime("%A %B %d %Y, %I:%M %p") + ".")
         notes = self._self_model_notes()
         if not notes:
-            return SYSTEM_PROMPT
+            return prompt
         block = "\n".join(f"- {n}" for n in notes)
-        return (SYSTEM_PROMPT +
+        return (prompt +
                 "\n\nYour current self-understanding - things you have learned about "
                 "your own behaviour and your home from experience. Let it colour your "
                 "personality and answers naturally, speaking from it in the first "
@@ -520,6 +580,77 @@ class Companion:
         self.bus.publish("picarx/audio/speak", {"text": reply})
         return True
 
+    # ---------- LLM tool loop ----------
+
+    def _chat_with_tools(self, client, messages):
+        """One utterance, with the model allowed to call tools. Runs a
+        bounded tool<->model loop: each round, execute any tool_use blocks
+        (which just publish mode toggles to the daemons) and feed the
+        results back so the model can produce a natural spoken reply.
+        Returns the final spoken text ("" if none)."""
+        convo = list(messages)
+        final_text = ""
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = client.messages.create(
+                model=COMPANION_MODEL,
+                max_tokens=REPLY_MAX_TOKENS,
+                system=self._compose_system_prompt(),
+                tools=TOOLS,
+                messages=convo,
+                timeout=REPLY_TIMEOUT,
+            )
+            text = "".join(b.text for b in response.content
+                           if getattr(b, "type", None) == "text").strip()
+            if text:
+                final_text = text
+            tool_uses = [b for b in response.content
+                         if getattr(b, "type", None) == "tool_use"]
+            if not tool_uses:
+                break
+            convo.append({"role": "assistant", "content": response.content})
+            results = []
+            for tu in tool_uses:
+                out = self._execute_tool(tu.name, getattr(tu, "input", None) or {})
+                results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                "content": out})
+            convo.append({"role": "user", "content": results})
+        return final_text
+
+    def _execute_tool(self, name, tool_input):
+        """Run one tool call by publishing the matching mode/request topic.
+        Returns a short result string fed back to the model. Never emits a
+        motion primitive - follow motion is generated by follow_daemon."""
+        try:
+            if name == "schedule_reminder":
+                message = str(tool_input.get("message") or "").strip()
+                if not message:
+                    return "No reminder text was provided."
+                req = {"message": message}
+                if tool_input.get("delay_minutes") is not None:
+                    req["delay_minutes"] = tool_input["delay_minutes"]
+                if tool_input.get("at"):
+                    req["at"] = tool_input["at"]
+                if "delay_minutes" not in req and "at" not in req:
+                    return "Need either a delay in minutes or an exact time."
+                self.bus.publish(REMINDER_SET_TOPIC, req)
+                return "Reminder scheduled."
+            if name == "start_following":
+                self.bus.publish(FOLLOW_CONTROL_TOPIC, {"enabled": True})
+                return "Following started; movement is safety-checked."
+            if name == "stop_following":
+                self.bus.publish(FOLLOW_CONTROL_TOPIC, {"enabled": False})
+                return "Following stopped."
+            if name == "share_connection":
+                req = {}
+                if tool_input.get("name"):
+                    req["name"] = tool_input["name"]
+                self.bus.publish(NETWORK_CONNECT_TOPIC, req)
+                return "Trying to join the phone's hotspot."
+        except Exception as e:
+            print(f"Companion: tool '{name}' failed: {e}")
+            return "That didn't work."
+        return f"Unknown tool: {name}"
+
     # ---------- chat ----------
 
     def _handle_utterance(self, text):
@@ -553,16 +684,7 @@ class Companion:
         messages = messages + [{"role": "user", "content": content}]
 
         try:
-            response = client.messages.create(
-                model=COMPANION_MODEL,
-                max_tokens=REPLY_MAX_TOKENS,
-                system=self._compose_system_prompt(),
-                messages=messages,
-                timeout=REPLY_TIMEOUT,
-            )
-            reply = "".join(
-                block.text for block in response.content if getattr(block, "type", None) == "text"
-            ).strip()
+            reply = self._chat_with_tools(client, messages)
         except Exception as e:
             print(f"Companion: chat failed: {e}")
             reply = "Sorry, I got a little confused there."

@@ -1,0 +1,127 @@
+Tool layer: time/reminders, follow-me, and phone-connection sharing
+===================================================================
+
+BASE: origin/master (9a24e07).
+
+Adds an LLM TOOL layer to companion.py plus three standalone daemons under
+layer_b/modules/tools/. All three are registered in module_registry.json
+(entrypoints tools/<name>.py - the loader/orchestrator resolve those under
+layer_b/modules/, same as the cascades/ subdir; verified loadable).
+
+FILE PLACEMENT NOTE: the task named these "tools/reminder_daemon.py" etc.
+The robot only runs modules that live under layer_b/modules/, so they are at
+layer_b/modules/tools/<name>.py - a "tools" folder INSIDE the module folder,
+which honors both the naming and "modules live in the module folder".
+
+--------------------------------------------------------------------------
+1. TIME AWARENESS + REMINDERS
+--------------------------------------------------------------------------
+* companion._compose_system_prompt now always injects the current LOCAL
+  date/time, so every reply is time-aware (and the model can fill in exact
+  reminder times).
+* New LLM tool schedule_reminder(message, delay_minutes | at). companion
+  publishes it to picarx/tools/reminder/set.
+* tools/reminder_daemon.py holds the timers asynchronously (one
+  threading.Timer each). On expiry it speaks "Reminder: <message>" on the
+  existing TTS topic picarx/audio/speak. Pending reminders persist to
+  data/reminders.json and re-arm on restart (a reminder already due at load
+  fires immediately). Accepts "HH:MM" (rolls to tomorrow if passed) and
+  "YYYY-MM-DD HH:MM"; unparseable times are announced and dropped.
+
+--------------------------------------------------------------------------
+2. DYNAMIC FOLLOW MODE
+--------------------------------------------------------------------------
+* New LLM tools start_following / stop_following -> picarx/tools/follow/set
+  {"enabled": bool}.
+* tools/follow_daemon.py runs the control loop. It reuses vision_basic's
+  existing picamera2 output (does NOT open a second camera): the SSD/YOLO
+  "person" track on picarx/vision/objects (with a face fallback for
+  centering), steers proportionally to keep the person centered, drives
+  forward at a bounded low speed, and STOPS once the person's bounding box
+  gets large enough. Lost target -> hold, then give up after a while.
+
+SAFETY / INVARIANT (signed off):
+  The project invariant is "motion never starts from raw LLM output". You
+  approved the exception for this feature: the LLM MAY initiate follow mode,
+  but only when it is very confident the user explicitly wants it. The
+  design keeps the invariant's spirit intact:
+    - companion NEVER emits a motion primitive. start_following only flips a
+      mode switch on a picarx/tools/* topic - the model chooses a BEHAVIOUR,
+      not a maneuver - and its tool description tells it to call
+      start_following ONLY when it is VERY CONFIDENT the person is clearly
+      asking to be followed right now (ambiguous/casual mentions -> reply in
+      words, don't move).
+    - follow_daemon generates every motion deterministically from vision and
+      publishes ordinary intents on picarx/intent/move, so arbiter + the
+      safety daemon veto exactly as for any other motion (cliff/obstacle).
+      The daemon never touches the safety socket.
+    - A literal spoken "stop"/"halt" (picarx/audio/heard) disables follow
+      with no LLM in the loop - the kill switch is always local.
+
+--------------------------------------------------------------------------
+3. SHARE A PHONE CONNECTION (your added request)
+--------------------------------------------------------------------------
+* New LLM tool share_connection(name?) -> picarx/tools/network/connect.
+* tools/network_daemon.py gives the robot internet where home wifi can't
+  reach, two ways:
+    - USB tethering: plug the phone into the Pi's USB and enable tethering;
+      NetworkManager brings up usb0 automatically and the daemon just
+      notices it's online again.
+    - Phone wifi hotspot: store SSID+password once in data/networks.json
+      (an editable template is written on first run). "Share your
+      connection" then joins it via nmcli. With auto_failover on, it also
+      joins on its own after the internet has been unreachable for a grace
+      period; NetworkManager prefers the home network again once in range.
+  A dependency-free TCP-to-1.1.1.1:53 check drives connectivity monitoring;
+  everything is fail-soft (no nmcli / no config / failed join is announced,
+  never raised). Issues no motion.
+
+--------------------------------------------------------------------------
+4. SPEAKER-AMP ENABLE ON STARTUP (bug fix)
+--------------------------------------------------------------------------
+audio_nodes._enable_speakers ran the amp-enable command exactly once at its
+own startup. The amp GPIO comes up disabled and, worse, gets pulled low
+again when safety_daemon's Picarx() initializes the HAT AFTER us (module
+start order isn't guaranteed), so the one-shot enable lost that race and no
+speech was audible until you ran 'robot_hat enable_speaker' by hand and
+restarted the orchestrator. Now it re-asserts the enable across the boot
+window (SPEAKER_ENABLE_RETRIES x SPEAKER_ENABLE_INTERVAL ~= 60s) in a
+background thread, then stops - re-asserting an already-on GPIO is a
+pop-free no-op, so it's safe, and it costs nothing once the window passes.
+A missing robot_hat binary is detected on the first try and stops the loop.
+SPEAKER_ENABLE_CMD still overrides the command for other HAT builds.
+
+--------------------------------------------------------------------------
+TESTS (off-robot, tests/) - now 103, all green (was 51)
+--------------------------------------------------------------------------
++ test_reminder_daemon.py  - time parsing (delay/at, roll-to-tomorrow,
+  garbage), arming/firing/persistence-reload.
++ test_follow_daemon.py    - steering/drive/pick_person math, motion only on
+  picarx/intent/move, close->stop, bounded speed, lost-target handling,
+  spoken-stop kill switch.
++ test_network_daemon.py   - config load/merge/corrupt, hotspot pick, nmcli
+  argv, offline<->online transitions, auto-failover gating (incl. no nmcli).
++ test_companion_tools.py  - each tool dispatches to the right topic,
+  companion emits NO motion primitive, bounded tool<->model loop.
++ test_audio_nodes_speaker.py - enable command runs, fail-soft on missing
+  binary, retries across the boot window, stops when the binary is absent.
+~ test_companion_memory.py - updated the one assertion that expected the
+  system prompt to equal SYSTEM_PROMPT (it now always appends the time).
+
+STRICT-BOUNDARY CHECKLIST
+-------------------------
+- One-writer-per-DB untouched (no new DB writers; reminders/networks are
+  plain JSON owned by their daemon).
+- Fail-soft everywhere (no key, no nmcli, no camera detections, bad time).
+- CPU budget: follow reuses vision output (no 2nd detector); reminders are
+  idle timers; network check is one socket every ~20s.
+- Motion still flows only through picarx/intent/move under the safety
+  daemon; companion emits no motion primitive.
+
+SUGGESTED NEXT STEPS
+--------------------
+- Let follow_daemon also pan the camera head to keep a person in view before
+  steering the whole chassis (smoother, less driving).
+- A "cancel my reminders" / "what are my reminders" tool for symmetry.
+- Persist a learned-hotspot list from successful joins so new phones are
+  remembered.

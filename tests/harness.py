@@ -30,6 +30,17 @@ for _name in ("numpy", "cv2", "vosk", "picamera2",
               "paho", "paho.mqtt", "paho.mqtt.client"):
     sys.modules.setdefault(_name, types.ModuleType(_name))
 
+# A couple of modules do `from vosk import Model, KaldiRecognizer` /
+# `from picamera2 import Picamera2` at import time, so the bare stub module
+# isn't enough - give it the names (trivial no-op classes; tests never call
+# into real speech/camera code).
+for _attr in ("Model", "KaldiRecognizer"):
+    if not hasattr(sys.modules["vosk"], _attr):
+        setattr(sys.modules["vosk"], _attr,
+                type(_attr, (), {"__init__": lambda self, *a, **k: None}))
+if not hasattr(sys.modules["picamera2"], "Picamera2"):
+    sys.modules["picamera2"].Picamera2 = type("Picamera2", (), {})
+
 for _p in (MODULES, LAYER_B):
     if _p not in sys.path:
         sys.path.insert(0, _p)

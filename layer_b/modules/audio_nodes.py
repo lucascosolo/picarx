@@ -74,8 +74,19 @@ import math
 import time
 import json
 import subprocess
+import threading
 from collections import deque
 from vosk import Model, KaldiRecognizer
+
+# Speaker amp enable: the robot_hat amp GPIO comes up DISABLED on boot, and
+# can be pulled low AGAIN when safety_daemon's Picarx() initializes the HAT
+# after us (module start order isn't guaranteed). A single enable at our
+# startup loses that race, so we re-assert it a few times across the boot
+# window; re-asserting an already-on GPIO is a pop-free no-op, and we stop
+# once the window passes so it costs nothing ongoing.
+SPEAKER_ENABLE_CMD = os.environ.get("SPEAKER_ENABLE_CMD", "robot_hat enable_speaker")
+SPEAKER_ENABLE_RETRIES = 12
+SPEAKER_ENABLE_INTERVAL = 5.0
 
 try:
     import audioop  # stdlib; removed in 3.13+, hence the fallback below
@@ -389,20 +400,39 @@ class AudioNode:
             return
         self.speak(text)
 
-    def _enable_speakers(self):
-        # The robot_hat speaker amp is gated by a GPIO switch that comes
-        # up DISABLED on every boot - without flipping it on first, aplay
-        # plays to a dead output and no speech is ever heard. Must run
-        # after the hat is initialized (safety_daemon's Picarx() does
-        # that) and before our first speak(). Override the command via
-        # SPEAKER_ENABLE_CMD if your robot_hat build names it differently.
-        cmd = os.environ.get("SPEAKER_ENABLE_CMD", "robot_hat enable_speaker")
+    def _enable_speakers_once(self):
+        """Assert the amp-enable GPIO once. Returns True if the command
+        ran (fail-soft: a missing robot_hat just prints and returns False).
+        Override the command via SPEAKER_ENABLE_CMD for other HAT builds."""
         try:
-            subprocess.run(cmd.split(), check=False, timeout=5,
+            subprocess.run(SPEAKER_ENABLE_CMD.split(), check=False, timeout=5,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"Audio node: ran '{cmd}' to enable the speaker amp.")
+            return True
         except (FileNotFoundError, subprocess.SubprocessError) as e:
-            print(f"Audio node: could not enable speakers via '{cmd}': {e}")
+            print(f"Audio node: could not enable speakers via '{SPEAKER_ENABLE_CMD}': {e}")
+            return False
+
+    def _enable_speakers(self):
+        """Enable the amp now and keep re-asserting it across the boot
+        window in a background thread, so speech is audible even though the
+        amp GPIO comes up disabled and safety_daemon's later HAT init can
+        reset it (see the SPEAKER_ENABLE_* note above). Returns the thread
+        (for tests); production ignores it."""
+        def _loop():
+            for i in range(max(1, SPEAKER_ENABLE_RETRIES)):
+                ran = self._enable_speakers_once()
+                if i == 0:
+                    print(f"Audio node: enabling speaker amp via "
+                          f"'{SPEAKER_ENABLE_CMD}'"
+                          f"{'' if ran else ' (command unavailable)'}, re-asserting "
+                          f"for ~{int(SPEAKER_ENABLE_RETRIES * SPEAKER_ENABLE_INTERVAL)}s.")
+                if not ran:
+                    return   # binary missing - retrying won't help, don't spin
+                if i < SPEAKER_ENABLE_RETRIES - 1:
+                    time.sleep(SPEAKER_ENABLE_INTERVAL)
+        thread = threading.Thread(target=_loop, name="speaker-enable", daemon=True)
+        thread.start()
+        return thread
 
     def on_mic_control(self, payload):
         enabled = bool(payload.get("enabled", True))

@@ -86,8 +86,15 @@ class CompanionMemoryTest(unittest.TestCase):
         self.assertIn("I back away first when stuck.", prompt)
         self.assertIn(companion.SYSTEM_PROMPT, prompt)
 
-    def test_system_prompt_falls_back_without_self_model(self):
-        self.assertEqual(self.c._compose_system_prompt(), companion.SYSTEM_PROMPT)
+    def test_system_prompt_without_self_model_still_has_base_and_time(self):
+        prompt = self.c._compose_system_prompt()
+        # Base personality is always present as a prefix...
+        self.assertTrue(prompt.startswith(companion.SYSTEM_PROMPT))
+        # ...plus the dynamically-injected current local date/time...
+        self.assertIn("current local date and time", prompt)
+        self.assertIn(time.strftime("%Y"), prompt)
+        # ...and no self-model block when there is no self-model yet.
+        self.assertNotIn("self-understanding", prompt)
 
 
 if __name__ == "__main__":
