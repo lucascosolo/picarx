@@ -23,9 +23,14 @@
   .row { display:flex; gap:8px; margin-top:8px; }
   input[type=text] { flex:1; background:#10141a; color:var(--fg);
            border:1px solid #333b46; border-radius:8px; padding:10px; font-size:.95rem; }
-  #mic { font-weight:600; }
-  #mic.on  { background:var(--ok); color:#08130c; }
-  #mic.off { background:var(--off); color:#180808; }
+  #mic, #cam-toggle { font-weight:600; }
+  #mic.on, #cam-toggle.on  { background:var(--ok); color:#08130c; }
+  #mic.off, #cam-toggle.off { background:var(--off); color:#180808; }
+  #cam-wrap { position:relative; margin-top:10px; background:#000; border-radius:8px;
+              overflow:hidden; aspect-ratio:4/3; display:flex; align-items:center;
+              justify-content:center; }
+  #cam { width:100%; height:100%; object-fit:contain; display:none; }
+  #cam-msg { color:var(--dim); font-size:.85rem; }
   .stat { display:flex; justify-content:space-between; padding:2px 0;
           border-bottom:1px solid #262d36; font-size:.9rem; }
   .stat:last-child { border-bottom:0; }
@@ -39,6 +44,17 @@
 </head>
 <body>
 <h1>PicarX Console <span id="conn">connecting…</span></h1>
+
+<div class="card">
+  <h2>Camera</h2>
+  <button id="cam-toggle" class="off" onclick="toggleLive()">LIVE OFF</button>
+  <span style="color:var(--dim);font-size:.85rem;margin-left:8px">
+    live view uses the robot's CPU — turn off when done</span>
+  <div id="cam-wrap">
+    <img id="cam" alt="camera">
+    <span id="cam-msg">live view off</span>
+  </div>
+</div>
 
 <div class="card">
   <h2>Microphone</h2>
@@ -118,6 +134,47 @@ function tune() { const el = document.getElementById('dial');
 function find() { const el = document.getElementById('q');
   if (el.value.trim()) { say('radio find ' + el.value.trim()); el.value=''; } }
 function toggleMic() { post('/mic', {enabled: !micOn}); }
+
+// ---- live camera view ----
+let liveOn = false, camTimer = null;
+const CAM_INTERVAL_MS = 400;   // ~2.5 fps refresh; vision caps the source rate
+
+function refreshCam() {
+  const img = document.getElementById('cam');
+  // Cache-buster so the browser actually refetches each frame.
+  img.src = '/camera.jpg?t=' + Date.now();
+}
+function toggleLive() {
+  liveOn = !liveOn;
+  const btn = document.getElementById('cam-toggle');
+  const img = document.getElementById('cam');
+  const msg = document.getElementById('cam-msg');
+  btn.textContent = liveOn ? 'LIVE ON' : 'LIVE OFF';
+  btn.className = liveOn ? 'on' : 'off';
+  if (liveOn) {
+    msg.textContent = 'starting camera…';
+    post('/camera', {enabled: true});           // pre-warm vision's encoder
+    refreshCam();
+    camTimer = setInterval(refreshCam, CAM_INTERVAL_MS);
+  } else {
+    clearInterval(camTimer); camTimer = null;
+    post('/camera', {enabled: false});           // stop vision encoding now
+    img.style.display = 'none';
+    msg.textContent = 'live view off';
+  }
+}
+// A frame loaded: show it. An error (503 before the first frame) just
+// leaves the "starting…" message up; the interval keeps trying.
+document.getElementById('cam').addEventListener('load', () => {
+  if (liveOn) { document.getElementById('cam').style.display = 'block';
+                document.getElementById('cam-msg').textContent = ''; }
+});
+// Best-effort: tell the robot to stop encoding if the tab is closed.
+// (The server's watchdog also covers this if the beacon doesn't fire.)
+window.addEventListener('pagehide', () => {
+  if (liveOn) navigator.sendBeacon('/camera',
+    new Blob([JSON.stringify({enabled: false})], {type: 'application/json'}));
+});
 
 function esc(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
 

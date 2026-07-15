@@ -88,7 +88,15 @@ except ImportError:
 # also been narrowed (lower max-active/beam, much lower lattice-beam -
 # we only ever take the 1-best result, so a wide lattice-beam is pure
 # wasted computation for this pipeline) to cut per-chunk decode cost.
-MODEL_PATH = "/home/picarx/layer_b/modules/models/model-en-lgraph"
+#
+# To switch models without editing code, point VOSK_MODEL_PATH at any
+# unpacked Vosk model directory (one containing am/, conf/, graph/ ...).
+# Grab one from https://alphacephei.com/vosk/models - e.g. the larger
+# vosk-model-en-us-0.22 for better accuracy (needs much more RAM/CPU, so
+# watch this Pi's budget), or a small model for lower latency. The engine
+# and the whole pipeline here are model-agnostic; only this path changes.
+MODEL_PATH = os.environ.get(
+    "VOSK_MODEL_PATH", "/home/picarx/layer_b/modules/models/model-en-lgraph")
 
 CHUNK_BYTES = 4000              # ~125ms per chunk at 16kHz/16-bit/mono
 

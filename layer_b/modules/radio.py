@@ -71,9 +71,16 @@ def _norm_dial(value):
 
 # The stream must go to the SAME speaker the TTS uses, not ALSA's
 # "default" sink (often HDMI / the wrong card -> the classic "says
-# tuning, plays nothing"). This is the ALSA PCM *name* (as in
-# asound.conf), matching audio_nodes.py's plug:robot_speaker output.
-RADIO_ALSA_DEVICE = os.environ.get("RADIO_ALSA_DEVICE", "robot_speaker")
+# tuning, plays nothing"). Route through the SAME plug PCM audio_nodes.py
+# proved works (AUDIO_OUT_DEVICE = "plug:robot_speaker"), NOT the bare
+# "robot_speaker" hw PCM underneath it: the "plug" plugin transparently
+# resamples/reformats the stream to whatever fixed rate the HifiBerry DAC
+# accepts. Internet radio is typically 44.1 kHz MP3; opening the raw DAC
+# PCM at a rate it doesn't support makes the player fail to bring up audio
+# yet keep running - so we announce and report "playing" while dead
+# silent. (The old default here was "robot_speaker" - missing the plug:
+# prefix the comment already claimed it had. That was the bug.)
+RADIO_ALSA_DEVICE = os.environ.get("RADIO_ALSA_DEVICE", "plug:robot_speaker")
 # How long to watch a freshly-started player before trusting it - a bad
 # stream/URL/device makes the player exit within a second, and we'd
 # rather report that than announce a station and sit silent.
@@ -100,7 +107,13 @@ def _ffplay_cmd(url, dev):
 def _mplayer_cmd(url, dev):
     args = ["mplayer", "-really-quiet"]
     if dev:
-        args += ["-ao", f"alsa:device={dev}"]
+        # MPlayer's -ao suboption parser splits on ':', so a PCM name
+        # that contains one (e.g. "plug:robot_speaker") has to be written
+        # with its documented ':' -> '=' escaping ("plug=robot_speaker"),
+        # which MPlayer converts back to "plug:robot_speaker" internally.
+        # Passing it raw would truncate the device to "plug" and lose the
+        # speaker routing.
+        args += ["-ao", "alsa:device=" + dev.replace(":", "=")]
     return args + [url]
 
 # Preference order.

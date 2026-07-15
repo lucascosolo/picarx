@@ -34,6 +34,7 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 
+import base64
 import json
 import threading
 import time
@@ -43,6 +44,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("WEB_CONSOLE_PORT", "8088"))
 HTML_PATH = "/home/picarx/layer_b/web_ui/console.html"
 LOG_LINES = 40
+
+# Live camera view. vision_basic.py owns the camera and only encodes
+# frames while we ask it to (picarx/vision/stream_control), so the view
+# costs nothing until someone opens it. We tell vision to start on the
+# first frame request and, via a watchdog, to stop once the browser has
+# gone quiet for CAMERA_IDLE_SEC (tab closed / live toggle off) - so a
+# forgotten tab can't pin vision's CPU encoding frames nobody sees.
+VISION_STREAM_CONTROL = "picarx/vision/stream_control"
+VISION_FRAME_TOPIC = "picarx/vision/frame"
+CAMERA_IDLE_SEC = 5.0
 
 
 class ConsoleState:
@@ -55,10 +66,50 @@ class ConsoleState:
         self.goal = {}
         self.world = {}
         self.log = deque(maxlen=LOG_LINES)
+        # Live camera view
+        self.camera_jpeg = None       # latest JPEG bytes, or None until first frame
+        self.camera_ts = 0.0          # when that frame was captured (robot clock)
+        self.last_view_request = 0.0  # last time a browser fetched /camera.jpg
+        self.stream_on = False        # whether we've told vision to encode frames
 
     def add_log(self, kind, text):
         with self.lock:
             self.log.appendleft({"t": time.strftime("%H:%M:%S"), "kind": kind, "text": text})
+
+    def set_camera_frame(self, jpeg_bytes, ts):
+        with self.lock:
+            self.camera_jpeg = jpeg_bytes
+            self.camera_ts = ts
+
+    def note_view_demand(self):
+        """A browser asked for a frame. Records the demand and reports
+        whether this is a fresh off->on transition (caller then tells
+        vision to start streaming)."""
+        with self.lock:
+            self.last_view_request = time.time()
+            was_on = self.stream_on
+            self.stream_on = True
+            return not was_on
+
+    def set_stream(self, on):
+        """Force stream state (explicit toggle / watchdog). Returns True
+        if it actually changed, so the caller only publishes on edges."""
+        with self.lock:
+            if self.stream_on == on:
+                return False
+            self.stream_on = on
+            if on:
+                self.last_view_request = time.time()
+            return True
+
+    def camera_idle_expired(self, now):
+        """True (once, on the transition) if streaming is on but no frame
+        has been requested for CAMERA_IDLE_SEC - time to stop vision."""
+        with self.lock:
+            if self.stream_on and now - self.last_view_request > CAMERA_IDLE_SEC:
+                self.stream_on = False
+                return True
+            return False
 
     def snapshot(self):
         with self.lock:
@@ -109,6 +160,20 @@ class Handler(BaseHTTPRequestHandler):
                            "text/html; charset=utf-8")
         elif self.path == "/state":
             self._send(200, STATE.snapshot())
+        elif self.path == "/camera.jpg" or self.path.startswith("/camera.jpg?"):
+            # Fetching a frame is itself the "someone is watching" signal:
+            # start vision's stream on the first request, keep the
+            # watchdog fed on every one.
+            if STATE.note_view_demand():
+                BUS.publish(VISION_STREAM_CONTROL, {"enabled": True})
+            with STATE.lock:
+                jpeg = STATE.camera_jpeg
+            if jpeg is None:
+                # Streaming just started; no frame has arrived yet. 503
+                # tells the client to keep polling without logging an error.
+                self._send(503, {"error": "no frame yet"})
+            else:
+                self._send(200, jpeg, "image/jpeg")
         else:
             self._send(404, {"error": "not found"})
 
@@ -128,6 +193,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         elif self.path == "/mic":
             BUS.publish("picarx/audio/mic_control", {"enabled": bool(body.get("enabled", True))})
+            self._send(200, {"ok": True})
+        elif self.path == "/camera":
+            # Explicit toggle from the live-view switch. Turning it off
+            # stops vision encoding immediately rather than waiting out
+            # the idle watchdog; turning it on pre-warms the stream.
+            enabled = bool(body.get("enabled", False))
+            if STATE.set_stream(enabled):
+                BUS.publish(VISION_STREAM_CONTROL, {"enabled": enabled})
             self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "not found"})
@@ -170,6 +243,26 @@ def on_goal(p):
     with STATE.lock:
         STATE.goal = p if p.get("location_id") is not None else {}
 
+def on_vision_frame(p):
+    b64 = p.get("jpeg")
+    if not b64:
+        return
+    try:
+        STATE.set_camera_frame(base64.b64decode(b64), float(p.get("ts") or 0.0))
+    except (ValueError, TypeError):
+        pass  # malformed frame - just skip it, next one will be fine
+
+
+def camera_watchdog():
+    """Stop vision's encoder when the browser stops asking for frames
+    (live view toggled off, or the tab was simply closed). Runs off the
+    request path so it fires even when nothing is hitting the server."""
+    while True:
+        time.sleep(1.0)
+        if STATE.camera_idle_expired(time.time()):
+            BUS.publish(VISION_STREAM_CONTROL, {"enabled": False})
+            print("Web console: live view idle - stopping camera stream")
+
 
 def main():
     global BUS
@@ -181,6 +274,7 @@ def main():
     BUS.subscribe("picarx/state/world", on_world)
     BUS.subscribe("picarx/exploration/location_change", on_location)
     BUS.subscribe("picarx/exploration/active_goal", on_goal)
+    BUS.subscribe(VISION_FRAME_TOPIC, on_vision_frame)
 
     try:
         server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
@@ -188,6 +282,7 @@ def main():
         print(f"Web console: cannot bind port {PORT} ({e}) - idling (fail-soft)")
         while True:
             time.sleep(60)
+    threading.Thread(target=camera_watchdog, daemon=True).start()
     print(f"Web console active: http://<robot-ip>:{PORT}/")
     server.serve_forever()
 

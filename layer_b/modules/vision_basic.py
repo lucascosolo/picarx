@@ -104,6 +104,7 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 from picamera2 import Picamera2
+import base64
 import cv2
 import time
 
@@ -151,6 +152,22 @@ CLOSE_OBJECT_CONFIRM_PASSES = 2
 MOTION_CHECK_SIZE = (80, 60)
 MOTION_DIFF_THRESHOLD = 6.0     # mean abs pixel difference (0-255 scale) to count as "changed"
 FORCE_DETECT_INTERVAL = 6.0     # always refresh at least this often, motion or not
+
+# ---- on-demand MJPEG-style stream for the web console ----
+# The Pi camera is a single-owner device and this module holds it, so
+# the web console cannot open it directly. Instead, WHEN A VIEWER IS
+# ACTUALLY WATCHING, we JPEG-encode the frame we already captured and
+# publish it on picarx/vision/frame; web_console.py caches the latest
+# one and serves it over HTTP. This stays off by default and is gated by
+# picarx/vision/stream_control {"enabled": bool} (the console turns it on
+# only while its live view is open, and a watchdog there turns it back
+# off when nobody's looking), so the encode cost is paid only during
+# hands-on debugging - never during autonomous operation, preserving the
+# CPU budget this module guards everywhere else.
+STREAM_CONTROL_TOPIC = "picarx/vision/stream_control"
+STREAM_FRAME_TOPIC = "picarx/vision/frame"
+STREAM_MIN_INTERVAL = 0.2       # cap publish rate (~5 fps ceiling; loop tick bounds it lower)
+STREAM_JPEG_QUALITY = 60        # small over MQTT/base64; a debug view doesn't need more
 
 MODEL_DIR = "/home/picarx/layer_b/modules/models/mobilenet_ssd"
 SSD_PROTOTXT = f"{MODEL_DIR}/deploy.prototxt"
@@ -275,12 +292,22 @@ def run():
     net = cv2.dnn.readNetFromCaffe(SSD_PROTOTXT, SSD_WEIGHTS)
     tracker = CentroidTracker()
 
+    # On-demand console stream state. Toggled from the MQTT callback
+    # thread; the loop only reads it, so a plain dict is enough (a stale
+    # read just means one extra/fewer frame, which is harmless).
+    stream = {"enabled": False}
+    def on_stream_control(payload):
+        stream["enabled"] = bool(payload.get("enabled", False))
+        print(f"vision stream {'ENABLED' if stream['enabled'] else 'disabled'} (console live view)")
+    bus.subscribe(STREAM_CONTROL_TOPIC, on_stream_control)
+
     print("vision basic module running, publishing to picarx/vision/faces and picarx/vision/objects")
 
     face_streak = 0
     last_object_detect = 0.0
     last_forced_detect = 0.0
     last_motion_thumb = None
+    last_stream_pub = 0.0
     close_object = False   # persists between ticks where the SSD didn't run
     close_streak = 0       # consecutive SSD passes with a frame-filling detection
     scene_motion = None    # last motion-thumb mean abs diff (for stuck detection downstream)
@@ -399,6 +426,20 @@ def run():
             "close_object": close_object,
             "scene_motion": scene_motion,
         })
+
+        # ---------- on-demand console stream (only while a viewer watches) ----------
+        if stream["enabled"] and now - last_stream_pub >= STREAM_MIN_INTERVAL:
+            last_stream_pub = now
+            # picamera2 gives RGB888; cv2.imencode assumes BGR, so convert
+            # first or the preview shows swapped red/blue channels.
+            ok, buf = cv2.imencode(
+                ".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
+            if ok:
+                bus.publish(STREAM_FRAME_TOPIC, {
+                    "jpeg": base64.b64encode(buf.tobytes()).decode("ascii"),
+                    "w": frame_w, "h": frame_h, "ts": now,
+                })
 
         time.sleep(DETECT_INTERVAL)
 
