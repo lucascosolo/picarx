@@ -66,6 +66,7 @@ import json
 from collections import deque
 
 HISTORY_TURNS = 12          # user+assistant messages kept for context
+SELF_MODEL_MAX = 5          # self-model facts folded into the personality prompt
 WORKER_THREADS = 2
 REPLY_TIMEOUT = 8.0
 REPLY_MAX_TOKENS = 150
@@ -361,12 +362,38 @@ class Companion:
         # Fold in a couple of long-term learned facts (from reflection.py's
         # semantic store) so conversation can draw on more than the last
         # few seconds of sensors. One tiny read-only SELECT per utterance.
-        facts = self.semantic.recent_facts(limit=2)
+        # The self-model (subject "self") is handled separately - it grounds
+        # the PERSONALITY (system prompt), not this per-turn sensor snapshot -
+        # so exclude it here to avoid reciting it twice.
+        facts = [f for f in self.semantic.recent_facts(limit=4)
+                 if f["subject"] != "self"][:2]
         if facts:
             remembered = "; ".join(f"{f['subject']}: {f['fact']}" for f in facts)
             parts.append(f"long-term memory notes: {remembered}")
 
         return "; ".join(parts)
+
+    def _self_model_notes(self):
+        """The robot's current self-model - first-person facts under
+        subject "self" that reflection.py's offline self-model pass writes.
+        Read-only and fail-soft: [] until reflection has ever run."""
+        return [f["fact"] for f in self.semantic.facts_for("self", limit=SELF_MODEL_MAX)]
+
+    def _compose_system_prompt(self):
+        """Base personality + a DYNAMIC self-model block, so the robot's
+        conversational voice is grounded in what it has actually learned
+        about itself rather than only the fixed prompt string. Costs one
+        tiny read-only SELECT, no API call. Falls back to the plain prompt
+        before the first self-model exists."""
+        notes = self._self_model_notes()
+        if not notes:
+            return SYSTEM_PROMPT
+        block = "\n".join(f"- {n}" for n in notes)
+        return (SYSTEM_PROMPT +
+                "\n\nYour current self-understanding - things you have learned about "
+                "your own behaviour and your home from experience. Let it colour your "
+                "personality and answers naturally, speaking from it in the first "
+                "person; do not just recite the list:\n" + block)
 
     def _gap_note(self, now):
         """Empty unless enough silence passed since the last turn (possibly
@@ -527,7 +554,7 @@ class Companion:
             response = client.messages.create(
                 model=COMPANION_MODEL,
                 max_tokens=REPLY_MAX_TOKENS,
-                system=SYSTEM_PROMPT,
+                system=self._compose_system_prompt(),
                 messages=messages,
                 timeout=REPLY_TIMEOUT,
             )

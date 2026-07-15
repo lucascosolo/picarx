@@ -49,6 +49,18 @@ import time
 import threading
 
 EVENTS_DB_PATH = "/home/picarx/layer_b/data/events.db"
+# Coach's learned bandit policy (arm win/loss records). Read-only here -
+# coach.py is its sole writer; we only aggregate it into a self-model.
+COACH_POLICY_PATH = "/home/picarx/layer_b/data/coach_policy.json"
+
+# Self-model thresholds: how much evidence before a tendency is worth
+# stating in the first person. Kept conservative so the robot doesn't
+# narrate noise from two coaching attempts.
+SELF_MIN_PULLS_PER_DIRECTION = 3   # min tries before comparing escape directions
+SELF_MIN_RATE_GAP = 0.15           # min success-rate gap to call one better
+SELF_MIN_TOTAL_PULLS = 5           # min coaching attempts before an overall claim
+SELF_VETO_PRONE_MIN = 2            # vetoes at one place before it's "troublesome"
+SELF_MAX_FACTS = 5
 
 # Non-LLM analysis (pattern mining + spatial connectivity facts) is
 # pure Python but still only worth re-running occasionally. Unlike LLM
@@ -323,6 +335,108 @@ class Reflection:
         finally:
             conn.close()
 
+    # ---------- self-model (pure Python, no LLM, no API key) ----------
+
+    @staticmethod
+    def _read_coach_policy():
+        """Coach's bandit policy as a dict, fail-soft to {} (no file yet,
+        or unreadable). We never write it - coach.py owns it."""
+        try:
+            with open(COACH_POLICY_PATH) as f:
+                policy = json.load(f)
+            return policy if isinstance(policy, dict) else {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    @staticmethod
+    def _aggregate_escape_directions(policy):
+        """Sum coaching win/loss across every arm, keyed by the FIRST
+        step's movement direction ('backward', 'forward', 'turn', ...).
+        Returns {direction: [successes, failures]}."""
+        agg = {}
+        for entry in policy.values():
+            if not isinstance(entry, dict):
+                continue
+            for arm in (entry.get("arms") or {}).values():
+                steps = arm.get("steps") or []
+                if not steps:
+                    continue
+                direction = (steps[0].get("action") or {}).get("direction")
+                if not direction:
+                    continue
+                bucket = agg.setdefault(direction, [0, 0])
+                bucket[0] += int(arm.get("successes", 0))
+                bucket[1] += int(arm.get("failures", 0))
+        return agg
+
+    def _synthesize_self_facts(self):
+        """3-5 first-person observations about the robot's own tendencies,
+        aggregated purely from coach_policy.json, the spatial map and mined
+        patterns. No API call. Returns a list of (text, confidence); may be
+        shorter than 3 on a robot that simply hasn't done much yet - we
+        state only what the data supports, never filler."""
+        facts = []
+
+        # --- escape-tactic tendencies, from the coach bandit records ---
+        agg = self._aggregate_escape_directions(self._read_coach_policy())
+
+        def rate(direction):
+            s, f = agg.get(direction, [0, 0])
+            total = s + f
+            return (s / total if total else None), total
+
+        b_rate, b_n = rate("backward")
+        f_rate, f_n = rate("forward")
+        if (b_n >= SELF_MIN_PULLS_PER_DIRECTION and f_n >= SELF_MIN_PULLS_PER_DIRECTION
+                and b_rate is not None and f_rate is not None
+                and abs(b_rate - f_rate) >= SELF_MIN_RATE_GAP):
+            if b_rate > f_rate:
+                facts.append(("I have learned that backing away first gets me unstuck "
+                              "more reliably than pushing forward does.", 0.75))
+            else:
+                facts.append(("I have learned that easing forward gets me unstuck "
+                              "more reliably than reversing does.", 0.75))
+
+        total_s = sum(v[0] for v in agg.values())
+        total_f = sum(v[1] for v in agg.values())
+        total_pulls = total_s + total_f
+        if total_pulls >= SELF_MIN_TOTAL_PULLS:
+            overall = total_s / total_pulls
+            if overall >= 0.6:
+                facts.append(("I usually manage to work my own way out of a tight "
+                              "spot once I try a maneuver I've learned.", 0.7))
+            elif overall <= 0.4:
+                facts.append(("I still get stuck fairly often even when I try what "
+                              "I've learned, so I'm cautious in tight spaces.", 0.7))
+
+        # --- where I have and haven't been, from the spatial map ---
+        locations = self.spatial.all_locations()
+        if locations:
+            facts.append((f"I have mapped {len(locations)} different "
+                          f"place{'s' if len(locations) != 1 else ''} while exploring.",
+                          0.65))
+            # A place found once but never returned to = still unexplored.
+            lonely = [l for l in locations if l["visit_count"] <= 1]
+            if lonely:
+                l = min(lonely, key=lambda x: x["discovered_at"])
+                facts.append((f"I still have not properly explored {l['label']} - "
+                              f"I found it once but never went back.", 0.6))
+            # A place that keeps vetoing me is worth admitting to.
+            troublesome = [l for l in locations if l["veto_count"] >= SELF_VETO_PRONE_MIN]
+            if troublesome:
+                l = max(troublesome, key=lambda x: x["veto_count"])
+                facts.append((f"Something about {l['label']} keeps tripping my safety "
+                              f"sensors and stopping me.", 0.65))
+
+        # --- one behavioural habit, from mined event patterns ---
+        patterns = self.store.top_patterns(limit=1)
+        if patterns:
+            p = patterns[0]
+            facts.append((f"I've noticed that {p['condition']} tends to lead to "
+                          f"{p['outcome']}.", min(0.7, float(p['confidence']))))
+
+        return facts[:SELF_MAX_FACTS]
+
     def try_analyze(self, now=None):
         """Pattern mining + spatial-connectivity facts. Does NOT need a
         key - a robot with no API access still consolidates statistics.
@@ -361,11 +475,19 @@ class Reflection:
                     confidence=min(0.9, 0.5 + 0.1 * traversals), source="location_graph")
                 connectivity += 1
 
+        # Self-model: recompute the robot's first-person sense of its own
+        # tendencies from the freshly-written patterns + coach/spatial
+        # stats, and make it the complete active "self" fact set (stale
+        # snapshot retired). replace_subject no-ops if nothing synthesized,
+        # so a quiet robot keeps whatever self-model it already had.
+        self_facts = self._synthesize_self_facts()
+        self.store.replace_subject("self", self_facts, source="self_model")
+
         self.store.set_meta("last_analysis_at", now)
         self.store.set_meta("last_analyzed_event_id", max_event_id)
-        if patterns or connectivity:
+        if patterns or connectivity or self_facts:
             print(f"Reflection: offline analysis stored {len(patterns)} patterns, "
-                  f"{connectivity} connectivity facts")
+                  f"{connectivity} connectivity facts, {len(self_facts)} self-facts")
         return True
 
     # ---------- one reflection attempt ----------

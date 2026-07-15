@@ -228,6 +228,37 @@ class SemanticStore:
         self.conn.commit()
         return new_id
 
+    def replace_subject(self, subject, facts, source="reflection"):
+        """Make `facts` the COMPLETE active set for `subject`, atomically.
+
+        For fully-recomputed subjects like the self-model ("self"), whose
+        every fact is re-derived from scratch each pass: upsert (reinforce
+        / reactivate) each given fact, then retire any other still-active
+        fact under the same subject so a stale snapshot never lingers next
+        to the fresh one. Retired rows follow the normal lifecycle
+        (status='superseded'); superseded_by_id stays NULL because a whole
+        snapshot has no single successor row. No-op guard: an EMPTY facts
+        list leaves the subject untouched (a transient empty synthesis must
+        not wipe a good self-model).
+
+        facts: iterable of (fact_text, confidence). Returns the kept ids."""
+        if self.readonly:
+            raise RuntimeError("SemanticStore opened readonly - only reflection.py writes")
+        kept = []
+        for fact, confidence in facts:
+            fid = self.upsert_fact(subject, fact, confidence, source=source)
+            if fid is not None:
+                kept.append(fid)
+        if not kept:
+            return kept  # nothing synthesized this pass - don't disturb existing
+        placeholders = ",".join("?" * len(kept))
+        self.conn.execute(
+            f"UPDATE facts SET status = 'superseded' "
+            f"WHERE subject = ? AND status = 'active' AND id NOT IN ({placeholders})",
+            (subject.strip()[:80], *kept))
+        self.conn.commit()
+        return kept
+
     def upsert_pattern(self, condition, outcome, frequency, confidence):
         """Patterns are aggregate statistics over a window, so a re-mine
         REPLACES frequency/confidence rather than accumulating them."""

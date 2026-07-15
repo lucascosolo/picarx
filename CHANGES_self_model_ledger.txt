@@ -1,0 +1,89 @@
+Self-Model Ledger (Pythonic self-aggregation)
+=============================================
+
+DEPENDS ON: the belief-revision / episodic-memory change
+(commit "Belief revision (contradiction detection) and autobiographical
+episode memory"). This patch is generated ON TOP OF it - apply that one
+first. In particular replace_subject relies on upsert_fact returning the
+row id, which that earlier change added.
+
+WHAT CHANGED
+------------
+The robot now maintains a dynamic first-person self-model (durable facts
+under subject "self") that grounds its conversational personality. It is
+synthesized with PURE PYTHON aggregation in the cheap try_analyze pass -
+absolutely no new API call, and it rides the existing offline-analysis
+cadence (ANALYSIS_COOLDOWN / idle-or-event-count trigger).
+
+1. layer_b/semantic_store.py  -  new replace_subject()
+   - Makes a given list of (fact, confidence) the COMPLETE active set for
+     a subject: upserts each (reinforce/reactivate), then retires any
+     other still-active row under that subject (status='superseded',
+     superseded_by_id left NULL - a whole-snapshot swap has no single
+     successor row). Keeps a recomputed-every-pass subject like "self"
+     from accumulating stale rows.
+   - No-op guard: an EMPTY list leaves the subject untouched, so a
+     transient empty synthesis (e.g. coach_policy.json briefly
+     unreadable) never wipes a good self-model.
+   - Writer-only, same single-writer rule; reflection.py stays the sole
+     writer to semantic.db.
+
+2. layer_b/modules/reflection.py  -  self-model in try_analyze()
+   - New COACH_POLICY_PATH (read-only; coach.py remains its sole writer)
+     and SELF_* evidence thresholds.
+   - _read_coach_policy(): fail-soft load of coach_policy.json.
+   - _aggregate_escape_directions(): sums every bandit arm's win/loss by
+     its FIRST step's movement direction.
+   - _synthesize_self_facts(): builds 3-5 first-person observations from
+     (a) escape-direction success rates ("backing away first gets me
+     unstuck more reliably than pushing forward"), (b) overall coaching
+     success rate, (c) the spatial map - places mapped, a place found
+     once but never revisited ("I still have not properly explored
+     place 4 ..."), a veto-prone place, and (d) one mined pattern. It
+     states only what the data supports (may be fewer than 3 on a fresh
+     robot - never filler), capped at SELF_MAX_FACTS (5).
+   - try_analyze now calls replace_subject("self", ...) after patterns
+     and connectivity are written, so top_patterns reads fresh data. The
+     log line reports the self-fact count.
+
+3. layer_b/modules/companion.py  -  personality grounded in the self-model
+   - _self_model_notes(): read-only facts_for("self") (fail-soft to []).
+   - _compose_system_prompt(): base SYSTEM_PROMPT + a dynamic
+     self-understanding block built from those notes; falls back to the
+     plain prompt before any self-model exists. _handle_utterance now
+     passes this composed prompt as `system=`.
+   - _context_blurb() now EXCLUDES subject "self" from its per-turn
+     "long-term memory notes" (it pulls a few recent non-self facts),
+     so the self-model isn't recited twice - it lives in the personality
+     (system prompt), the sensor snapshot stays about the here-and-now.
+
+   Note on the requirement wording: it asked to retrieve facts_for("self")
+   "in _context_blurb" and inject into the system prompt. Those are two
+   different call sites (the blurb feeds the USER turn's sensor snapshot;
+   personality belongs in the SYSTEM prompt), so the retrieval lives in
+   its own _self_model_notes()/_compose_system_prompt() and _context_blurb
+   was updated only to stop double-reporting "self". Same data, correct
+   home.
+
+CURRENT STATE
+-------------
+- All three files parse. Smoke-tested: replace_subject snapshot swap +
+  empty-guard; full _synthesize_self_facts() over fixture coach policy /
+  spatial locations / pattern (produced the 5 example-style facts);
+  companion _compose_system_prompt() injection and its no-self fallback.
+- No new API calls, no motion-path changes, single-writer invariant
+  intact. No twin-file sync needed (these three files have no layer_b/
+  top-level twins).
+
+SUGGESTED NEXT STEPS
+--------------------
+- Tune SELF_* thresholds against real coach_policy.json volumes once
+  there's field data; consider a "turn"-direction fact too if turning
+  escapes become common.
+- The self-model currently reuses the "self" subject; if the web console
+  grows a debug view, surfacing active vs. retired "self" rows would make
+  the ledger's evolution visible.
+- When a tests/ harness exists, cover _aggregate_escape_directions,
+  _synthesize_self_facts thresholds, replace_subject retire/empty-guard,
+  and the companion fallback (stub broker_client/semantic per project
+  convention).
