@@ -68,6 +68,17 @@ MAX_EVENTS_PER_DIGEST = 120    # newest N events considered per window
 DIGEST_CHAR_BUDGET = 2800      # hard cap on digest text sent to the model
 MAX_FACTS_PER_REFLECTION = 6
 
+# Belief revision: how many current active facts to show the model as
+# "existing memory" so it can spot a new fact that contradicts an old one.
+# Kept small - this rides the SAME haiku call as extraction (no extra API
+# request), so it only costs a few hundred input tokens.
+EXISTING_FACTS_FOR_PROMPT = 25
+
+# Autobiographical memory: a quiet stretch this long between consecutive
+# events in the digest window marks a session boundary, and the reflection
+# is asked to also emit one diary-style episode summary for that day.
+SESSION_GAP_SEC = 3600.0
+
 REFLECTION_MODEL = os.environ.get("REFLECTION_MODEL", "claude-haiku-4-5-20251001")
 
 # Topics worth reflecting on (a subset of what event_logger records -
@@ -100,10 +111,25 @@ Up to 2 of the entries may instead use the subject "idea": a specific, safe
 SURPRISE - something that should have worked but didn't, or vice versa). Ideas feed
 future coaching decisions, so keep them concrete and actionable, never fanciful.
 
+BELIEF REVISION: the user message may include an EXISTING MEMORY block - facts you
+already believe, each prefixed with a numeric id like "[42]". If a NEW fact you are
+about to write directly CONTRADICTS one of those (same subject, incompatible claim -
+e.g. you now learn a door that "connects" two rooms is actually always closed), add
+"supersedes": <that id> to the new fact so the stale belief is retired. Use it ONLY
+for genuine contradictions, never for mere elaboration or a fact you're just
+reinforcing. Omit the field (or use null) otherwise.
+
+AUTOBIOGRAPHICAL MEMORY: if the user message says SESSION BOUNDARY DETECTED, also
+include exactly ONE extra entry whose subject is the "episode:<date>" string it gives
+you. Its "fact" is a short (2-3 sentence) first-person, diary-style narrative of what
+happened this session - warm and reflective, not a bullet list. This is the only entry
+allowed to be narrative and multi-sentence; never emit an episode entry otherwise.
+
 Reply with a JSON array only, no prose:
 [{{"subject": "<short topic, e.g. 'living room' or 'escape tactics'>",
    "fact": "<one sentence>",
-   "confidence": <0.0-1.0>}}]
+   "confidence": <0.0-1.0>,
+   "supersedes": <id of a contradicted EXISTING MEMORY fact, or null>}}]
 Return [] if nothing is worth remembering."""
 
 
@@ -220,16 +246,47 @@ class Reflection:
             print("Reflection: 'anthropic' package not installed - reflection disabled.")
         return self._client
 
-    def _extract_facts(self, digest):
+    def _existing_memory_block(self):
+        """Current active facts shown to the model for contradiction
+        detection, each tagged with its id so the LLM can point
+        'supersedes' at one. Returns (prompt_text, {id: fact_dict}).
+        Episodes are excluded - a diary entry is never 'contradicted'."""
+        facts = self.store.recent_facts(limit=EXISTING_FACTS_FOR_PROMPT)
+        facts = [f for f in facts if not str(f["subject"]).startswith("episode:")]
+        if not facts:
+            return "", {}
+        lines = [f"[{f['id']}] ({f['subject']}) {f['fact']}" for f in facts]
+        by_id = {f["id"]: f for f in facts}
+        return "EXISTING MEMORY (your current beliefs):\n" + "\n".join(lines), by_id
+
+    @staticmethod
+    def _session_boundary_subject(rows, now):
+        """'episode:<YYYY-MM-DD>' if a significant idle gap splits this
+        digest window into separate sessions, else None. rows are in
+        chronological (id-ascending) order; ts is epoch seconds."""
+        ts = [r[1] for r in rows if r[1]]
+        if len(ts) < 2:
+            return None
+        if max(b - a for a, b in zip(ts, ts[1:])) < SESSION_GAP_SEC:
+            return None
+        return "episode:" + time.strftime("%Y-%m-%d", time.localtime(ts[-1]))
+
+    def _extract_facts(self, digest, memory_block="", episode_subject=None):
         client = self._get_client()
         if client is None:
             return None
+        content = digest
+        if memory_block:
+            content = f"{memory_block}\n\n---\nRECENT EVENTS:\n{digest}"
+        if episode_subject:
+            content += (f"\n\n---\nSESSION BOUNDARY DETECTED. Also emit one "
+                        f"episode entry with subject \"{episode_subject}\".")
         try:
             response = client.messages.create(
                 model=REFLECTION_MODEL,
-                max_tokens=500,
+                max_tokens=600,
                 system=SYSTEM_PROMPT.format(max_facts=MAX_FACTS_PER_REFLECTION),
-                messages=[{"role": "user", "content": digest}],
+                messages=[{"role": "user", "content": content}],
                 timeout=15.0,
             )
             text = "".join(b.text for b in response.content
@@ -241,7 +298,7 @@ class Reflection:
             facts = json.loads(text)
             if not isinstance(facts, list):
                 return None
-            return facts[:MAX_FACTS_PER_REFLECTION]
+            return facts  # capping happens in try_reflect (episodes are extra)
         except Exception as e:
             print(f"Reflection: LLM extraction failed: {e}")
             return None
@@ -333,26 +390,60 @@ class Reflection:
         if n_lines < MIN_NEW_EVENTS:
             return False
 
-        facts = self._extract_facts(digest)
+        # Same haiku call, now also handed the current beliefs (for
+        # contradiction detection) and, when the window straddles an idle
+        # gap, a request for one diary-style episode summary. No extra API
+        # call - it's all folded into the one request.
+        memory_block, existing_by_id = self._existing_memory_block()
+        episode_subject = self._session_boundary_subject(rows, now)
+        facts = self._extract_facts(digest, memory_block, episode_subject)
         if facts is None:
             return False  # no key / API failure - leave events unconsumed, retry next window
 
         stored = 0
+        superseded = 0
+        episodes = 0
+        n_facts = 0
         for f in facts:
-            subject = (f.get("subject") or "").strip() if isinstance(f, dict) else ""
-            fact = (f.get("fact") or "").strip() if isinstance(f, dict) else ""
+            if not isinstance(f, dict):
+                continue
+            subject = (f.get("subject") or "").strip()
+            fact = (f.get("fact") or "").strip()
             if not subject or not fact:
                 continue
+            is_episode = subject.startswith("episode:")
+            # Ordinary facts are capped; the episode entry is extra and
+            # always allowed through so a busy window still gets its diary.
+            if not is_episode:
+                if n_facts >= MAX_FACTS_PER_REFLECTION:
+                    continue
+                n_facts += 1
             try:
                 confidence = max(0.0, min(1.0, float(f.get("confidence", 0.5))))
             except (TypeError, ValueError):
                 confidence = 0.5
-            self.store.upsert_fact(subject, fact, confidence)
+            # Only honor a supersede pointing at a real active fact we
+            # actually showed the model, so a hallucinated id can't retire
+            # an arbitrary belief. Episodes never supersede anything.
+            supersedes = None
+            if not is_episode:
+                try:
+                    cand = int(f.get("supersedes"))
+                except (TypeError, ValueError):
+                    cand = None
+                if cand is not None and cand in existing_by_id:
+                    supersedes = cand
+            self.store.upsert_fact(subject, fact, confidence, supersedes=supersedes)
             stored += 1
+            if supersedes is not None:
+                superseded += 1
+            if is_episode:
+                episodes += 1
 
         self.store.set_meta("last_reflected_event_id", max_id)
         self.store.set_meta("last_reflection_at", now)
         print(f"Reflection: digested {n_lines} events into {stored} facts "
+              f"({superseded} superseding, {episodes} episode) "
               f"({self.store.fact_count()} total known)")
         return True
 

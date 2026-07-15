@@ -186,19 +186,47 @@ class SemanticStore:
 
     # ---------- writer side (reflection.py only) ----------
 
-    def upsert_fact(self, subject, fact, confidence=0.5, source="reflection"):
+    def upsert_fact(self, subject, fact, confidence=0.5, source="reflection",
+                    supersedes=None):
+        """Insert or reinforce a fact and return its row id.
+
+        Belief revision: pass `supersedes=<old fact id>` when this new fact
+        CONTRADICTS an existing active one (reflection.py decides this from
+        the LLM's verdict). The old row is flipped status='superseded' and
+        its superseded_by_id is pointed at the new row, in the same
+        transaction, so readers stop seeing the retired belief while its
+        history stays queryable via include_superseded=True. A no-op if the
+        old id is missing, already superseded, or equal to the new row (a
+        fact never supersedes itself)."""
         if self.readonly:
             raise RuntimeError("SemanticStore opened readonly - only reflection.py writes")
         now = time.time()
+        subject = subject.strip()[:80]
+        fact = fact.strip()[:300]
         self.conn.execute(
             """INSERT INTO facts (subject, fact, confidence, source, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(subject, fact) DO UPDATE SET
                  seen_count = seen_count + 1,
                  confidence = MAX(confidence, excluded.confidence),
-                 updated_at = excluded.updated_at""",
-            (subject.strip()[:80], fact.strip()[:300], float(confidence), source, now, now))
+                 updated_at = excluded.updated_at,
+                 status = 'active',
+                 superseded_by_id = NULL""",
+            (subject, fact, float(confidence), source, now, now))
+        # UNIQUE(subject, fact) makes this lookup the reliable way to get the
+        # id back for both the insert and the ON CONFLICT update path.
+        row = self.conn.execute(
+            "SELECT id FROM facts WHERE subject = ? AND fact = ?",
+            (subject, fact)).fetchone()
+        new_id = row[0] if row else None
+        if (supersedes is not None and new_id is not None
+                and int(supersedes) != new_id):
+            self.conn.execute(
+                "UPDATE facts SET status = 'superseded', superseded_by_id = ? "
+                "WHERE id = ? AND status = 'active'",
+                (new_id, int(supersedes)))
         self.conn.commit()
+        return new_id
 
     def upsert_pattern(self, condition, outcome, frequency, confidence):
         """Patterns are aggregate statistics over a window, so a re-mine

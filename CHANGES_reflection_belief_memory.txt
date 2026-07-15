@@ -1,0 +1,81 @@
+Belief revision + autobiographical memory
+==========================================
+
+WHAT CHANGED
+------------
+All three edits piggyback on the ONE existing haiku call in
+reflection.try_reflect (no new API requests, no new CPU hot-path work),
+per the "CPU budget is sacred" invariant.
+
+1. layer_b/semantic_store.py  -  upsert_fact()
+   - Now RETURNS the fact's row id (works for both the insert and the
+     ON CONFLICT reinforce path, via a follow-up SELECT on the
+     UNIQUE(subject, fact) key).
+   - New optional arg `supersedes=<old_id>`: in the same transaction it
+     flips the old row to status='superseded' and sets its
+     superseded_by_id to the new row. No-op if the old id is missing,
+     already superseded, or equals the new row.
+   - Reinforcing a fact now also resets status='active',
+     superseded_by_id=NULL, so a belief that gets re-learned after being
+     retired is resurrected (reinforcement wins). Noted here because it's
+     a deliberate behaviour choice, not an accident.
+   - Reader path, single-writer rule, and the Phase 1 schema are
+     untouched (status / superseded_by_id already existed).
+
+2. layer_b/modules/reflection.py  -  try_reflect()
+   Belief revision:
+   - Before the call, _existing_memory_block() pulls up to
+     EXISTING_FACTS_FOR_PROMPT (25) current ACTIVE facts (episodes
+     excluded) and renders them as "[id] (subject) fact" lines in the
+     user message under EXISTING MEMORY.
+   - The prompt instructs the model to add "supersedes": <id> to a new
+     fact that directly CONTRADICTS one of those beliefs.
+   - Parsing only honours a supersede id that was actually shown to the
+     model (guards against a hallucinated id retiring an arbitrary
+     belief). Episodes never supersede anything.
+
+   Autobiographical memory:
+   - _session_boundary_subject() detects a >= SESSION_GAP_SEC (1h) idle
+     gap between consecutive events in the digest window; if found it
+     asks the model (in the same call) for ONE diary-style
+     "episode:<YYYY-MM-DD>" entry, written back with the ordinary
+     upsert_fact. The date is local-time to match the reader.
+   - Episode entries are extra: the MAX_FACTS_PER_REFLECTION cap now
+     applies to ordinary facts only, so a busy window still gets its
+     diary entry. max_tokens nudged 500 -> 600 to fit the narrative.
+
+3. layer_b/modules/companion.py  -  _handle_utterance()
+   - New _maybe_answer_episode(): "what did you do today",
+     "summarize yesterday", "how was your day", "recap today", etc.
+     resolve to a local date, read episode:<date> from semantic.db, and
+     speak it. Pure read-only SELECT - NO LLM call, no tokens, works
+     with no API key. Falls back to a friendly "not put together yet"
+     line when the day has no episode. Runs before the LLM path in
+     _handle_utterance so it intercepts cleanly.
+
+CURRENT STATE
+-------------
+- All three files parse; supersession, reactivation, episode round-trip,
+  boundary detection, and the companion date/trigger matching were
+  smoke-tested and pass.
+- No twin-file sync needed: companion.py and reflection.py have no
+  layer_b/ top-level twins (only audio_nodes / field_agent / coach do),
+  and semantic_store.py is a single top-level file. Nothing to cp-sync.
+- Single-writer invariant preserved: reflection.py remains the sole
+  writer to semantic.db; companion.py opens it readonly.
+- No motion path touched; motion still only flows through field_agent's
+  literal-word matching.
+
+SUGGESTED NEXT STEPS
+--------------------
+- Add unit tests once a tests/ harness exists (stub broker_client, vosk,
+  picamera2, cv2, numpy per project convention): cover upsert_fact
+  supersede + reactivation, try_reflect supersede-id validation, episode
+  cap-exemption, and companion episode readback / date resolution.
+- Consider a "summarize <weekday>" / "last week" range in
+  _episode_query_date if users want more than today/yesterday.
+- Watch input-token cost of the EXISTING MEMORY block on very busy
+  robots; EXISTING_FACTS_FOR_PROMPT (25) is the knob to trim if the
+  haiku call grows.
+- Optional: expose superseded history in the web console for debugging
+  belief revision.

@@ -135,6 +135,17 @@ CAMERA_TRIGGERS = (
     "what does this look like",
 )
 
+# ---------- autobiographical memory readback ----------
+# reflection.py writes diary-style "episode:<YYYY-MM-DD>" facts to
+# semantic.db at session boundaries. When someone asks about the robot's
+# day we answer straight from that store - a pure read-only SELECT, no LLM
+# call and no tokens spent - so "what did you do today" is instant even
+# with no API key.
+EPISODE_TRIGGERS = (
+    "what did you do", "what have you done", "what happened", "summarize",
+    "summarise", "recap", "tell me about your day", "how was your day",
+)
+
 SYSTEM_PROMPT = """You are the voice and personality of a small autonomous robot car (PiCar-X).
 You are friendly, a little playful, and curious about the world you're rolling around in.
 
@@ -442,9 +453,51 @@ class Companion:
         lowered = text.lower()
         return any(t in lowered for t in CAMERA_TRIGGERS)
 
+    # ---------- autobiographical memory readback ----------
+
+    def _episode_query_date(self, text):
+        """'YYYY-MM-DD' if this utterance is asking about the robot's day
+        ("what did you do today", "summarize yesterday"), else None. Date
+        is formatted in local time to match reflection.py's episode keys."""
+        lowered = text.lower()
+        if not any(t in lowered for t in EPISODE_TRIGGERS):
+            return None
+        if not any(w in lowered for w in ("today", "yesterday", "day")):
+            return None
+        now = time.time()
+        offset = -86400 if "yesterday" in lowered else 0
+        return time.strftime("%Y-%m-%d", time.localtime(now + offset))
+
+    def _maybe_answer_episode(self, text):
+        """Answer 'what did you do today / summarize yesterday' straight
+        from semantic.db (the episode:<date> fact). Returns True if it
+        handled the utterance. No API call - works even without a key."""
+        date = self._episode_query_date(text)
+        if not date:
+            return False
+        entries = self.semantic.facts_for(f"episode:{date}", limit=1)
+        if entries:
+            reply = entries[0]["fact"]
+        else:
+            when = "yesterday" if "yesterday" in text.lower() else "today"
+            reply = f"I don't have my thoughts on {when} put together yet."
+        now = time.time()
+        with self.lock:
+            self.history.append({"role": "user", "content": text})
+            self.history.append({"role": "assistant", "content": reply})
+            self.last_turn_at = now
+        self._save_memory()
+        print(f"Companion (episode {date}): {reply}")
+        self.bus.publish("picarx/audio/speak", {"text": reply})
+        return True
+
     # ---------- chat ----------
 
     def _handle_utterance(self, text):
+        # Autobiographical readback first: a diary question is answered from
+        # the semantic store directly, never spending an LLM round-trip.
+        if self._maybe_answer_episode(text):
+            return
         client = self._get_client()
         if client is None:
             self.bus.publish("picarx/audio/speak", {"text": "Sorry, I can't chat right now."})
