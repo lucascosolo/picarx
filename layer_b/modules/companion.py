@@ -167,6 +167,8 @@ MAX_TOOL_ROUNDS = 3          # bound the tool<->model round-trips per utterance
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
 FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
 BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
+HEALTH_STATE_TOPIC = "picarx/health/state"
+LOWPOWER_REQUEST_TOPIC = "picarx/tools/lowpower/request"
 
 TOOLS = [
     {"name": "schedule_reminder",
@@ -205,6 +207,20 @@ TOOLS = [
          "name": {"type": "string",
                   "description": "optional saved phone name to tether to"}},
          "required": []}},
+    {"name": "check_vital_stats",
+     "description": "Check your own physical health: battery voltage/percentage, "
+                    "CPU temperature, and free disk space. Use when the person asks "
+                    "how you're doing/feeling, about your battery/power/temperature, "
+                    "or before deciding whether to conserve power.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "register_low_power_intent",
+     "description": "Enter low-power mode to preserve yourself when the battery is "
+                    "low: this curtails high-power work (heavy vision processing) and "
+                    "drops to a low-overhead monitoring state. Call it when you see "
+                    "from check_vital_stats that the battery is low, or when the "
+                    "person tells you to conserve power. (A safety system also does "
+                    "this on its own if the battery gets critically low.)",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
 ]
 
 SYSTEM_PROMPT = """You are the voice and personality of a small autonomous robot car (PiCar-X).
@@ -257,6 +273,8 @@ class Companion:
         # Latest camera frame (base64 JPEG) seen on the bus, if any
         self.latest_frame_b64 = None
         self.latest_frame_at = 0.0
+        # Latest vital stats from health_daemon (for the check_vital_stats tool)
+        self.latest_health = None
 
     # ---------- memory persistence ----------
 
@@ -351,6 +369,32 @@ class Companion:
             with self.lock:
                 self.latest_frame_b64 = b64
                 self.latest_frame_at = time.time()
+
+    def on_health(self, payload):
+        # Vital stats from health_daemon, cached for the check_vital_stats tool.
+        with self.lock:
+            self.latest_health = payload
+
+    @staticmethod
+    def _format_health(health):
+        """Spoken-friendly one-liner from a cached health payload."""
+        if not health:
+            return "I don't have my vital stats yet."
+        parts = []
+        v, pct = health.get("battery_v"), health.get("battery_pct")
+        if v is not None and pct is not None:
+            parts.append(f"battery {v:.1f} volts, about {pct} percent")
+        elif v is not None:
+            parts.append(f"battery {v:.1f} volts")
+        if health.get("temp_c") is not None:
+            parts.append(f"CPU {health['temp_c']:.0f} degrees")
+        if health.get("disk_free_gb") is not None:
+            parts.append(f"{health['disk_free_gb']:.1f} gigabytes of disk free")
+        if health.get("low_power"):
+            parts.append("currently in low-power mode")
+        if not parts:
+            return "My vital stats are unavailable right now."
+        return "; ".join(parts) + "."
 
     def on_uncertain(self, payload):
         """A router escalated a command-shaped utterance it couldn't
@@ -648,6 +692,13 @@ class Companion:
                     req["name"] = tool_input["name"]
                 self.bus.publish(BLUETOOTH_CONNECT_TOPIC, req)
                 return "Trying to tether over Bluetooth to the phone."
+            if name == "check_vital_stats":
+                with self.lock:
+                    health = dict(self.latest_health) if self.latest_health else None
+                return self._format_health(health)
+            if name == "register_low_power_intent":
+                self.bus.publish(LOWPOWER_REQUEST_TOPIC, {"active": True})
+                return "Entering low-power mode to conserve battery."
         except Exception as e:
             print(f"Companion: tool '{name}' failed: {e}")
             return "That didn't work."
@@ -723,6 +774,7 @@ class Companion:
         self.bus.subscribe("picarx/audio/uncertain", self.on_uncertain)
         self.bus.subscribe(VISION_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
+        self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
 
         for _ in range(WORKER_THREADS):
             threading.Thread(target=self._worker_loop, daemon=True).start()

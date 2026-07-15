@@ -72,6 +72,28 @@ class CompanionToolTest(unittest.TestCase):
         msg = self.c.bus.last(companion.BLUETOOTH_CONNECT_TOPIC)
         self.assertEqual(msg["name"], "Pixel")
 
+    def test_check_vital_stats_no_data(self):
+        self.c.latest_health = None
+        out = self.c._execute_tool("check_vital_stats", {})
+        self.assertIn("don't have", out.lower())
+
+    def test_check_vital_stats_summarizes(self):
+        self.c.latest_health = {"battery_v": 7.4, "battery_pct": 58,
+                                "temp_c": 51.0, "disk_free_gb": 9.2, "low_power": False}
+        out = self.c._execute_tool("check_vital_stats", {})
+        self.assertIn("7.4 volts", out)
+        self.assertIn("58 percent", out)
+        self.assertIn("51 degrees", out)
+
+    def test_register_low_power_intent_publishes(self):
+        out = self.c._execute_tool("register_low_power_intent", {})
+        self.assertIn("low-power", out.lower())
+        self.assertEqual(self.c.bus.last(companion.LOWPOWER_REQUEST_TOPIC)["active"], True)
+
+    def test_on_health_caches(self):
+        self.c.on_health({"battery_v": 8.0, "battery_pct": 90})
+        self.assertEqual(self.c.latest_health["battery_pct"], 90)
+
     def test_unknown_tool(self):
         self.assertIn("Unknown", self.c._execute_tool("frobnicate", {}))
 

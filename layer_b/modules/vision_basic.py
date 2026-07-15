@@ -115,6 +115,11 @@ CAPTURE_SIZE = (320, 240)      # was 640x480 - biggest single lever, see notes a
 
 DETECT_INTERVAL = 0.3          # base capture/face-check tick (was 0.2)
 OBJECT_DETECT_INTERVAL = 1.5   # candidate ticks for a fresh SSD pass (was 1.0)
+# Homeostatic self-preservation: when health_daemon signals low battery on
+# picarx/health/low_power, the expensive SSD/YOLO forward pass is throttled
+# way back (the cheap Haar face pass keeps running) to conserve power.
+LOW_POWER_TOPIC = "picarx/health/low_power"
+LOW_POWER_OBJECT_DETECT_INTERVAL = 15.0
 
 FACE_CONFIRM_FRAMES = 3        # consecutive frames before reporting a face
 
@@ -447,6 +452,14 @@ def run():
         print(f"vision stream {'ENABLED' if stream['enabled'] else 'disabled'} (console live view)")
     bus.subscribe(STREAM_CONTROL_TOPIC, on_stream_control)
 
+    # Low-power curtailment (same mutable-dict-from-callback pattern as the
+    # stream flag above): while active, the heavy SSD pass runs far less often.
+    low_power = {"active": False}
+    def on_low_power(payload):
+        low_power["active"] = bool(payload.get("active", False))
+        print(f"vision: low-power {'ON - throttling object detection' if low_power['active'] else 'off'}")
+    bus.subscribe(LOW_POWER_TOPIC, on_low_power)
+
     print(f"vision basic module running ({detector.name}), "
           f"publishing to picarx/vision/faces and picarx/vision/objects")
 
@@ -488,7 +501,9 @@ def run():
 
         # ---------- object detection (motion-gated + throttled) ----------
         now = time.time()
-        if now - last_object_detect >= OBJECT_DETECT_INTERVAL:
+        detect_interval = (LOW_POWER_OBJECT_DETECT_INTERVAL if low_power["active"]
+                           else OBJECT_DETECT_INTERVAL)
+        if now - last_object_detect >= detect_interval:
             last_object_detect = now
 
             # Cheap motion check on a tiny thumbnail - reuses the gray

@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# /home/picarx/layer_b/modules/tools/health_daemon.py
+"""
+Health daemon (Layer B tool) - the robot's homeostatic self-monitoring.
+
+Watches the robot's own physical "vital stats" - battery, CPU temperature,
+free disk - and drives a self-preservation LOW-POWER state.
+
+  - Publishes picarx/health/state at a fixed rate so anything (companion's
+    check_vital_stats tool, the web console, ...) can read them.
+  - Owns picarx/health/low_power (sole publisher). It enters low power on a
+    battery hysteresis (LOW_BATTERY_V in, RECOVER_BATTERY_V out) OR when the
+    LLM asks via picarx/tools/lowpower/request (companion's
+    register_low_power_intent). On entering it announces once; consumers
+    that honor the topic curtail high-power work - vision_basic backs its
+    heavy SSD/YOLO pass right off, for instance.
+  - This deterministic auto-trigger matters: self-preservation must not
+    depend on the LLM being spoken to. The register_low_power_intent tool is
+    an ADDITIONAL, proactive lever, not the only line of defense.
+
+Battery source: it CONSUMES the voltage already on picarx/state/world (the
+safety daemon reads the battery ADC and world_state.py republishes it).
+Re-reading the robot_hat ADC from a second process would contend with the
+safety daemon on the I2C bus, so we don't by default. A direct ADC read
+(the SunFounder A4 snippet) is available behind HEALTH_BATTERY_ADC=1 as a
+fallback for setups that don't run world_state.
+
+Fail-soft throughout: an unreadable sensor just reports None. Issues no
+motion and writes no database.
+"""
+import os
+import getpass
+os.getlogin = getpass.getuser
+
+import sys
+sys.path.insert(0, "/home/picarx/layer_b")
+from broker_client import Bus
+
+import shutil
+import threading
+import time
+
+WORLD_TOPIC = "picarx/state/world"
+STATE_TOPIC = "picarx/health/state"
+LOW_POWER_TOPIC = "picarx/health/low_power"
+LOWPOWER_REQUEST_TOPIC = "picarx/tools/lowpower/request"
+SPEAK_TOPIC = "picarx/audio/speak"
+
+THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
+DISK_PATH = "/"
+
+HEALTH_INTERVAL = 30.0          # seconds between vital-stat publishes
+
+# PiCar-X runs 2x 18650 Li-ion in series: ~8.4V full, ~6.0V empty.
+BATT_FULL_V = 8.4
+BATT_EMPTY_V = 6.0
+LOW_BATTERY_V = 6.6             # enter low power at/below this...
+RECOVER_BATTERY_V = 7.0        # ...and only leave once back above this (hysteresis)
+
+
+def battery_percent(voltage):
+    """Rough state-of-charge % from pack voltage (linear, clamped)."""
+    if voltage is None:
+        return None
+    pct = (voltage - BATT_EMPTY_V) / (BATT_FULL_V - BATT_EMPTY_V) * 100.0
+    return int(max(0.0, min(100.0, round(pct))))
+
+
+def read_cpu_temp_c(path=THERMAL_PATH):
+    """CPU core temp in C from /sys (a cheap file read, no subprocess).
+    None if unavailable (e.g. off-robot)."""
+    try:
+        with open(path) as f:
+            return round(int(f.read().strip()) / 1000.0, 1)
+    except (OSError, ValueError):
+        return None
+
+
+def read_disk(path=DISK_PATH):
+    """(free_gb, used_pct) for the filesystem at `path`, or (None, None)."""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return None, None
+    free_gb = round(usage.free / 1e9, 1)
+    used_pct = round(usage.used / usage.total * 100.0, 1) if usage.total else None
+    return free_gb, used_pct
+
+
+def read_battery_adc():
+    """Direct robot_hat ADC battery read (SunFounder A4 divider). OFF by
+    default (see module docstring - I2C contention with the safety daemon).
+    Enable with HEALTH_BATTERY_ADC=1 for setups without world_state."""
+    try:
+        from robot_hat import ADC
+        return round(ADC("A4").read() * 3.3 / 4095 * 3, 2)
+    except Exception:
+        return None
+
+
+def summarize(vitals):
+    """One spoken-friendly line from a vitals dict."""
+    if not vitals:
+        return "I don't have my vital stats yet."
+    parts = []
+    v, pct = vitals.get("battery_v"), vitals.get("battery_pct")
+    if v is not None and pct is not None:
+        parts.append(f"battery {v:.1f} volts, about {pct} percent")
+    elif v is not None:
+        parts.append(f"battery {v:.1f} volts")
+    else:
+        parts.append("battery reading unavailable")
+    if vitals.get("temp_c") is not None:
+        parts.append(f"CPU {vitals['temp_c']:.0f} degrees")
+    if vitals.get("disk_free_gb") is not None:
+        parts.append(f"{vitals['disk_free_gb']:.1f} gigabytes of disk free")
+    if vitals.get("low_power"):
+        parts.append("I'm in low-power mode")
+    return ". ".join(p[0].upper() + p[1:] for p in parts) + "."
+
+
+class HealthDaemon:
+    def __init__(self):
+        self.bus = Bus()
+        self.lock = threading.Lock()
+        self.battery_v = None
+        self.battery_critical = False
+        self.battery_low = False          # battery-driven component (hysteresis)
+        self.low_power = False            # combined published state
+        self.manual_latch = False         # LLM/manual low-power request
+        self.use_adc = bool(os.environ.get("HEALTH_BATTERY_ADC"))
+
+    # ---------- inbound ----------
+
+    def on_world_state(self, payload):
+        battery = payload.get("battery") or {}
+        with self.lock:
+            if battery.get("voltage") is not None:
+                self.battery_v = battery["voltage"]
+            self.battery_critical = bool(battery.get("critical"))
+        # React to a battery change immediately, not only on the 30s loop.
+        self._evaluate(time.time())
+
+    def on_lowpower_request(self, payload):
+        """companion.register_low_power_intent lands here. A request to enter
+        low power latches until the battery is healthy again; an explicit
+        {active:false} clears the manual latch."""
+        want = bool(payload.get("active", True))
+        with self.lock:
+            self.manual_latch = want
+        print(f"Health daemon: manual low-power request active={want}")
+        self._evaluate(time.time())
+
+    # ---------- vitals ----------
+
+    def _battery_voltage(self):
+        with self.lock:
+            v = self.battery_v
+        if v is None and self.use_adc:
+            v = read_battery_adc()
+            if v is not None:
+                with self.lock:
+                    self.battery_v = v
+        return v
+
+    def _collect(self):
+        voltage = self._battery_voltage()
+        free_gb, used_pct = read_disk()
+        return {
+            "battery_v": voltage,
+            "battery_pct": battery_percent(voltage),
+            "temp_c": read_cpu_temp_c(),
+            "disk_free_gb": free_gb,
+            "disk_used_pct": used_pct,
+            "low_power": self.low_power,
+            "ts": time.time(),
+        }
+
+    # ---------- low-power state machine ----------
+
+    def _battery_low_now(self, voltage):
+        """Battery-only low state with hysteresis: enter at/below
+        LOW_BATTERY_V, leave only above RECOVER_BATTERY_V. A safety-daemon
+        'critical' flag forces low. Unknown voltage keeps the battery
+        component as-is (kept separate from the manual latch so clearing the
+        latch can actually turn low power off)."""
+        with self.lock:
+            critical = self.battery_critical
+        if critical:
+            return True
+        if voltage is None:
+            return self.battery_low
+        if self.battery_low:
+            return voltage < RECOVER_BATTERY_V
+        return voltage <= LOW_BATTERY_V
+
+    def _evaluate(self, now, voltage=None):
+        """Recompute low-power = (battery low) OR (manual latch), publish +
+        announce on any transition. Manual latch auto-clears once healthy."""
+        if voltage is None:
+            voltage = self._battery_voltage()
+        with self.lock:
+            if self.manual_latch and voltage is not None and voltage >= RECOVER_BATTERY_V:
+                self.manual_latch = False
+            manual = self.manual_latch
+        self.battery_low = self._battery_low_now(voltage)
+        active = self.battery_low or manual
+        if active == self.low_power:
+            return
+        self.low_power = active
+        reason = ("battery" if self.battery_low else "requested") if active else "recovered"
+        self.bus.publish(LOW_POWER_TOPIC, {"active": active, "reason": reason, "ts": now})
+        if active:
+            print(f"Health daemon: ENTERING low power ({reason}, {voltage}V)")
+            self.bus.publish(SPEAK_TOPIC, {
+                "text": "My battery is getting low, so I'm conserving power.",
+                "ts": now})
+        else:
+            print("Health daemon: leaving low power")
+            self.bus.publish(SPEAK_TOPIC, {
+                "text": "My power is back to normal.", "ts": now})
+
+    # ---------- main loop ----------
+
+    def run(self):
+        self.bus.subscribe(WORLD_TOPIC, self.on_world_state)
+        self.bus.subscribe(LOWPOWER_REQUEST_TOPIC, self.on_lowpower_request)
+        print(f"Health daemon active, publishing vitals to {STATE_TOPIC} "
+              f"every {HEALTH_INTERVAL:.0f}s")
+        while True:
+            try:
+                self._evaluate(time.time())
+                self.bus.publish(STATE_TOPIC, self._collect())
+            except Exception as e:
+                print(f"Health daemon: cycle error: {e}")
+            time.sleep(HEALTH_INTERVAL)
+
+
+if __name__ == "__main__":
+    HealthDaemon().run()

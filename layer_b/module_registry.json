@@ -18,5 +18,6 @@
   {"name": "reminder_daemon", "version": "0.1", "entrypoint": "tools/reminder_daemon.py", "enabled": true},
   {"name": "follow_daemon", "version": "0.1", "entrypoint": "tools/follow_daemon.py", "enabled": true},
   {"name": "bluetooth_daemon", "version": "0.1", "entrypoint": "tools/bluetooth_daemon.py", "enabled": true},
+  {"name": "health_daemon", "version": "0.1", "entrypoint": "tools/health_daemon.py", "enabled": true},
   {"name": "web_console", "version": "0.1", "entrypoint": "web_console.py", "enabled": true}
 ]
