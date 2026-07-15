@@ -38,6 +38,16 @@ Published:
                            flag an object that's rapidly filling the
                            frame (i.e. approaching).
 
+                           overhead ({"area_ratio","y_center_frac"} or
+                           None) is the largest class-agnostic mass that
+                           looks like a head-height OVERHANG - big and high
+                           in the frame with open space below it (a counter
+                           lip, a table edge). It exists because the low
+                           bumper ultrasonic is blind above its beam: an
+                           overhang reads as clear air underneath while the
+                           camera head is about to hit it. See the
+                           OVERHEAD_* notes and field_agent's cross-check.
+
                            close_object is separate from the labeled
                            items list and doesn't require confident
                            classification: the SSD assigns a confidence
@@ -152,6 +162,53 @@ CLOSE_OBJECT_MIN_CONFIDENCE = 0.3
 CLOSE_OBJECT_AREA_RATIO = 0.55
 CLOSE_OBJECT_CONFIRM_PASSES = 2
 
+# ---- overhead / head-height obstacle signal (vertical blind-spot fix) ----
+# The ultrasonic rides low on the front bumper; the camera rides high on the
+# pan/tilt head. That vertical gap is a real blind spot: an OVERHANGING
+# obstacle - a counter lip, a table edge, a shelf - sits above the ultrasonic
+# beam, so the beam passes UNDER it into clear air and reads long even as the
+# head is about to smack the object's side. close_object can't disambiguate
+# this from a wall across the room (both fill the frame), so field_agent
+# rightly dismisses a frame-filler when the ultrasonic reads clearly long.
+#
+# To catch the overhang case BEFORE the head hits, we publish the geometry of
+# the largest class-agnostic detection that looks like a head-height mass:
+# big enough to be imminent AND sitting high in the frame (its vertical center
+# in the upper portion), with the lower frame - the gap the base is driving
+# INTO - relatively open. A wall across the room fills top-to-bottom; a looming
+# overhang is high with clear floor below, which is exactly this signature.
+# Threshold is lower than close_object's (0.55) because the extra "high in
+# frame" requirement makes it specific, so it can fire earlier - the point is
+# to stop before contact, not after. world_state tracks how this mass grows
+# to tell a real closing overhang from a distant high wall; field_agent then
+# trusts vision over a clear ultrasonic ONLY for this (see the module there).
+OVERHEAD_MIN_AREA_RATIO = 0.30   # smaller than close_object: high-in-frame is the extra filter
+OVERHEAD_MAX_Y_CENTER = 0.55     # bbox vertical center must sit in the upper ~half of the frame
+OVERHEAD_MAX_BOTTOM = 0.90       # ...and not run to the very floor (that's a wall, not an overhang)
+OVERHEAD_CONFIRM_PASSES = 2      # debounced like every other detection here
+
+
+def pick_overhead(boxes):
+    """From this pass's class-agnostic detections, return the largest that
+    looks like a head-height overhang, or None.
+
+    boxes: iterable of (area_ratio, y_center_frac, y_bottom_frac), all in
+    0..1 frame-relative units. Pure/hardware-free so it's unit-testable off
+    the robot. A qualifying box is big (>= OVERHEAD_MIN_AREA_RATIO), centered
+    high (<= OVERHEAD_MAX_Y_CENTER), and doesn't extend to the floor (bottom
+    <= OVERHEAD_MAX_BOTTOM) - i.e. an object looming at head height with open
+    space below it, not a full-height wall."""
+    best = None
+    for area_ratio, y_center, y_bottom in boxes:
+        if (area_ratio >= OVERHEAD_MIN_AREA_RATIO
+                and y_center <= OVERHEAD_MAX_Y_CENTER
+                and y_bottom <= OVERHEAD_MAX_BOTTOM):
+            if best is None or area_ratio > best[0]:
+                best = (area_ratio, y_center)
+    if best is None:
+        return None
+    return {"area_ratio": round(best[0], 3), "y_center_frac": round(best[1], 3)}
+
 # Motion gate: only bother running the SSD at all if the scene looks
 # like it's actually changed since the last time we ran it, checked on
 # a tiny thumbnail so the check itself costs almost nothing.
@@ -232,6 +289,7 @@ class CaffeSsdDetector:
 
         found = []
         close_hit = False
+        overhead_boxes = []   # (area_ratio, y_center_frac, y_bottom_frac)
         for i in range(detections.shape[2]):
             confidence = float(detections[0, 0, i, 2])
             if confidence < CLOSE_OBJECT_MIN_CONFIDENCE:
@@ -253,6 +311,9 @@ class CaffeSsdDetector:
             area_ratio = ((x2 - x1) * (y2 - y1)) / float(frame_w * frame_h)
             if area_ratio > CLOSE_OBJECT_AREA_RATIO:
                 close_hit = True
+            overhead_boxes.append((area_ratio,
+                                   ((y1 + y2) / 2.0) / frame_h,
+                                   y2 / float(frame_h)))
 
             if class_id >= len(VOC_CLASSES) or confidence < OBJECT_CONFIDENCE_THRESHOLD:
                 continue
@@ -261,7 +322,7 @@ class CaffeSsdDetector:
                 "confidence": confidence,
                 "bbox": (x1, y1, x2 - x1, y2 - y1),
             })
-        return found, close_hit
+        return found, close_hit, pick_overhead(overhead_boxes)
 
 
 class YoloTinyDetector:
@@ -305,12 +366,16 @@ class YoloTinyDetector:
 
         found = []
         close_hit = False
+        overhead_boxes = []   # (area_ratio, y_center_frac, y_bottom_frac)
         kept = cv2.dnn.NMSBoxes(boxes, confidences,
                                 CLOSE_OBJECT_MIN_CONFIDENCE, YOLO_NMS_THRESHOLD)
         for i in np.array(kept).flatten():
             x, y, w, h = boxes[i]
             if (w * h) / float(frame_w * frame_h) > CLOSE_OBJECT_AREA_RATIO:
                 close_hit = True
+            overhead_boxes.append(((w * h) / float(frame_w * frame_h),
+                                   (y + h / 2.0) / frame_h,
+                                   (y + h) / float(frame_h)))
             if confidences[i] < OBJECT_CONFIDENCE_THRESHOLD or \
                     class_ids[i] >= len(self.classes):
                 continue
@@ -319,7 +384,7 @@ class YoloTinyDetector:
                 "confidence": confidences[i],
                 "bbox": (x, y, w, h),
             })
-        return found, close_hit
+        return found, close_hit, pick_overhead(overhead_boxes)
 
 
 def _make_detector():
@@ -470,6 +535,8 @@ def run():
     last_stream_pub = 0.0
     close_object = False   # persists between ticks where the SSD didn't run
     close_streak = 0       # consecutive SSD passes with a frame-filling detection
+    overhead_object = None # persists between ticks; last confirmed head-height mass geometry
+    overhead_streak = 0    # consecutive SSD passes with an overhead-looking mass
     scene_motion = None    # last motion-thumb mean abs diff (for stuck detection downstream)
 
     while True:
@@ -521,10 +588,18 @@ def run():
 
             if should_run_ssd:
                 last_forced_detect = now
-                found, close_hit_this_pass = detector.detect(frame, frame_w, frame_h)
+                found, close_hit_this_pass, overhead_this_pass = \
+                    detector.detect(frame, frame_w, frame_h)
 
                 close_streak = close_streak + 1 if close_hit_this_pass else 0
                 close_object = close_streak >= CLOSE_OBJECT_CONFIRM_PASSES
+
+                # Debounce the overhead mass exactly like close_object: a real
+                # overhang stays in frame across passes, a single-frame texture
+                # fluke doesn't. We keep the latest geometry once confirmed.
+                overhead_streak = overhead_streak + 1 if overhead_this_pass else 0
+                overhead_object = (overhead_this_pass
+                                   if overhead_streak >= OVERHEAD_CONFIRM_PASSES else None)
 
                 tracker.update(found, now)
 
@@ -546,6 +621,7 @@ def run():
         bus.publish("picarx/vision/objects", {
             "objects": objects_payload,
             "close_object": close_object,
+            "overhead": overhead_object,   # None, or {"area_ratio","y_center_frac"}
             "scene_motion": scene_motion,
         })
 

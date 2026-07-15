@@ -50,6 +50,10 @@ Output (published):
         "close_object": bool,  # class-agnostic - see vision_basic.py;
                                 # true if something is filling most of
                                 # the frame regardless of what it is
+        "overhead": {"area_ratio", "y_center_frac", "approach_rate",
+                     "approaching"} or None,  # head-height overhang mass
+                                # the low ultrasonic is blind to; "approaching"
+                                # set when it's looming larger fast
         "stale": bool
     },
     "battery": {
@@ -125,11 +129,17 @@ class WorldState:
             "objects": {},  # id -> tracked object record (see on_objects)
             "objects_updated_at": None,
             "close_object": False,
+            "overhead": None,      # head-height overhang mass (see on_objects), or None
             "scene_motion": None,  # vision's motion-thumb diff; low while camera view is static
             "battery": {"voltage": None, "low": False, "critical": False, "updated_at": None},
             "last_heard": {"text": None, "updated_at": None},
             "last_action": {"source": None, "action": None, "result": None, "updated_at": None},
         }
+        # Previous overhead-mass sample ({"area_ratio","_ts"}) so we can flag a
+        # head-height overhang that's actively LOOMING (growing) - the same
+        # depth-free "it's closing in" trick used for tracked objects above,
+        # applied to the class-agnostic overhang mass. None until first seen.
+        self._overhead_prev = None
 
     # ---------- bus callbacks ----------
 
@@ -168,6 +178,26 @@ class WorldState:
             self.state["objects_updated_at"] = now
             self.state["close_object"] = bool(payload.get("close_object", False))
             self.state["scene_motion"] = payload.get("scene_motion")
+
+            # Overhead (head-height overhang) mass: annotate it with how fast
+            # it's growing so consumers can tell a real closing overhang from a
+            # distant high wall. Reuses APPROACH_RATE_THRESHOLD - the same bar
+            # a tracked object must clear to count as "approaching".
+            overhead = payload.get("overhead")
+            if overhead:
+                overhead = dict(overhead)
+                rate = 0.0
+                prev = self._overhead_prev
+                if prev is not None:
+                    dt = now - prev["_ts"]
+                    if dt > 0:
+                        rate = (overhead["area_ratio"] - prev["area_ratio"]) / dt
+                overhead["approach_rate"] = rate
+                overhead["approaching"] = rate > APPROACH_RATE_THRESHOLD
+                self._overhead_prev = {"area_ratio": overhead["area_ratio"], "_ts": now}
+            else:
+                self._overhead_prev = None
+            self.state["overhead"] = overhead
 
     def on_heard(self, payload):
         with self.lock:
@@ -228,6 +258,7 @@ class WorldState:
             objects = {tid: dict(obj) for tid, obj in self.state["objects"].items()}
             objects_updated_at = self.state["objects_updated_at"]
             close_object = self.state["close_object"]
+            overhead = dict(self.state["overhead"]) if self.state["overhead"] else None
             scene_motion = self.state["scene_motion"]
             battery = dict(self.state["battery"])
             heard = dict(self.state["last_heard"])
@@ -247,6 +278,7 @@ class WorldState:
                     for obj in objects.values()
                 ],
                 "close_object": close_object,
+                "overhead": overhead,
                 "scene_motion": scene_motion,
                 "stale": self._is_stale(objects_updated_at, "objects"),
             },

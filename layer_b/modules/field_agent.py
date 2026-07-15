@@ -240,24 +240,38 @@ WATCH_PRIORITY = 6
 # object "approaching" if its bounding box is growing quickly while
 # centered in frame. Treated exactly like a close ultrasonic reading.
 #
-# close_object is checked first and takes priority: it's class-agnostic
-# (doesn't require the SSD to confidently recognize what the object is -
-# see vision_basic.py), so it catches point-blank obstacles like a
-# cabinet that "approaching" never can, since that path only fires for
-# objects the SSD actually tracks by label in the first place.
+# Priority order, most-blind-spot-covering first:
+#   1. overhead - a head-height OVERHANG (counter lip, table edge) the low
+#      bumper ultrasonic can't see over its beam. This is the one the
+#      ultrasonic's "clear" reading must NOT be allowed to dismiss (the beam
+#      passes under it into open air); flagged with overhead=True so the
+#      caller's cross-check knows to trust vision for the head's path.
+#   2. close_object - class-agnostic frame-filler; catches point-blank
+#      obstacles like a cabinet that "approaching" never can, since that path
+#      only fires for objects the SSD actually tracks by label.
+#   3. approaching - a labeled tracked object growing fast and centered.
+# Returned dict is normalized: {label, area_ratio, overhead, approaching}.
 def _vision_obstacle(snapshot):
     if not snapshot:
         return None
     objects = snapshot.get("objects") or {}
     if objects.get("stale", True):
         return None
+    overhead = objects.get("overhead")
+    if overhead:
+        return {"label": "something", "area_ratio": overhead.get("area_ratio", 1.0),
+                "overhead": True, "approaching": bool(overhead.get("approaching"))}
     if objects.get("close_object"):
-        return {"label": "something", "area_ratio": 1.0}
+        return {"label": "something", "area_ratio": 1.0,
+                "overhead": False, "approaching": False}
     best = None
     for obj in objects.get("items", []):
         if obj.get("approaching") and (best is None or obj.get("area_ratio", 0) > best.get("area_ratio", 0)):
             best = obj
-    return best
+    if best is None:
+        return None
+    return {"label": best.get("label", "something"), "area_ratio": best.get("area_ratio", 0),
+            "overhead": False, "approaching": True}
 
 
 def _prune_older_than(dq, window, now):
@@ -1635,25 +1649,43 @@ class FieldAgent:
                     self.last_wander = now
                 return
 
-        # --- Handle a vision-flagged approaching object (covers the
-        # ultrasonic's blind spots - this is the fix for driving
-        # straight into things the distance sensor never saw) ---
+        # --- Handle a vision-flagged obstacle (covers the ultrasonic's
+        # blind spots - this is the fix for driving straight into things
+        # the distance sensor never saw) ---
         # Cross-checked against the ultrasonic: a fresh, clearly-long
-        # distance reading means the frame-filling detection is the
-        # room itself (wall/sofa/floor), not a point-blank obstacle -
-        # see VISION_OBSTACLE_ULTRASONIC_CLEAR_CM.
-        ultrasonic_says_clear = (
-            distance is not None and not distance_stale
-            and distance > VISION_OBSTACLE_ULTRASONIC_CLEAR_CM
-        )
-        if vision_obstacle is not None and not ultrasonic_says_clear:
-            label = vision_obstacle.get("label", "something")
-            if label == "something":
-                self.announce("Something's right in front of me, backing away.")
-            else:
-                self.announce(f"A {label} is closing in, backing away.")
-            self._begin_evasion("vision")
-            return
+        # distance reading normally means a frame-filling detection is the
+        # room itself (wall/sofa/floor), not a point-blank obstacle - see
+        # VISION_OBSTACLE_ULTRASONIC_CLEAR_CM.
+        #
+        # BUT that cross-check only holds for obstacles the ultrasonic could
+        # actually have seen. The sensor rides low on the front bumper; an
+        # OVERHANG at head height (a counter lip, a table edge) sits ABOVE its
+        # beam, so the beam passes underneath into clear air and reads long
+        # even as the camera head is about to smack the object - the exact
+        # "base drives under the counter, head hits the side" failure. So a
+        # clear reading may only dismiss a NON-overhead obstacle; for an
+        # overhead one we trust vision. To keep a genuinely distant high wall
+        # from tripping it (both fill the upper frame), an overhead mass that
+        # coincides with a clear-long reading must also be actively LOOMING
+        # (growing) before we evade.
+        if vision_obstacle is not None:
+            ultrasonic_says_clear = (
+                distance is not None and not distance_stale
+                and distance > VISION_OBSTACLE_ULTRASONIC_CLEAR_CM
+            )
+            if vision_obstacle.get("overhead"):
+                if not ultrasonic_says_clear or vision_obstacle.get("approaching"):
+                    self.announce("Something's right at head height, backing away before I hit it.")
+                    self._begin_evasion("overhead")
+                    return
+            elif not ultrasonic_says_clear:
+                label = vision_obstacle.get("label", "something")
+                if label == "something":
+                    self.announce("Something's right in front of me, backing away.")
+                else:
+                    self.announce(f"A {label} is closing in, backing away.")
+                self._begin_evasion("vision")
+                return
 
         # --- Handle Trustworthiness of Sensor Data ---
         if distance is None or distance_stale or distance < 0:

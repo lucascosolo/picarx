@@ -57,6 +57,28 @@ BATT_EMPTY_V = 6.0
 LOW_BATTERY_V = 6.6             # enter low power at/below this...
 RECOVER_BATTERY_V = 7.0        # ...and only leave once back above this (hysteresis)
 
+# Glitch rejection band. The pack is 2x 18650 in series: a genuine reading
+# while the robot is powered and running lives in the ~6.0-8.4V range, and
+# the Pi/Robot HAT brown out and lose power long before the pack could ever
+# actually sit near zero. So a reading at/below GLITCH_FLOOR_V (classically a
+# momentary 0.0V from an I2C/ADC hiccup or a dropped safety-daemon frame) is
+# physically impossible while we're alive to read it - it is a sensor glitch,
+# not a dead battery, and must NOT be allowed to trip the low-power state. A
+# reading above GLITCH_CEILING_V is likewise impossible for this pack. Both
+# are dropped: we keep the last good voltage rather than acting on a spike.
+# The floor sits far below LOW_BATTERY_V/BATT_EMPTY_V, so this can never mask
+# a real low battery - it only discards readings a real battery can't produce.
+GLITCH_FLOOR_V = 3.0
+GLITCH_CEILING_V = 9.0
+
+
+def plausible_voltage(voltage):
+    """True if `voltage` is a physically-possible pack reading (see the
+    GLITCH_FLOOR_V/GLITCH_CEILING_V note). None (no reading) is not a glitch -
+    it's honest 'unknown' - so it returns False here and is handled separately
+    by callers (kept as-is / left to the ADC fallback)."""
+    return voltage is not None and GLITCH_FLOOR_V <= voltage <= GLITCH_CEILING_V
+
 
 def battery_percent(voltage):
     """Rough state-of-charge % from pack voltage (linear, clamped)."""
@@ -93,9 +115,15 @@ def read_battery_adc():
     Enable with HEALTH_BATTERY_ADC=1 for setups without world_state."""
     try:
         from robot_hat import ADC
-        return round(ADC("A4").read() * 3.3 / 4095 * 3, 2)
+        v = round(ADC("A4").read() * 3.3 / 4095 * 3, 2)
     except Exception:
         return None
+    # A momentary 0.0V (or otherwise impossible) ADC sample is a glitch, not a
+    # flat pack - report None ("unknown") so it can't drive low power.
+    if not plausible_voltage(v):
+        print(f"Health daemon: ignoring implausible ADC battery reading ({v}V)")
+        return None
+    return v
 
 
 def summarize(vitals):
@@ -134,9 +162,18 @@ class HealthDaemon:
 
     def on_world_state(self, payload):
         battery = payload.get("battery") or {}
+        voltage = battery.get("voltage")
+        # Drop a glitch reading (e.g. a spurious 0.0V) outright: don't store it,
+        # don't re-evaluate, and DON'T honor a 'critical' flag arriving with it
+        # - that flag was computed downstream from the very same bad sample, so
+        # trusting it would let the glitch trip low power through the back door.
+        # We simply keep the last good state until a plausible reading lands.
+        if voltage is not None and not plausible_voltage(voltage):
+            print(f"Health daemon: ignoring implausible battery reading ({voltage}V)")
+            return
         with self.lock:
-            if battery.get("voltage") is not None:
-                self.battery_v = battery["voltage"]
+            if voltage is not None:
+                self.battery_v = voltage
             self.battery_critical = bool(battery.get("critical"))
         # React to a battery change immediately, not only on the 30s loop.
         self._evaluate(time.time())

@@ -41,6 +41,13 @@ for _attr in ("Model", "KaldiRecognizer"):
 if not hasattr(sys.modules["picamera2"], "Picamera2"):
     sys.modules["picamera2"].Picamera2 = type("Picamera2", (), {})
 
+# vision_basic calls cv2.setNumThreads() at import time (module level, before
+# any test runs); give the bare cv2 stub a no-op so the module imports off-robot
+# and its pure helpers (e.g. pick_overhead) can be exercised. Tests never touch
+# the real DNN/camera paths.
+if not hasattr(sys.modules["cv2"], "setNumThreads"):
+    sys.modules["cv2"].setNumThreads = lambda *a, **k: None
+
 for _p in (MODULES, LAYER_B):
     if _p not in sys.path:
         sys.path.insert(0, _p)

@@ -92,6 +92,48 @@ class LowPowerStateMachineTest(unittest.TestCase):
         self.d.on_world_state({"battery": {"voltage": 7.6}})
         self.assertFalse(self.d.low_power)
 
+    def test_zero_volt_glitch_does_not_trip_low_power(self):
+        # A healthy reading, then a spurious 0.0V glitch: the glitch must be
+        # ignored, not treated as a dead battery.
+        self.d.on_world_state({"battery": {"voltage": 7.6}})
+        self.assertFalse(self.d.low_power)
+        self.d.on_world_state({"battery": {"voltage": 0.0}})
+        self.assertFalse(self.d.low_power)
+        self.assertEqual(self._low_power_msgs(), [])   # no transition announced
+
+    def test_glitch_keeps_last_good_voltage(self):
+        self.d.on_world_state({"battery": {"voltage": 7.4}})
+        self.d.on_world_state({"battery": {"voltage": 0.0}})     # glitch
+        self.assertEqual(self.d.battery_v, 7.4)                  # unchanged
+        self.assertEqual(self.d._collect()["battery_v"], 7.4)
+
+    def test_glitch_with_critical_flag_is_ignored(self):
+        # 'critical' riding along with a 0.0V glitch is computed from the same
+        # bad sample - it must not force low power.
+        self.d.on_world_state({"battery": {"voltage": 0.0, "critical": True}})
+        self.assertFalse(self.d.low_power)
+        self.assertFalse(self.d.battery_critical)
+
+    def test_implausible_high_reading_ignored(self):
+        self.d.on_world_state({"battery": {"voltage": 7.2}})
+        self.d.on_world_state({"battery": {"voltage": 42.0}})    # impossible spike
+        self.assertEqual(self.d.battery_v, 7.2)
+
+    def test_plausible_voltage_helper(self):
+        self.assertTrue(hd.plausible_voltage(7.4))
+        self.assertTrue(hd.plausible_voltage(hd.BATT_EMPTY_V))
+        self.assertFalse(hd.plausible_voltage(0.0))
+        self.assertFalse(hd.plausible_voltage(1.5))
+        self.assertFalse(hd.plausible_voltage(50.0))
+        self.assertFalse(hd.plausible_voltage(None))
+
+    def test_genuine_low_still_trips_after_glitch(self):
+        # The glitch filter must not swallow a REAL low battery that follows.
+        self.d.on_world_state({"battery": {"voltage": 0.0}})     # glitch, ignored
+        self.assertFalse(self.d.low_power)
+        self.d.on_world_state({"battery": {"voltage": 6.4}})     # real low reading
+        self.assertTrue(self.d.low_power)
+
     def test_collect_shape(self):
         self.d.on_world_state({"battery": {"voltage": 7.4}})
         v = self.d._collect()
