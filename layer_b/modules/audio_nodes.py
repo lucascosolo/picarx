@@ -333,6 +333,12 @@ class AudioNode:
         else:
             self.model = Model(MODEL_PATH)
             self.rec = KaldiRecognizer(self.model, 16000)
+            # Ask Kaldi for per-word confidences alongside the text. The
+            # average rides on every picarx/audio/heard message so the
+            # command routers can tell a clean utterance from a mangled
+            # one - that's the signal behind "should the LLM intent
+            # arbiter take a look at this?" downstream.
+            self.rec.SetWords(True)
 
     # Bypass ALSA's "default" device resolution (which normally hands
     # off to PulseAudio) and target the physical sound card directly.
@@ -508,13 +514,19 @@ class AudioNode:
 
     def _emit_result(self, result_json, now):
         try:
-            text = json.loads(result_json).get("text", "").lower().strip()
+            result = json.loads(result_json)
+            text = result.get("text", "").lower().strip()
         except (json.JSONDecodeError, AttributeError):
             return
         if not text:
             return
-        print(f"Heard locally: '{text}'")
-        self.bus.publish("picarx/audio/heard", {"text": text})
+        # Mean per-word decoder confidence (0-1), present because of
+        # SetWords(True) above; None if Kaldi didn't attach word info.
+        words = result.get("result") or []
+        confidence = (round(sum(w.get("conf", 1.0) for w in words) / len(words), 3)
+                      if words else None)
+        print(f"Heard locally: '{text}' (conf {confidence})")
+        self.bus.publish("picarx/audio/heard", {"text": text, "confidence": confidence})
         # Core local reflex - throttled (see STOP_REFLEX_COOLDOWN) so
         # repeating "stop" doesn't queue a pile of blocking TTS.
         if ("halt" in text or "stop" in text) and (now - self._last_stop_reflex_at) > STOP_REFLEX_COOLDOWN:

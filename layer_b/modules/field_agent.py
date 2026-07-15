@@ -100,6 +100,7 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 from spatial_store import SpatialStore
+import speech_match
 
 import sqlite3
 import json
@@ -132,7 +133,17 @@ WAKE_PHRASES = ("robot", "hey robot", "computer")
 # routes them to their own modules). They must be ignored here so that
 # e.g. "stop radio" reaches the radio instead of tripping the
 # robot-wide "stop". Movement/safety words never appear in this list.
-TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm")
+# "music"/"song" are here because tools_registry now treats them as
+# radio synonyms AND escalates its own unparsed radio-ish utterances -
+# without them here both modules would escalate the same text twice.
+TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
+                 "music", "song")
+
+# After anyone has interacted with the robot (a command, or a wake-
+# phrase chat), keep treating unmatched speech as conversation for this
+# long - so a follow-up question doesn't need "robot ..." again. Kept
+# short: it's a reply window, not an always-open mic to the LLM.
+CONVERSATION_WINDOW_SEC = 45.0
 
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker
@@ -273,6 +284,7 @@ class FieldAgent:
         self.bus = Bus()
         self.lock = threading.Lock()
 
+        self.last_interaction_at = 0.0  # last time speech was clearly for us
         self.explore_mode = False
         self.latest_world = None
         self.face_was_detected = False
@@ -504,19 +516,31 @@ class FieldAgent:
         if not text:
             return
         print(f"Heard: '{text}'")
-        self.handle_voice_command(text)
+        self.handle_voice_command(text,
+                                  confidence=payload.get("confidence"),
+                                  source=payload.get("source"))
 
-    def handle_voice_command(self, text):
+    def handle_voice_command(self, text, confidence=None, source=None):
+        # Substring checks below run against the raw text PLUS its
+        # canonicalized form, so filler never blocks a match and an STT
+        # near-miss ("batery", "radial") still lands on the right word.
+        canon = speech_match.canonicalize(text)
+        match_text = f"{text} {canon}"
+
         # Tool commands belong to tools_registry.py / their tool module.
-        if any(k in text for k in TOOL_KEYWORDS):
+        if any(k in match_text for k in TOOL_KEYWORDS):
             print(f"(tool command, leaving it to the tools registry): '{text}'")
+            self._mark_interaction()
             return
 
         # Only an explicit "explore" starts driving. "start" was too loose -
         # STT mishearing background noise/TV as "start" could auto-launch
         # exploration on its own, which is exactly the unwanted
         # "moves around on boot" behavior. Default state is stationary.
+        # NOTE this checks raw text only, deliberately: motion must never
+        # start off a fuzzy repair, only off the literal word.
         if "explore" in text:
+            self._mark_interaction()
             if not self.explore_mode:
                 self.explore_mode = True
                 self.given_up = False
@@ -528,7 +552,8 @@ class FieldAgent:
                 self.announce("Starting exploration. Let me take a look around first.", force=True)
             return
 
-        if "stop" in text or "halt" in text:
+        if "stop" in match_text or "halt" in match_text:
+            self._mark_interaction()
             if self.explore_mode:
                 self.explore_mode = False
                 self.cancel_intent()
@@ -536,44 +561,82 @@ class FieldAgent:
                 self.announce("Stopping.", force=True)
             return
 
-        if "battery" in text or "charge" in text or "level" in text:
+        if "battery" in match_text or "charge" in match_text or "level" in match_text:
+            self._mark_interaction()
             self.report_battery()
             return
 
-        if "history" in text or "what have you done" in text or "what happened" in text:
+        if "history" in match_text or "what have you done" in text or "what happened" in text:
+            self._mark_interaction()
             self.report_history()
             return
 
-        if "object" in text or "what's around" in text or "whats around" in text or "what do you notice" in text:
+        if "object" in match_text or "what's around" in text or "whats around" in text or "what do you notice" in text:
+            self._mark_interaction()
             self.report_objects()
             return
 
         if "why" in text and ("why did you" in text or text.strip() == "why"):
+            self._mark_interaction()
             self.report_why()
             return
 
-        if "where are you" in text or "map" in text or "places" in text:
+        if "where are you" in text or "map" in match_text or "places" in match_text:
+            self._mark_interaction()
             self.report_map()
             return
 
-        if "what do you see" in text or "status" in text or "report" in text:
+        if "what do you see" in text or "status" in match_text or "report" in match_text:
+            self._mark_interaction()
             self.report_status()
             return
 
-        if "hello" in text or re.search(r"\bhi\b", text):
+        if "hello" in match_text or re.search(r"\bhi\b", text):
+            self._mark_interaction()
             self.announce("Hello! I am ready to chat and explore.", force=True)
             return
 
-        # Nothing above matched a hard command. Only forward to the LLM
-        # chat fallback if a wake phrase was used (see WAKE_PHRASES) -
-        # anything else is dropped, but still printed so you can see
-        # what got heard and tune the wake phrases if something real
-        # is being missed.
+        # Nothing above matched a hard command. Three ways it can still
+        # mean something, tried in order:
+        #   1. wake phrase -> LLM chat (as before);
+        #   2. we're mid-conversation (someone addressed the robot within
+        #      CONVERSATION_WINDOW_SEC) -> LLM chat without the wake word,
+        #      so follow-ups don't need "robot ..." every single time;
+        #   3. it LOOKS like a garbled command (contains robot vocabulary
+        #      yet matched nothing) -> the LLM intent arbiter, which maps
+        #      it onto a known command if it can, and teaches the local
+        #      phrase cache so next time this stays fully on-board.
+        # Everything else is dropped, printed so the misses stay visible.
         remainder = self._strip_wake_phrase(text)
         if remainder is not None:
+            self._mark_interaction()
             self.bus.publish("picarx/audio/unhandled", {"text": remainder})
-        else:
-            print(f"(no wake phrase, not forwarding to chat): '{text}'")
+            return
+
+        if time.time() - self.last_interaction_at < CONVERSATION_WINDOW_SEC:
+            # Deliberately does NOT re-mark the interaction: only wake
+            # phrases and matched commands extend the window. If chatting
+            # itself extended it, a talkative TV within 45s of one real
+            # command would hold the window open (and burn API calls)
+            # indefinitely.
+            print(f"(in-conversation, forwarding without wake phrase): '{text}'")
+            self.bus.publish("picarx/audio/unhandled", {"text": text})
+            return
+
+        # Loop guard: text the arbiter already repaired never re-escalates -
+        # if its best repair still matched nothing, it dies here.
+        if source != "intent_repair" and speech_match.looks_command_like(canon):
+            print(f"(command-shaped but unmatched, escalating to arbiter): '{text}'")
+            self.bus.publish("picarx/audio/uncertain", {
+                "text": text, "confidence": confidence, "from": SOURCE_NAME})
+            return
+
+        print(f"(no wake phrase, not forwarding to chat): '{text}'")
+
+    def _mark_interaction(self):
+        """Speech was clearly directed at the robot - keeps the
+        no-wake-word conversation window (CONVERSATION_WINDOW_SEC) open."""
+        self.last_interaction_at = time.time()
 
     @staticmethod
     def _strip_wake_phrase(text):

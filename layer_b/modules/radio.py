@@ -90,6 +90,18 @@ PLAYER_HEALTHCHECK_SEC = 1.3
 # this long to finish before the player seizes the device. Set to 0 if
 # you switch robot_speaker to a mixing (dmix) PCM so both can overlap.
 TTS_SETTLE_SEC = float(os.environ.get("RADIO_TTS_SETTLE", "2.0"))
+# Streams sometimes die moments AFTER the startup healthcheck passed:
+# the player spends the healthcheck window buffering the NETWORK stream
+# and only then opens the ALSA device - which can still be busy with the
+# tail of our own "Tuning to..." announcement (TTS can also start late
+# when audio_nodes' queue is backed up, so no fixed TTS_SETTLE_SEC value
+# covers every case). The old behavior published "playing", then the
+# watchdog noticed the corpse and flipped the console to "off" a few
+# seconds later - the classic name-flashes-then-off. A death this soon
+# after a successful start now gets quiet automatic restarts (the
+# speaker is free by then) before we give up and report the drop.
+STREAM_STARTUP_GRACE_SEC = 20.0
+STREAM_MAX_AUTO_RETRIES = 2
 
 # Per-player argv builders. Each returns the full command list,
 # pointed at RADIO_ALSA_DEVICE so audio lands on the real speaker.
@@ -133,6 +145,12 @@ class Radio:
         self.index = 0
         self.proc = None
         self._errfile = None
+        # on_command runs on the MQTT callback thread while the watchdog
+        # runs on the main loop; both start/stop the player, so player
+        # state transitions are serialized behind this lock.
+        self.play_lock = threading.RLock()
+        self.started_at = 0.0          # when the current stream last came up
+        self.auto_retries_left = 0     # early-death restarts remaining (watchdog)
         # Live directory search (radio-browser.info): "radio find soft
         # rock" fills search_results and switches mode; "next station"
         # then walks the RESULTS until you hear one you like. Saved
@@ -179,6 +197,14 @@ class Radio:
 
     # ---------- player process ----------
 
+    def _close_errfile(self):
+        if self._errfile is not None:
+            try:
+                self._errfile.close()
+            except OSError:
+                pass
+            self._errfile = None
+
     def _stop_player(self):
         if self.proc is None:
             return
@@ -202,12 +228,7 @@ class Radio:
             except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
                 pass
         self.proc = None
-        if self._errfile is not None:
-            try:
-                self._errfile.close()
-            except OSError:
-                pass
-            self._errfile = None
+        self._close_errfile()
 
     def _start_player(self):
         """Start the player and confirm it's actually alive. Returns
@@ -220,6 +241,7 @@ class Radio:
             env["AUDIODEV"] = RADIO_ALSA_DEVICE
         # stderr to a temp file (not a PIPE): a live player we never
         # read from could fill a pipe buffer and stall; a file can't.
+        self._close_errfile()   # retries would otherwise leak the old one
         self._errfile = tempfile.TemporaryFile()
         try:
             self.proc = subprocess.Popen(
@@ -275,6 +297,10 @@ class Radio:
     # ---------- commands ----------
 
     def on_command(self, payload):
+        with self.play_lock:
+            self._on_command_locked(payload)
+
+    def _on_command_locked(self, payload):
         command = payload.get("command")
         if self.player_build is None:
             self._say("Sorry, I don't have radio capability on this hardware.")
@@ -316,7 +342,13 @@ class Radio:
             self._tune_and_play()
             return
 
-        if command == "next" and self.proc is not None:
+        if command == "next":
+            # Always advance - even when the stream is already dead. The
+            # old `and self.proc is not None` guard meant that after a
+            # station dropped out, "next station" silently re-tuned the
+            # SAME dead station: exactly when you most want to move on,
+            # "next" felt broken. Whether it's playing, just died, or
+            # was stopped, "next" now means the next station.
             if self.mode == "search" and self.search_results:
                 self.search_pos = (self.search_pos + 1) % len(self.search_results)
             else:
@@ -339,7 +371,7 @@ class Radio:
                 self.mode = "saved"
         elif command == "play":
             pass  # resume whatever is current (saved or search result)
-        elif command != "next":
+        else:
             return
 
         self._tune_and_play()
@@ -364,6 +396,8 @@ class Radio:
             ok = self._start_player()
 
         if ok:
+            self.started_at = time.time()
+            self.auto_retries_left = STREAM_MAX_AUTO_RETRIES
             self._publish_state(True)
             # Directory etiquette: report the play so radio-browser
             # learns the station is alive/popular. Off-thread so a slow
@@ -381,6 +415,32 @@ class Radio:
         self._stop_player()
         sys.exit(0)
 
+    def _watchdog_tick(self):
+        """A dead stream (network drop, bad URL, lost the speaker to a
+        TTS announcement) shouldn't pretend to be playing forever - but
+        it also shouldn't give up on the first hiccup. Deaths shortly
+        after startup get quiet restarts (see STREAM_STARTUP_GRACE_SEC);
+        only when the retries are spent do we report the drop."""
+        with self.play_lock:
+            if self.proc is None or self.proc.poll() is None:
+                return
+            err = self._read_err()
+            self.proc = None
+            died_after = time.time() - self.started_at
+            if died_after < STREAM_STARTUP_GRACE_SEC and self.auto_retries_left > 0:
+                self.auto_retries_left -= 1
+                print(f"Radio: stream died {died_after:.1f}s after start "
+                      f"({err or 'no stderr'}) - restarting "
+                      f"({self.auto_retries_left} retries left)")
+                if self._start_player():
+                    self.started_at = time.time()
+                    self._publish_state(True)  # re-assert for late console joins
+                    return
+            print(f"Radio: stream ended/died ({err or 'no stderr'})")
+            self._close_errfile()
+            self._publish_state(False)
+            self._say("The radio stream dropped out.")
+
     def run(self):
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
@@ -389,12 +449,7 @@ class Radio:
               f"{RADIO_ALSA_DEVICE or 'default'}, {len(self.stations)} stations)")
         while True:
             time.sleep(5)
-            # A dead stream (network drop, bad URL) shouldn't pretend to
-            # be playing forever.
-            if self.proc is not None and self.proc.poll() is not None:
-                print("Radio: stream ended/died")
-                self.proc = None
-                self._publish_state(False)
+            self._watchdog_tick()
 
 
 if __name__ == "__main__":

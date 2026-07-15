@@ -106,6 +106,7 @@ from broker_client import Bus
 from picamera2 import Picamera2
 import base64
 import cv2
+import numpy as np
 import time
 
 cv2.setNumThreads(THREAD_LIMIT)
@@ -182,6 +183,151 @@ VOC_CLASSES = [
     "motorbike", "person", "pottedplant", "sheep", "sofa", "train",
     "tvmonitor",
 ]
+
+# ---- optional upgraded detector: YOLOv4-tiny trained on COCO ----
+# The VOC model above only knows 20 classes, which is why half the
+# house gets reported as "bottle"/"sofa"/"tvmonitor" - the SSD is
+# forced to pick its nearest of 20 labels for everything object-shaped.
+# If the three files below exist (run layer_b/setup_coco_detector.sh
+# once to download them - models/ is gitignored, weights don't live in
+# git), vision switches to YOLOv4-tiny with the 80-class COCO label set
+# (adds e.g. couch, bed, laptop, cell phone, book, cup, remote, sink,
+# refrigerator, scissors, teddy bear...). A YOLOv4-tiny pass at 320x320
+# costs roughly 2-3x the SSD pass on a Pi 4 - acceptable because the
+# motion gate + FORCE_DETECT_INTERVAL already keep passes rare, and the
+# per-pass budget is the right place to spend for 4x the vocabulary.
+# Fail-soft: files missing or cv2 too old -> the VOC model runs as before.
+YOLO_DIR = "/home/picarx/layer_b/modules/models/yolov4-tiny"
+YOLO_CFG = f"{YOLO_DIR}/yolov4-tiny.cfg"
+YOLO_WEIGHTS = f"{YOLO_DIR}/yolov4-tiny.weights"
+YOLO_NAMES = f"{YOLO_DIR}/coco.names"
+YOLO_INPUT_SIZE = (320, 320)   # multiple of 32; 320 over 416 to protect the CPU budget
+YOLO_NMS_THRESHOLD = 0.4
+
+
+class CaffeSsdDetector:
+    """The original MobileNet-SSD/VOC pipeline, behind the shared
+    detector contract: detect() -> (found, close_hit) where found is
+    the confidently-labeled boxes and close_hit means ANY detection
+    (labeled confidently or not) fills most of the frame."""
+    name = "MobileNet-SSD (Caffe, 20 VOC classes)"
+
+    def __init__(self):
+        self.net = cv2.dnn.readNetFromCaffe(SSD_PROTOTXT, SSD_WEIGHTS)
+
+    def detect(self, frame, frame_w, frame_h):
+        # Resize first (cheap - CAPTURE_SIZE is already small), then let
+        # blobFromImage's swapRB handle the RGB->BGR conversion on the
+        # now-tiny 300x300 image instead of converting the full frame.
+        blob = cv2.dnn.blobFromImage(
+            cv2.resize(frame, SSD_INPUT_SIZE), 0.007843, SSD_INPUT_SIZE, 127.5, swapRB=True
+        )
+        self.net.setInput(blob)
+        detections = self.net.forward()
+
+        found = []
+        close_hit = False
+        for i in range(detections.shape[2]):
+            confidence = float(detections[0, 0, i, 2])
+            if confidence < CLOSE_OBJECT_MIN_CONFIDENCE:
+                continue
+            class_id = int(detections[0, 0, i, 1])
+            if class_id <= 0:
+                continue
+            box = detections[0, 0, i, 3:7] * [frame_w, frame_h, frame_w, frame_h]
+            # int(...) here, not just .astype(int): numpy int64
+            # scalars aren't JSON-serializable, and json.dumps()
+            # would otherwise blow up the instant any object is
+            # actually detected.
+            x1, y1, x2, y2 = (int(v) for v in box.astype(int))
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame_w, x2), min(frame_h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            area_ratio = ((x2 - x1) * (y2 - y1)) / float(frame_w * frame_h)
+            if area_ratio > CLOSE_OBJECT_AREA_RATIO:
+                close_hit = True
+
+            if class_id >= len(VOC_CLASSES) or confidence < OBJECT_CONFIDENCE_THRESHOLD:
+                continue
+            found.append({
+                "label": VOC_CLASSES[class_id],
+                "confidence": confidence,
+                "bbox": (x1, y1, x2 - x1, y2 - y1),
+            })
+        return found, close_hit
+
+
+class YoloTinyDetector:
+    """YOLOv4-tiny (Darknet) on COCO's 80 classes, same contract as
+    CaffeSsdDetector so run() doesn't care which one is loaded."""
+
+    def __init__(self):
+        with open(YOLO_NAMES) as f:
+            self.classes = [line.strip() for line in f if line.strip()]
+        self.net = cv2.dnn.readNetFromDarknet(YOLO_CFG, YOLO_WEIGHTS)
+        self.out_names = self.net.getUnconnectedOutLayersNames()
+        self.name = f"YOLOv4-tiny (Darknet, {len(self.classes)} COCO classes)"
+
+    def detect(self, frame, frame_w, frame_h):
+        # Darknet models are trained on RGB and the picamera2 frame is
+        # already RGB888, so no channel swap here (unlike the Caffe path).
+        blob = cv2.dnn.blobFromImage(
+            frame, 1 / 255.0, YOLO_INPUT_SIZE, swapRB=False, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.out_names)
+
+        boxes, confidences, class_ids = [], [], []
+        for out in outs:
+            for row in out:
+                scores = row[5:]
+                class_id = int(np.argmax(scores))
+                confidence = float(scores[class_id])
+                if confidence < CLOSE_OBJECT_MIN_CONFIDENCE:
+                    continue
+                cx, cy, w, h = row[0] * frame_w, row[1] * frame_h, \
+                    row[2] * frame_w, row[3] * frame_h
+                x1 = max(0, int(cx - w / 2))
+                y1 = max(0, int(cy - h / 2))
+                x2 = min(frame_w, int(cx + w / 2))
+                y2 = min(frame_h, int(cy + h / 2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                boxes.append([x1, y1, x2 - x1, y2 - y1])
+                confidences.append(confidence)
+                class_ids.append(class_id)
+
+        found = []
+        close_hit = False
+        kept = cv2.dnn.NMSBoxes(boxes, confidences,
+                                CLOSE_OBJECT_MIN_CONFIDENCE, YOLO_NMS_THRESHOLD)
+        for i in np.array(kept).flatten():
+            x, y, w, h = boxes[i]
+            if (w * h) / float(frame_w * frame_h) > CLOSE_OBJECT_AREA_RATIO:
+                close_hit = True
+            if confidences[i] < OBJECT_CONFIDENCE_THRESHOLD or \
+                    class_ids[i] >= len(self.classes):
+                continue
+            found.append({
+                "label": self.classes[class_ids[i]],
+                "confidence": confidences[i],
+                "bbox": (x, y, w, h),
+            })
+        return found, close_hit
+
+
+def _make_detector():
+    if all(os.path.exists(p) for p in (YOLO_CFG, YOLO_WEIGHTS, YOLO_NAMES)):
+        try:
+            return YoloTinyDetector()
+        except Exception as e:
+            print(f"vision: YOLO COCO model present but failed to load ({e}) - "
+                  f"falling back to the VOC model")
+    else:
+        print("vision: COCO model not found (run layer_b/setup_coco_detector.sh "
+              "for 80-class detection) - using the 20-class VOC model")
+    return CaffeSsdDetector()
 
 
 class CentroidTracker:
@@ -289,7 +435,7 @@ def run():
     face_cascade = cv2.CascadeClassifier(
         "/home/picarx/layer_b/modules/cascades/cascades.xml"
     )
-    net = cv2.dnn.readNetFromCaffe(SSD_PROTOTXT, SSD_WEIGHTS)
+    detector = _make_detector()
     tracker = CentroidTracker()
 
     # On-demand console stream state. Toggled from the MQTT callback
@@ -301,7 +447,8 @@ def run():
         print(f"vision stream {'ENABLED' if stream['enabled'] else 'disabled'} (console live view)")
     bus.subscribe(STREAM_CONTROL_TOPIC, on_stream_control)
 
-    print("vision basic module running, publishing to picarx/vision/faces and picarx/vision/objects")
+    print(f"vision basic module running ({detector.name}), "
+          f"publishing to picarx/vision/faces and picarx/vision/objects")
 
     face_streak = 0
     last_object_detect = 0.0
@@ -359,47 +506,7 @@ def run():
 
             if should_run_ssd:
                 last_forced_detect = now
-                # Resize first (cheap - CAPTURE_SIZE is already small),
-                # then let blobFromImage's swapRB handle the RGB->BGR
-                # conversion on the now-tiny 300x300 image instead of
-                # converting the full frame beforehand.
-                blob = cv2.dnn.blobFromImage(
-                    cv2.resize(frame, SSD_INPUT_SIZE), 0.007843, SSD_INPUT_SIZE, 127.5, swapRB=True
-                )
-                net.setInput(blob)
-                detections = net.forward()
-
-                found = []
-                close_hit_this_pass = False
-                for i in range(detections.shape[2]):
-                    confidence = float(detections[0, 0, i, 2])
-                    if confidence < CLOSE_OBJECT_MIN_CONFIDENCE:
-                        continue
-                    class_id = int(detections[0, 0, i, 1])
-                    if class_id <= 0:
-                        continue
-                    box = detections[0, 0, i, 3:7] * [frame_w, frame_h, frame_w, frame_h]
-                    # int(...) here, not just .astype(int): numpy int64
-                    # scalars aren't JSON-serializable, and json.dumps()
-                    # would otherwise blow up the instant any object is
-                    # actually detected.
-                    x1, y1, x2, y2 = (int(v) for v in box.astype(int))
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(frame_w, x2), min(frame_h, y2)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-
-                    area_ratio = ((x2 - x1) * (y2 - y1)) / float(frame_w * frame_h)
-                    if area_ratio > CLOSE_OBJECT_AREA_RATIO and confidence >= CLOSE_OBJECT_MIN_CONFIDENCE:
-                        close_hit_this_pass = True
-
-                    if class_id >= len(VOC_CLASSES) or confidence < OBJECT_CONFIDENCE_THRESHOLD:
-                        continue
-                    found.append({
-                        "label": VOC_CLASSES[class_id],
-                        "confidence": confidence,
-                        "bbox": (x1, y1, x2 - x1, y2 - y1),
-                    })
+                found, close_hit_this_pass = detector.detect(frame, frame_w, frame_h)
 
                 close_streak = close_streak + 1 if close_hit_this_pass else 0
                 close_object = close_streak >= CLOSE_OBJECT_CONFIRM_PASSES

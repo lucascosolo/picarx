@@ -31,6 +31,18 @@ conversation (MEMORY_STALE_GAP), that gap is surfaced to the model as
 context instead of being hidden, so it doesn't continue an hour-old
 sentence as if no time passed.
 
+This module is also the INTENT ARBITER (picarx/audio/uncertain): when
+a router hears something command-shaped it can't parse, the arbiter
+maps it onto a known command with one tiny LLM call and CACHES the
+mapping (data/learned_intents.json), so each new phrasing is bought
+from the API exactly once and handled on-board forever after. Movement
+commands are excluded on principle - motion never starts from an LLM's
+guess. And when someone asks what the robot is looking at (or teaches
+it an object name), a live camera frame is attached to the chat call,
+giving it open-vocabulary sight beyond the on-board detector's labels;
+those exchanges ride picarx/audio/heard into events.db, where
+reflection.py later consolidates them into durable semantic facts.
+
 Requires ANTHROPIC_API_KEY in the environment, same as coach.py. If
 it's missing, or a request fails/times out, this module just replies
 with a short apology instead of raising - a quiet, unhelpful companion
@@ -45,6 +57,7 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 from semantic_store import SemanticStore
+import speech_match
 
 import threading
 import queue
@@ -63,6 +76,65 @@ MEMORY_STALE_GAP = 1800      # seconds of silence before a gap is worth mentioni
 
 COMPANION_MODEL = os.environ.get("COMPANION_MODEL", "claude-sonnet-5")
 
+# ---------- intent arbiter (picarx/audio/uncertain) ----------
+# The routers escalate command-shaped utterances they couldn't parse
+# ("could you put the radio on for me?", a mangled "next station").
+# The arbiter maps them onto a KNOWN command via a small, cheap LLM
+# call - and remembers each successful mapping in a local phrase cache,
+# so a phrasing only ever costs one API call in the robot's lifetime:
+# afterward it's handled on-board like a native command. That's the
+# learning loop: the LLM is the teacher, the cache is what was learned.
+INTENT_MODEL = os.environ.get("INTENT_MODEL", "claude-haiku-4-5-20251001")
+LEARNED_INTENTS_PATH = f"{DATA_DIR}/learned_intents.json"
+LEARNED_INTENTS_MAX = 300        # oldest-used entries beyond this get evicted
+INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls
+INTENT_TIMEOUT = 6.0
+INTENT_MAX_TOKENS = 80
+
+# Commands the arbiter may emit. Deliberately EXCLUDES "explore" and
+# any movement: motion must only ever start from the literal spoken
+# word through field_agent's strict local path, never from an LLM's
+# guess about a garbled transcript.
+ALLOWED_INTENTS = {
+    "stop", "battery", "status", "history", "objects", "map", "why",
+    "hello", "play radio", "stop radio", "next station",
+    "what's playing", "list stations",
+}
+ALLOWED_INTENT_PREFIXES = ("tune to ", "radio find ", "station ")
+
+INTENT_SYSTEM_PROMPT = """You repair garbled voice-command transcripts for a small robot car.
+The transcript comes from an offline speech recognizer and may contain misheard words.
+
+Known commands: stop, battery, status, history, objects, map, why, hello, play radio,
+stop radio, next station, what's playing, list stations, tune to <number>,
+radio find <keywords>, station <name>.
+
+Reply with JSON only, one of:
+{"command": "<one known command, with its parameter filled in if it takes one>"}
+  - only if the transcript was clearly an attempt at that command
+{"chat": true}   - it was speech directed at the robot, but not a command
+{"ignore": true} - background noise, TV, or speech not meant for the robot
+
+NEVER return a movement command: requests to explore, drive, turn, or go somewhere
+must be answered with {"chat": true}, not a command."""
+
+# ---------- camera-grounded chat ----------
+# When someone asks the robot what it's looking at (or teaches it a new
+# object: "remember this is a watering can"), attach a live camera
+# frame to the LLM call so the reply is grounded in ACTUAL sight, not
+# the 20 labels the on-board detector knows. Frames come from
+# vision_basic.py's on-demand stream (same one the web console uses).
+VISION_STREAM_CONTROL = "picarx/vision/stream_control"
+VISION_FRAME_TOPIC = "picarx/vision/frame"
+FRAME_FRESH_SEC = 2.0            # a frame this recent is "now" - reuse it
+FRAME_WAIT_SEC = 4.0             # how long to wait for a requested frame
+CAMERA_TRIGGERS = (
+    "what is this", "what's this", "what is that", "what do you see",
+    "what are you looking at", "look at this", "what am i holding",
+    "can you see", "take a look", "remember this", "learn this",
+    "what does this look like",
+)
+
 SYSTEM_PROMPT = """You are the voice and personality of a small autonomous robot car (PiCar-X).
 You are friendly, a little playful, and curious about the world you're rolling around in.
 
@@ -80,6 +152,11 @@ safety-critical command system handles "explore", "stop", "status", "objects",
 "history", and "battery". If someone asks you to move, stop, explore, or asks a
 question one of those commands already answers, tell them briefly to just say that
 word directly instead of trying to comply here yourself.
+
+Some messages include a photo: that is what you see through your camera RIGHT NOW.
+Use it naturally - describe what's actually in it when asked what you see or what
+something is. If someone teaches you a name for a thing ("remember, this is my
+watering can"), acknowledge it and use their name for it from then on.
 
 Your conversation history survives your own restarts, so earlier messages in this
 conversation may be from before you rebooted. Treat that history as a real memory
@@ -102,6 +179,12 @@ class Companion:
         # Read-only view of what reflection.py has learned; fail-soft
         # (returns [] until the first reflection has ever run).
         self.semantic = SemanticStore(readonly=True)
+        # Intent arbiter state
+        self.learned_intents = self._load_learned_intents()
+        self.last_repair_at = 0.0
+        # Latest camera frame (base64 JPEG) seen on the bus, if any
+        self.latest_frame_b64 = None
+        self.latest_frame_at = 0.0
 
     # ---------- memory persistence ----------
 
@@ -132,6 +215,53 @@ class Companion:
             f.write(snapshot)
         os.replace(tmp_path, COMPANION_MEMORY_PATH)
 
+    # ---------- learned intent cache ----------
+
+    def _load_learned_intents(self):
+        try:
+            with open(LEARNED_INTENTS_PATH) as f:
+                cache = json.load(f)
+            print(f"Companion: {len(cache)} learned phrases loaded")
+            return cache
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Companion: failed to load learned intents, starting fresh: {e}")
+            return {}
+
+    def _save_learned_intents(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with self.lock:
+            if len(self.learned_intents) > LEARNED_INTENTS_MAX:
+                keep = sorted(self.learned_intents.items(),
+                              key=lambda kv: kv[1].get("last", 0),
+                              reverse=True)[:LEARNED_INTENTS_MAX]
+                self.learned_intents = dict(keep)
+            snapshot = json.dumps(self.learned_intents, indent=1)
+        tmp_path = f"{LEARNED_INTENTS_PATH}.tmp"
+        with open(tmp_path, "w") as f:
+            f.write(snapshot)
+        os.replace(tmp_path, LEARNED_INTENTS_PATH)
+
+    def _dispatch_repaired(self, command, original_text, learned):
+        """Re-inject a repaired command as if it had been heard cleanly.
+        source=intent_repair is the routers' loop guard - repaired text
+        that STILL matches nothing gets dropped, never re-escalated."""
+        print(f"Companion arbiter: '{original_text}' -> '{command}'"
+              f"{' (from phrase cache, no API)' if learned else ''}")
+        self.bus.publish("picarx/audio/heard",
+                         {"text": command, "source": "intent_repair"})
+        self.bus.publish("picarx/decision", {
+            "source": "companion", "kind": "intent_repair",
+            "choice": {"command": command, "cached": learned},
+            "reason": f"unparsed utterance: '{original_text}'", "ts": time.time()})
+
+    @staticmethod
+    def _intent_allowed(command):
+        return (command in ALLOWED_INTENTS or
+                any(command.startswith(p) and len(command) > len(p)
+                    for p in ALLOWED_INTENT_PREFIXES))
+
     # ---------- inbound ----------
 
     def on_world_state(self, payload):
@@ -141,7 +271,39 @@ class Companion:
     def on_unhandled(self, payload):
         text = (payload.get("text") or "").strip()
         if text:
-            self.work_queue.put(text)
+            self.work_queue.put(("chat", text))
+
+    def on_frame(self, payload):
+        b64 = payload.get("jpeg")
+        if b64:
+            with self.lock:
+                self.latest_frame_b64 = b64
+                self.latest_frame_at = time.time()
+
+    def on_uncertain(self, payload):
+        """A router escalated a command-shaped utterance it couldn't
+        parse. Cheap path first: the learned phrase cache handles it
+        with zero network. Only a genuinely new phrasing costs an API
+        call - and its answer feeds the cache for next time."""
+        text = (payload.get("text") or "").strip()
+        if not text:
+            return
+        key = speech_match.canonicalize(text)
+        with self.lock:
+            entry = self.learned_intents.get(key)
+            if entry:
+                entry["count"] = entry.get("count", 0) + 1
+                entry["last"] = time.time()
+        if entry:
+            self._dispatch_repaired(entry["command"], text, learned=True)
+            self._save_learned_intents()
+            return
+        now = time.time()
+        if now - self.last_repair_at < INTENT_REPAIR_COOLDOWN:
+            print(f"Companion arbiter: cooling down, dropping '{text}'")
+            return
+        self.last_repair_at = now
+        self.work_queue.put(("repair", text))
 
     # ---------- Anthropic call ----------
 
@@ -210,6 +372,78 @@ class Companion:
             span = f"{minutes / 60.0:.1f} hours"
         return f"[picked back up after {span} of silence]\n"
 
+    def _repair_intent(self, text):
+        """One strict, tiny LLM call: map a garbled utterance onto a
+        known command (cached for next time), route it to chat, or
+        drop it as noise. Fail-soft: any error just drops the text."""
+        client = self._get_client()
+        if client is None:
+            return
+        try:
+            response = client.messages.create(
+                model=INTENT_MODEL,
+                max_tokens=INTENT_MAX_TOKENS,
+                system=INTENT_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": f"Transcript: {text}"}],
+                timeout=INTENT_TIMEOUT,
+            )
+            raw = "".join(b.text for b in response.content
+                          if getattr(b, "type", None) == "text").strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            verdict = json.loads(raw)
+        except Exception as e:
+            print(f"Companion arbiter: repair failed ({e}), dropping '{text}'")
+            return
+
+        command = (verdict.get("command") or "").strip().lower() \
+            if isinstance(verdict, dict) else ""
+        if command and self._intent_allowed(command):
+            with self.lock:
+                self.learned_intents[speech_match.canonicalize(text)] = {
+                    "command": command, "count": 1, "last": time.time()}
+            self._save_learned_intents()
+            self._dispatch_repaired(command, text, learned=False)
+        elif isinstance(verdict, dict) and verdict.get("chat"):
+            self._handle_utterance(text)
+        else:
+            # ignore verdict, disallowed command, or junk output - all
+            # end the same way: silently not acting on garbled audio.
+            print(f"Companion arbiter: no action for '{text}' ({verdict})")
+
+    # ---------- camera ----------
+
+    def _get_camera_frame(self):
+        """Base64 JPEG of what the camera sees right now, or None.
+        Reuses a fresh frame if one is already flowing (e.g. the web
+        console's live view is open) so we don't fight over the stream
+        control topic; otherwise asks vision for a brief burst."""
+        now = time.time()
+        with self.lock:
+            if self.latest_frame_b64 and now - self.latest_frame_at < FRAME_FRESH_SEC:
+                return self.latest_frame_b64
+        self.bus.publish(VISION_STREAM_CONTROL, {"enabled": True})
+        try:
+            deadline = now + FRAME_WAIT_SEC
+            while time.time() < deadline:
+                time.sleep(0.2)
+                with self.lock:
+                    if self.latest_frame_at > now:
+                        return self.latest_frame_b64
+            print("Companion: no camera frame arrived in time")
+            return None
+        finally:
+            self.bus.publish(VISION_STREAM_CONTROL, {"enabled": False})
+
+    @staticmethod
+    def _wants_camera(text):
+        lowered = text.lower()
+        return any(t in lowered for t in CAMERA_TRIGGERS)
+
+    # ---------- chat ----------
+
     def _handle_utterance(self, text):
         client = self._get_client()
         if client is None:
@@ -220,7 +454,21 @@ class Companion:
         with self.lock:
             messages = list(self.history)
         gap_note = self._gap_note(now)
-        messages = messages + [{"role": "user", "content": f"{gap_note}[current status: {self._context_blurb()}]\n{text}"}]
+        user_text = f"{gap_note}[current status: {self._context_blurb()}]\n{text}"
+        # Ground "what is this?"-style questions (and taught objects) in
+        # an actual camera frame - open-vocabulary sight via the LLM,
+        # not the fixed label set of the on-board detector.
+        content = user_text
+        if self._wants_camera(text):
+            frame_b64 = self._get_camera_frame()
+            if frame_b64:
+                content = [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg",
+                        "data": frame_b64}},
+                    {"type": "text", "text": user_text},
+                ]
+        messages = messages + [{"role": "user", "content": content}]
 
         try:
             response = client.messages.create(
@@ -253,16 +501,21 @@ class Companion:
 
     def _worker_loop(self):
         while True:
-            text = self.work_queue.get()
+            kind, text = self.work_queue.get()
             try:
-                self._handle_utterance(text)
+                if kind == "repair":
+                    self._repair_intent(text)
+                else:
+                    self._handle_utterance(text)
             except Exception as e:
-                print(f"Companion: error handling utterance: {e}")
+                print(f"Companion: error handling {kind} '{text}': {e}")
 
     # ---------- main loop ----------
 
     def run(self):
         self.bus.subscribe("picarx/audio/unhandled", self.on_unhandled)
+        self.bus.subscribe("picarx/audio/uncertain", self.on_uncertain)
+        self.bus.subscribe(VISION_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 
         for _ in range(WORKER_THREADS):

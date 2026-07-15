@@ -29,6 +29,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import speech_match
 
 import re
 import time
@@ -123,8 +124,12 @@ def _find_payload(m, text):
     return {"command": "find", "keywords": " ".join(words)}
 
 
+# Patterns run against speech_match.canonicalize()d text ("play the
+# radio for me please" arrives here as "play radio"), so they only need
+# to cover meaningful word variants, not filler permutations.
 RULES = [
-    (re.compile(r"\b(?:stop|pause|turn off|kill)\b.*\bradio\b|\bradio off\b"),
+    (re.compile(r"\b(?:stop|pause|turn off|shut off|kill)\b.*\b(?:radio|music)\b|"
+                r"\b(?:radio|music) off\b"),
      "picarx/tools/radio", lambda m, t: {"command": "stop"}),
     # Live directory search: needs a find/search word AND radio/station
     # in the utterance ("radio find soft rock", "find me a jazz station").
@@ -135,7 +140,9 @@ RULES = [
      "picarx/tools/radio", lambda m, t: {"command": "status"}),
     (re.compile(r"\blist\b.*\bstations?\b|\bwhat stations\b"),
      "picarx/tools/radio", lambda m, t: {"command": "list"}),
-    (re.compile(r"\b(?:next|change|switch)\b.*\b(?:station|radio)\b"),
+    (re.compile(r"\b(?:next|change|switch|skip|another|different)\b.*"
+                r"\b(?:station|radio|song|music)\b|"
+                r"\b(?:station|song)\b.*\b(?:next|skip)\b"),
      "picarx/tools/radio", lambda m, t: {"command": "next"}),
     # Tune to a frequency/dial: needs a tuning word AND a number.
     (re.compile(r"\b(?:tune|station|frequency|dial|fm|to)\b.*\d|"
@@ -144,7 +151,8 @@ RULES = [
                 r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
                 r"eighty|ninety|hundred|oh|zero)\b"),
      "picarx/tools/radio", _tune_payload),
-    (re.compile(r"\b(?:play|start)\b.*\bradio\b|\bradio on\b"),
+    (re.compile(r"\b(?:play|start|put on)\b.*\b(?:radio|music|tunes)\b|"
+                r"\b(?:radio|music) on\b"),
      "picarx/tools/radio", lambda m, t: {"command": "play"}),
     # Named station: "station <name>" (only when it's not a number).
     (re.compile(r"\bstation\s+([a-z][a-z\s]*)"),
@@ -171,30 +179,54 @@ class ToolsRegistry:
         self.bus.publish("picarx/tools/available", {
             "tools": TOOL_DESCRIPTIONS, "ts": time.time()})
 
+    # Vocabulary that marks an utterance as radio-intent even when no
+    # rule managed to parse it - those go to the LLM intent arbiter
+    # (companion.py) instead of vanishing.
+    _RADIO_WORDS = ("radio", "station", "stations", "tune", "dial",
+                    "frequency", "music")
+
     def on_heard(self, payload):
         text = (payload.get("text") or "").lower().strip()
         if not text:
             return
-        if "what tools" in text or "list tools" in text:
+        # Match on the canonicalized form ("play the radio for me
+        # please" -> "play radio", "play the radial" -> "play radio"),
+        # but keep the raw text for logs - canonical text is lossy.
+        canon = speech_match.canonicalize(text)
+        if "what tools" in canon or "list tools" in canon:
             self.publish_available()
             names = ", ".join(t["say"] for t in TOOL_DESCRIPTIONS)
             self.bus.publish("picarx/audio/speak", {
                 "text": f"I can do: {names}.", "ts": time.time()})
             return
         for pattern, topic, build in RULES:
-            m = pattern.search(text)
+            m = pattern.search(canon)
             if not m:
                 continue
-            command = build(m, text)
+            command = build(m, canon)
             if command is None:
                 continue  # shape matched but params didn't - try next rule
-            print(f"Tools registry: '{text}' -> {topic} {command}")
+            print(f"Tools registry: '{text}' (as '{canon}') -> {topic} {command}")
             self.bus.publish(topic, command)
             self.bus.publish("picarx/decision", {
                 "source": "tools_registry", "kind": "tool_invocation",
                 "choice": {"topic": topic, **command},
                 "reason": f"voice command matched: '{text}'", "ts": time.time()})
             return
+        # No rule fired, but the utterance clearly TRIED to be a radio
+        # command ("could you put the radio louder maybe"). Escalate to
+        # the intent arbiter - unless this text already IS the arbiter's
+        # repaired output, in which case dropping it here is the loop
+        # guard that keeps repair from recursing.
+        # Substring on purpose, mirroring field_agent's TOOL_KEYWORDS
+        # deferral: any text field_agent leaves to us ("...radial...")
+        # must either route or escalate here - never fall through both.
+        if payload.get("source") != "intent_repair" and \
+                any(w in canon for w in self._RADIO_WORDS):
+            print(f"Tools registry: unparsed radio-ish utterance -> arbiter: '{text}'")
+            self.bus.publish("picarx/audio/uncertain", {
+                "text": text, "confidence": payload.get("confidence"),
+                "from": "tools_registry"})
 
     def run(self):
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
