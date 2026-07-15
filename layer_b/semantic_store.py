@@ -17,6 +17,17 @@ Ownership rules (mirrors the events.db convention):
 Facts are deduplicated on (subject, fact): re-learning the same thing
 bumps seen_count/updated_at instead of inserting a duplicate row, so
 repeated reflections converge instead of accumulating noise.
+
+Fact lifecycle: rows are never deleted. `status` is 'active' until a
+later, contradicting fact supersedes it, at which point it flips to
+'superseded' and `superseded_by_id` points at the replacement row.
+Readers only see active facts unless they ask for history with
+include_superseded=True.
+
+Schema migrations are additive-only and run when the writer opens the
+store; readers on an un-migrated DB fail-soft to [] until reflection.py
+has restarted once, so deploy the writer first (in practice the
+orchestrator restarts everything together).
 """
 import os
 import sqlite3
@@ -24,6 +35,13 @@ import time
 
 DB_DIR = "/home/picarx/layer_b/data"
 DB_PATH = f"{DB_DIR}/semantic.db"
+
+# Passive time-decay, applied at READ time only (never written back):
+# a fact or pattern untouched for a full week loses 10% of its returned
+# confidence per week of staleness. Re-learning it (which bumps
+# updated_at / last_seen) restores full confidence for free.
+DECAY_WEEK_SEC = 7 * 86400
+DECAY_PER_WEEK = 0.9
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -35,6 +53,8 @@ CREATE TABLE IF NOT EXISTS facts (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     seen_count INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active',
+    superseded_by_id INTEGER,
     UNIQUE(subject, fact)
 );
 CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
@@ -64,7 +84,21 @@ class SemanticStore:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.executescript(_SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self):
+        """Additive, idempotent upgrades for DBs created before a column
+        existed in _SCHEMA (CREATE TABLE IF NOT EXISTS won't touch them).
+        ALTER TABLE ADD COLUMN is O(1) in SQLite - no table rewrite."""
+        cols = {row[1] for row in
+                self.conn.execute("PRAGMA table_info(facts)").fetchall()}
+        if "status" not in cols:
+            self.conn.execute(
+                "ALTER TABLE facts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        if "superseded_by_id" not in cols:
+            self.conn.execute(
+                "ALTER TABLE facts ADD COLUMN superseded_by_id INTEGER")
 
     # ---------- reader side (fail-soft) ----------
 
@@ -85,21 +119,46 @@ class SemanticStore:
         except sqlite3.Error:
             return []  # DB missing/locked/etc - reader degrades to "no memories"
 
-    def recent_facts(self, limit=5):
-        """Most recently reinforced facts, best first."""
-        rows = self._query(
-            "SELECT subject, fact, confidence, seen_count FROM facts "
-            "ORDER BY updated_at DESC LIMIT ?", (limit,))
-        return [{"subject": s, "fact": f, "confidence": c, "seen_count": n}
-                for s, f, c, n in rows]
+    @staticmethod
+    def _decayed(confidence, last_touched, now):
+        """Read-time confidence after passive staleness decay."""
+        weeks_stale = int(max(0.0, now - last_touched) // DECAY_WEEK_SEC)
+        if weeks_stale <= 0:
+            return confidence
+        return confidence * (DECAY_PER_WEEK ** weeks_stale)
 
-    def facts_for(self, subject, limit=5):
+    _FACT_COLS = ("id, subject, fact, confidence, seen_count, updated_at, "
+                  "status, superseded_by_id")
+
+    @classmethod
+    def _fact_dict(cls, row, now):
+        fid, subject, fact, confidence, seen, updated_at, status, sup = row
+        return {"id": fid, "subject": subject, "fact": fact,
+                "confidence": cls._decayed(confidence, updated_at, now),
+                "seen_count": seen, "status": status, "superseded_by_id": sup}
+
+    def recent_facts(self, limit=5, include_superseded=False):
+        """Most recently reinforced facts, best first."""
+        where = "" if include_superseded else "WHERE status = 'active' "
         rows = self._query(
-            "SELECT subject, fact, confidence, seen_count FROM facts "
-            "WHERE subject = ? ORDER BY confidence DESC, updated_at DESC LIMIT ?",
-            (subject, limit))
-        return [{"subject": s, "fact": f, "confidence": c, "seen_count": n}
-                for s, f, c, n in rows]
+            f"SELECT {self._FACT_COLS} FROM facts "
+            f"{where}ORDER BY updated_at DESC LIMIT ?", (limit,))
+        now = time.time()
+        return [self._fact_dict(r, now) for r in rows]
+
+    def facts_for(self, subject, limit=5, include_superseded=False):
+        # No LIMIT in SQL: decay can reorder, so rank on decayed
+        # confidence in Python (stable sort keeps the SQL updated_at
+        # tiebreak). Per-subject volumes are small.
+        status_sql = "" if include_superseded else "AND status = 'active' "
+        rows = self._query(
+            f"SELECT {self._FACT_COLS} FROM facts "
+            f"WHERE subject = ? {status_sql}"
+            f"ORDER BY confidence DESC, updated_at DESC", (subject,))
+        now = time.time()
+        facts = [self._fact_dict(r, now) for r in rows]
+        facts.sort(key=lambda f: f["confidence"], reverse=True)
+        return facts[:limit]
 
     def fact_count(self):
         rows = self._query("SELECT COUNT(*) FROM facts")
@@ -108,13 +167,22 @@ class SemanticStore:
     def top_patterns(self, limit=5, max_age_sec=7 * 86400):
         """Mined event-sequence patterns, freshest + most confident
         first. Old patterns age out of the results (the world changes;
-        the roadmap's spurious-correlation mitigation) but stay stored."""
+        the roadmap's spurious-correlation mitigation) but stay stored.
+        Confidence is staleness-decayed at read time like facts are
+        (only visible when callers widen max_age_sec past the decay
+        grace week). Patterns have no status column: a re-mine REPLACES
+        the row outright, so there is never history to supersede."""
         rows = self._query(
-            "SELECT condition, outcome, frequency, confidence FROM patterns "
-            "WHERE last_seen >= ? ORDER BY confidence DESC, frequency DESC LIMIT ?",
-            (time.time() - max_age_sec, limit))
-        return [{"condition": c, "outcome": o, "frequency": f, "confidence": conf}
-                for c, o, f, conf in rows]
+            "SELECT condition, outcome, frequency, confidence, last_seen "
+            "FROM patterns WHERE last_seen >= ? "
+            "ORDER BY confidence DESC, frequency DESC",
+            (time.time() - max_age_sec,))
+        now = time.time()
+        patterns = [{"condition": c, "outcome": o, "frequency": f,
+                     "confidence": self._decayed(conf, last_seen, now)}
+                    for c, o, f, conf, last_seen in rows]
+        patterns.sort(key=lambda p: (p["confidence"], p["frequency"]), reverse=True)
+        return patterns[:limit]
 
     # ---------- writer side (reflection.py only) ----------
 

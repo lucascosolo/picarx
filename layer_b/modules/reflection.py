@@ -6,9 +6,11 @@ few durable semantic facts, using ONE batched LLM call per reflection
 window instead of reasoning in the hot path.
 
 How it stays cheap (deliberate - preserve all of these):
-  - Only runs while the robot is IDLE: any movement intent, coach
-    query, or heard speech resets the idle clock. Real-time behavior
-    is never competing with reflection for CPU or attention.
+  - LLM reflection only runs while the robot is IDLE: any movement
+    intent, coach query, or heard speech resets the idle clock.
+    Real-time behavior is never competing with the API call for CPU
+    or attention. (Offline analysis has a looser trigger - see
+    try_analyze - because it costs no API call and little CPU.)
   - Hard cooldown between reflections (REFLECTION_COOLDOWN) plus a
     minimum batch size (MIN_NEW_EVENTS): quiet days produce zero API
     calls, busy days produce at most a couple.
@@ -49,8 +51,12 @@ import threading
 EVENTS_DB_PATH = "/home/picarx/layer_b/data/events.db"
 
 # Non-LLM analysis (pattern mining + spatial connectivity facts) is
-# pure Python but still only worth re-running occasionally.
+# pure Python but still only worth re-running occasionally. Unlike LLM
+# reflection it does not wait for an idle window: it also fires once
+# enough new events have accumulated, so statistics keep consolidating
+# on a busy robot that never goes quiet.
 ANALYSIS_COOLDOWN = 1800.0
+ANALYSIS_MIN_NEW_EVENTS = 20
 # An edge traversed at least this often becomes a durable layout fact.
 CONNECTIVITY_MIN_TRAVERSALS = 2
 
@@ -242,18 +248,42 @@ class Reflection:
 
     # ---------- offline analysis (pure Python, no LLM, no API key) ----------
 
+    def _count_new_events(self, since_id):
+        """(count, max_id) of events logged after since_id - any topic,
+        since pattern mining scans the full stream, not just the digest
+        topics. Fail-soft: unreadable events.db counts as nothing new."""
+        try:
+            conn = sqlite3.connect(f"file:{EVENTS_DB_PATH}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return 0, since_id
+        try:
+            count, max_id = conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), ?) FROM events WHERE id > ?",
+                (since_id, since_id)).fetchone()
+            return count, max_id
+        except sqlite3.Error:
+            return 0, since_id
+        finally:
+            conn.close()
+
     def try_analyze(self, now=None):
-        """Pattern mining + spatial-connectivity facts. Runs on the
-        same idle windows as LLM reflection but does NOT need a key -
-        a robot with no API access still consolidates statistics.
-        Returns True if it ran (for tests)."""
+        """Pattern mining + spatial-connectivity facts. Does NOT need a
+        key - a robot with no API access still consolidates statistics.
+
+        Trigger (decoupled from LLM reflection): runs when the robot is
+        idle OR when ANALYSIS_MIN_NEW_EVENTS have landed since the last
+        analysis, whichever comes first, so cheap mining continues in
+        the background of a busy day. ANALYSIS_COOLDOWN rate-limits both
+        paths. Returns True if it ran (for tests)."""
         now = now if now is not None else time.time()
-        with self.lock:
-            idle_for = now - self.last_activity
-        if idle_for < IDLE_AFTER_SEC:
-            return False
         last_run = float(self.store.get_meta("last_analysis_at", 0) or 0)
         if now - last_run < ANALYSIS_COOLDOWN:
+            return False
+        with self.lock:
+            idle_for = now - self.last_activity
+        since_id = int(self.store.get_meta("last_analyzed_event_id", 0) or 0)
+        new_events, max_event_id = self._count_new_events(since_id)
+        if idle_for < IDLE_AFTER_SEC and new_events < ANALYSIS_MIN_NEW_EVENTS:
             return False
 
         patterns = pattern_miner.mine_patterns(EVENTS_DB_PATH)
@@ -275,6 +305,7 @@ class Reflection:
                 connectivity += 1
 
         self.store.set_meta("last_analysis_at", now)
+        self.store.set_meta("last_analyzed_event_id", max_event_id)
         if patterns or connectivity:
             print(f"Reflection: offline analysis stored {len(patterns)} patterns, "
                   f"{connectivity} connectivity facts")
@@ -283,7 +314,10 @@ class Reflection:
     # ---------- one reflection attempt ----------
 
     def try_reflect(self, now=None):
-        """Returns True if a reflection actually ran (for tests)."""
+        """LLM reflection - stays strictly idle-gated (IDLE_AFTER_SEC)
+        plus REFLECTION_COOLDOWN; only try_analyze got the looser
+        event-count trigger. Returns True if a reflection ran (for
+        tests)."""
         now = now if now is not None else time.time()
         with self.lock:
             idle_for = now - self.last_activity
@@ -330,7 +364,8 @@ class Reflection:
         self.bus.subscribe("picarx/audio/heard", self.on_activity)
 
         print(f"Reflection active ({self.store.fact_count()} facts known), "
-              f"reflecting when idle {IDLE_AFTER_SEC:.0f}s+")
+              f"reflecting when idle {IDLE_AFTER_SEC:.0f}s+, analyzing when idle "
+              f"or every {ANALYSIS_MIN_NEW_EVENTS} events")
         while True:
             time.sleep(CHECK_INTERVAL)
             try:
