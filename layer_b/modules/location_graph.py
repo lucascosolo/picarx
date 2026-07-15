@@ -16,6 +16,15 @@ scan (changed=false when it's the same place re-confirmed), so
 field_agent can tag its coach queries and decisions with WHERE they
 happened without doing any spatial reasoning itself.
 
+Belief revision for places (the map half of the hypothesis loop): it
+also listens on picarx/exploration/hypothesis. When field_agent's
+VetoProneLocationProbe physically re-tests a veto-prone spot and the
+safety daemon stays silent ("maybe_clear"), this module eases that
+location's veto_count back down - so a place the robot learned to fear
+can be un-feared once the obstacle is actually gone. The write stays
+here because location_graph is the SOLE writer to spatial.db;
+field_agent only reports the physical finding, it never writes the map.
+
 Deliberately conservative (per the rollout-risk notes): location
 inference happens ONLY on a completed scan - never inferred from
 wander progress or single detections - so a bad frame can't teleport
@@ -35,6 +44,17 @@ from spatial_store import SpatialStore, fingerprint_from_scan
 
 import time
 import threading
+
+# The hypothesis-outcome contract from field_agent's VetoProneLocationProbe
+# (see modules/field_agent.py). Matching on the question string keeps this
+# decoupled from the other hypothesis types that share the topic.
+VETO_PRONE_QUESTION = "is_veto_prone_area_still_blocked"
+MAYBE_CLEAR = "maybe_clear"
+# How much to ease veto_count per confirmed clear re-test. 1 = gradual:
+# with the veto-prone threshold at 3, a place needs a few clean passes to
+# stop being treated as veto-prone, so one lucky window can't erase a real
+# recurring hazard.
+VETO_RELAX_STEP = 1
 
 
 class LocationGraph:
@@ -91,12 +111,38 @@ class LocationGraph:
         if loc_id is not None:
             self.store.note_coach_outcome(loc_id, bool(payload.get("success")))
 
+    # ---------- inbound: physical hypothesis outcomes (map decay) ----------
+
+    def on_hypothesis(self, payload):
+        """A VetoProneLocationProbe resolving 'maybe_clear' means the spot
+        that kept vetoing us re-tested clean - ease its veto_count so the
+        robot can eventually stop treating it as blocked. Other hypothesis
+        types (and 'still_blocked') are ignored. Fail-soft on a payload
+        missing the location id."""
+        if payload.get("question") != VETO_PRONE_QUESTION:
+            return
+        if payload.get("resolution") != MAYBE_CLEAR:
+            return
+        # Prefer the explicit location_id in the outcome detail; fall back
+        # to the location-context block field_agent stamps on every probe.
+        loc_id = payload.get("location_id")
+        if loc_id is None:
+            loc_id = (payload.get("location") or {}).get("id")
+        if loc_id is None:
+            return
+        self.store.relax_veto(loc_id, VETO_RELAX_STEP)
+        loc = self.store.get_location(loc_id)
+        remaining = loc["veto_count"] if loc else "?"
+        print(f"Location graph: {loc['label'] if loc else loc_id} re-tested clear - "
+              f"eased veto_count to {remaining}")
+
     # ---------- main loop ----------
 
     def run(self):
         self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
+        self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
         print(f"Location graph active ({self.store.location_count()} places known)")
         while True:
             time.sleep(5)

@@ -234,6 +234,21 @@ class SpatialStore:
             "UPDATE locations SET veto_count = veto_count + 1 WHERE id = ?", (location_id,))
         self.conn.commit()
 
+    def relax_veto(self, location_id, amount=1):
+        """Ease a place's veto_count back DOWN (floored at 0), the inverse
+        of note_veto. Called when field_agent's VetoProneLocationProbe
+        physically re-tests a once-blocked spot and the safety daemon stays
+        silent ('maybe_clear') - the robot unlearning its fear of a place as
+        the environment changes. Gradual on purpose: it takes a few clean
+        re-tests to drop a place below the veto-prone threshold, so one
+        lucky pass never erases a real, recurring hazard. Writer-only, same
+        single-writer rule as note_veto (location_graph.py only)."""
+        self._assert_writer()
+        self.conn.execute(
+            "UPDATE locations SET veto_count = MAX(0, veto_count - ?) WHERE id = ?",
+            (int(amount), location_id))
+        self.conn.commit()
+
     def note_coach_outcome(self, location_id, success):
         self._assert_writer()
         column = "coach_wins" if success else "coach_losses"

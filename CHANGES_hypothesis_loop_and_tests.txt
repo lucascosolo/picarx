@@ -1,0 +1,81 @@
+Close the hypothesis->map loop + off-robot test suite
+=====================================================
+
+BASE: origin/master (has the hypothesis framework already merged).
+
+PART 1 - CLOSE THE LOOP (hypothesis outcome -> map decay)
+---------------------------------------------------------
+When field_agent's VetoProneLocationProbe resolves "maybe_clear", the robot
+has physically re-tested a once-blocked spot and the safety daemon stayed
+silent. That finding now flows back into the map so the robot can UNLEARN
+its fear of a place - while respecting the single-writer rule.
+
+* layer_b/spatial_store.py - new writer method relax_veto(location_id,
+  amount=1): eases veto_count DOWN, floored at 0 (the inverse of note_veto).
+  Writer-only, same _assert_writer guard, so only location_graph can call
+  it. Gradual by design: from a veto_count of 5 it takes three clean
+  re-tests to fall below the veto-prone threshold of 3, so one lucky pass
+  can't erase a real recurring hazard.
+
+* layer_b/modules/location_graph.py - subscribes to
+  picarx/exploration/hypothesis and adds on_hypothesis(). It acts only on
+  question == "is_veto_prone_area_still_blocked" AND resolution ==
+  "maybe_clear" (other hypothesis types and "still_blocked" are ignored),
+  reads the location id from the outcome (falling back to the location
+  context block), and calls store.relax_veto(). location_graph remains the
+  SOLE writer to spatial.db - field_agent only reports the physical
+  finding, it never writes the map.
+
+  Data flow: field_agent probes -> picarx/exploration/hypothesis
+             -> location_graph -> spatial.db veto_count-- -> field_agent's
+             VETO_PRONE_THRESHOLD trigger eventually stops firing there.
+
+PART 2 - OFF-ROBOT TEST SUITE (tests/)
+--------------------------------------
+A dependency-light suite that runs on any machine (no Pi, no hardware, no
+network, no API key). Stdlib unittest, so `python3 -m unittest discover
+tests` works; also pytest-compatible (`pytest tests/`). 48 tests, all pass.
+
+* tests/harness.py - imported first by every test: stubs the off-robot deps
+  (paho, vosk, picamera2, cv2, numpy), puts layer_b/ + layer_b/modules/ on
+  sys.path, and swaps broker_client.Bus for an in-memory FakeBus that
+  records publishes and can deliver() payloads to subscribers synchronously.
+* tests/conftest.py - makes `pytest tests/` load the same harness.
+* test_spatial_store.py    - relax_veto: decrement, floor-at-0, custom
+  amount, unknown-id no-op, below-threshold, readonly refusal, reader sees
+  writes.
+* test_semantic_store.py   - upsert id/dedupe, supersede + reactivation +
+  self-supersede no-op, replace_subject snapshot swap / empty-guard /
+  readonly refusal, reader fail-soft.
+* test_location_graph_loop.py - the loop: maybe_clear decrements, repeated
+  passes fall below threshold, still_blocked / other question ignored,
+  location_id fallback, missing-id no-op, delivered through a real
+  subscription.
+* test_field_agent_hypothesis.py - both probes end to end: sensor probe
+  phantom/real + speed<=15 + decision-journal kinds; veto-prone probe
+  threshold gating, maybe_clear, speed<=10, still_blocked-on-veto, and that
+  all motion rides picarx/intent/move (never a direct safety channel).
+* test_reflection_self_model.py - escape-direction aggregation, full
+  self-fact synthesis, "no data -> no filler", replace_subject snapshot,
+  session-boundary date detection.
+* test_companion_memory.py - episode date resolution (today/yesterday),
+  episode readback from semantic.db (no LLM), self-model injected into the
+  system prompt + fallback.
+
+CURRENT STATE
+-------------
+- All 48 tests green. spatial_store.py and location_graph.py syntax-clean;
+  loop verified end-to-end including single-writer enforcement.
+- No twin sync needed: location_graph.py / spatial_store.py have no
+  top-level twins (and the old field_agent/audio_nodes/coach twins are
+  already gone).
+
+SUGGESTED NEXT STEPS
+--------------------
+- Emit a decision-journal entry (or a picarx/exploration/map_update) when
+  relax_veto fires, so "why did you stop fearing that corner?" is
+  answerable and reflection can fold the change into the self-model.
+- Consider decaying veto_count slowly over time as well, so places unlearn
+  even without an explicit re-test.
+- Wire the suite into a SessionStart hook / CI so it runs automatically on
+  every web session and PR.
