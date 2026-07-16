@@ -236,6 +236,76 @@ EVADE_PRIORITY = 8
 COACH_PRIORITY = 9
 WATCH_PRIORITY = 6
 
+# ---------------------------------------------------------------------
+# Reactive steer-around: a deterministic perception->heading law
+# ---------------------------------------------------------------------
+# Cruising used to drive dead straight until some threshold tripped, at
+# which point the only steering that ever happened was the emergency
+# reverse-arc - so the robot's whole repertoire looked like "drive at
+# things, then back-and-turn away from them." The steering servo has
+# always accepted any angle while moving (follow_daemon steers
+# proportionally and continuously the same way); the reflexes just never
+# used that freedom. This law closes the gap: every cruise tick, fresh
+# tracked objects that are in the path ahead each contribute a
+# counter-steer away from their side, proportional to how big they loom
+# (weight saturates at AVOID_SATURATION_AREA) and how central they sit
+# (a dead-ahead object steers hardest, one at the cone's edge barely).
+# Contributions SUM, so two objects flanking a gap cancel and the robot
+# threads between them instead of ping-ponging - and everything stays a
+# vetoable picarx/intent/move like all other motion. No LLM anywhere in
+# this path; it's the same class of deterministic control loop as
+# follow_daemon. The emergency evade/hypothesis reflexes above it in the
+# tick keep priority: this only shapes the heading while the path is
+# still considered clear.
+AVOID_MIN_AREA = 0.06         # ignore specks; approaching objects count regardless
+AVOID_SATURATION_AREA = 0.30  # an object this big steers at full weight
+AVOID_CONE_FRAC = 0.75        # only objects within this fraction of half-frame are "in the path"
+AVOID_MAX_ANGLE = 22          # cap - stays short of the +/-30 emergency reflexes
+AVOID_MIN_ANGLE = 4           # smaller than this isn't worth moving the servo
+AVOID_RESEND_DELTA = 4        # re-aim only when the target angle really moved (follow_daemon pattern)
+AVOID_HOLD_SEC = 0.8          # steering-reset window kept refreshed while actively avoiding
+AVOID_SPEED = 20              # ease off (from cruise 25) while maneuvering around something
+
+
+def _steer_away_angle(snapshot):
+    """Signed steering angle to flow around what's visible ahead, or None
+    when there's nothing worth reacting to. Pure function of the world
+    snapshot (unit-testable off-robot). Returns {"angle", "labels"}."""
+    if not snapshot:
+        return None
+    objects = snapshot.get("objects") or {}
+    if objects.get("stale", True):
+        return None
+    total = 0.0
+    labels = []
+    for obj in objects.get("items", []):
+        area = obj.get("area_ratio") or 0.0
+        if not obj.get("approaching") and area < AVOID_MIN_AREA:
+            continue
+        frame_w = obj.get("frame_width") or 0
+        if frame_w <= 0:
+            continue
+        offset_frac = obj.get("center_offset", 0) / (frame_w / 2.0)
+        # Dead-center has no side to prefer (that's the evasion reflex's
+        # call), and far off-path isn't in our way - both contribute nothing.
+        if offset_frac == 0 or abs(offset_frac) > AVOID_CONE_FRAC:
+            continue
+        weight = min(1.0, area / AVOID_SATURATION_AREA)
+        # "Approaching" means the box is growing FAST - it's closing on us
+        # whatever its current size, so it never weighs less than half.
+        if obj.get("approaching"):
+            weight = max(weight, 0.5)
+        side = 1.0 if offset_frac > 0 else -1.0
+        total += -side * (1.0 - abs(offset_frac)) * weight * AVOID_MAX_ANGLE
+        labels.append(obj.get("label", "something"))
+    if not labels:
+        return None
+    angle = int(round(max(-AVOID_MAX_ANGLE, min(AVOID_MAX_ANGLE, total))))
+    if abs(angle) < AVOID_MIN_ANGLE:
+        return None
+    return {"angle": angle, "labels": labels}
+
+
 # A depth-sensor-free obstacle signal: world_state flags a tracked
 # object "approaching" if its bounding box is growing quickly while
 # centered in frame. Treated exactly like a close ultrasonic reading.
@@ -271,7 +341,11 @@ def _vision_obstacle(snapshot):
     if best is None:
         return None
     return {"label": best.get("label", "something"), "area_ratio": best.get("area_ratio", 0),
-            "overhead": False, "approaching": True}
+            "overhead": False, "approaching": True,
+            # Which side the object sits on, so the escape can swing AWAY
+            # from it instead of picking a side blind (see evade_away_hint).
+            "center_offset": best.get("center_offset", 0),
+            "frame_width": best.get("frame_width", 0)}
 
 
 def _prune_older_than(dq, window, now):
@@ -585,6 +659,14 @@ class FieldAgent:
         self.last_wander = time.time()
         self.wander_interval = random.uniform(5.0, 10.0)
         self.steering_active_until = 0
+
+        # Reactive steer-around state (see _steer_away_angle): the angle
+        # currently commanded to flow around a visible object (None while
+        # not avoiding), and a one-shot escape-side hint - which way the
+        # NEXT evasion should swing, taken from the side the triggering
+        # obstacle was actually seen on.
+        self.avoid_active_angle = None
+        self.evade_away_hint = None
 
         # Spatial context (location_graph.py + explorer.py, both
         # optional): where the robot currently believes it is, and how
@@ -1369,9 +1451,13 @@ class FieldAgent:
                    "failure_mode": failure_mode},
         )
 
-    def _begin_evasion(self, reason):
+    def _begin_evasion(self, reason, away_hint=None):
         now = time.time()
         self.forward_since = None
+        # Escape-side hint from the caller (signed angle, or None): set
+        # fresh on EVERY entry so a stale hint from a previous vision
+        # evasion can never steer an unrelated later escape.
+        self.evade_away_hint = away_hint
         self.evasion_fail_events.append(now)
         _prune_older_than(self.evasion_fail_events, EVASION_FAIL_WINDOW, now)
         if len(self.evasion_fail_events) >= EVASION_FAIL_THRESHOLD:
@@ -1623,10 +1709,15 @@ class FieldAgent:
             else:
                 self.evade_stage += 1
                 if self.evade_stage == 1:
-                    # Choose + command the escape steering angle. Toward
-                    # whichever side the last scan found clearer; coin
-                    # flip only if we have no asymmetry to go on.
-                    self.evade_angle = self.preferred_escape_angle
+                    # Choose + command the escape steering angle, best
+                    # information first: away from the side the triggering
+                    # obstacle was actually SEEN on (evade_away_hint), else
+                    # toward whichever side the last scan found clearer;
+                    # coin flip only with no asymmetry to go on at all.
+                    self.evade_angle = self.evade_away_hint
+                    self.evade_away_hint = None
+                    if self.evade_angle is None:
+                        self.evade_angle = self.preferred_escape_angle
                     if self.evade_angle is None:
                         self.evade_angle = random.choice([-30, 30])
                     self.state_until = now + 0.3
@@ -1684,7 +1775,17 @@ class FieldAgent:
                     self.announce("Something's right in front of me, backing away.")
                 else:
                     self.announce(f"A {label} is closing in, backing away.")
-                self._begin_evasion("vision")
+                # If we saw which side it's on, escape AWAY from that side
+                # (same sign convention as _escape_angle_from_scan) instead
+                # of leaving it to scan memory or a coin flip. Only trust a
+                # clearly off-center sighting; near-center says nothing.
+                away_hint = None
+                frame_w = vision_obstacle.get("frame_width") or 0
+                if frame_w > 0:
+                    offset_frac = vision_obstacle.get("center_offset", 0) / (frame_w / 2.0)
+                    if abs(offset_frac) > 0.1:
+                        away_hint = -30 if offset_frac > 0 else 30
+                self._begin_evasion("vision", away_hint=away_hint)
                 return
 
         # --- Handle Trustworthiness of Sensor Data ---
@@ -1719,6 +1820,34 @@ class FieldAgent:
         if now - self.last_scan_at > CRUISE_SCAN_INTERVAL:
             self._enter_scanning(now, startup=False)
             return
+
+        # --- Reactive steer-around (deterministic, vision-based) ---
+        # The path isn't an emergency (the checks above already returned),
+        # but something visible is looming off-center - bend the heading
+        # away from it NOW and keep rolling, instead of driving straight
+        # at it until the evasion reflex has to back out. See the
+        # _steer_away_angle notes; this outranks/overrides wander steering
+        # while active. steering_active_until is kept refreshed so the
+        # existing timed-reset block straightens the wheels automatically
+        # once the object is cleared and this stops firing.
+        avoid = _steer_away_angle(snap)
+        if avoid is not None:
+            angle = avoid["angle"]
+            if self.avoid_active_angle is None:
+                self.publish_decision(
+                    "steer_around", {"angle": angle},
+                    f"steering around {', '.join(sorted(set(avoid['labels'])))} "
+                    f"seen off-center ahead")
+            if (self.avoid_active_angle is None
+                    or abs(angle - self.avoid_active_angle) >= AVOID_RESEND_DELTA):
+                self.publish_intent({"direction": "turn", "angle": angle})
+                self.avoid_active_angle = angle
+            self.steering_active_until = now + AVOID_HOLD_SEC
+            if self._note_forward_and_check_stuck(now, snap):
+                return
+            self.publish_intent({"direction": "forward", "speed": AVOID_SPEED})
+            return
+        self.avoid_active_angle = None
 
         # --- Handle Timed Steering Reset during standard wander ---
         if self.steering_active_until != 0 and now >= self.steering_active_until:
