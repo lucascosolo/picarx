@@ -97,3 +97,71 @@ def looks_command_like(canonical_text):
     the cheap signal that an unmatched utterance deserves escalation to
     the LLM intent arbiter rather than being dropped."""
     return any(t in DOMAIN_VOCAB for t in canonical_text.split())
+
+
+# ---------------------------------------------------------------------
+# Utterance quality scoring (noise rejection)
+# ---------------------------------------------------------------------
+# Background noise regularly decodes to SOMETHING - a lone "the", a limp
+# two-word fragment - and each one that reaches the chat path is a paid
+# LLM call answering the television. These scores are the cheap,
+# deterministic screen in front of that: no models (a POS tagger on the
+# Pi would cost more CPU than the LLM calls it saves), just word lists
+# and arithmetic, same philosophy as canonicalize() above.
+
+# A lone one of these is noise, period - background chatter's most common
+# decode products. Only ever applied to SINGLE-word utterances: all of
+# them are perfectly meaningful inside a longer sentence.
+WEAK_SINGLE_WORDS = {"the", "a", "an", "and", "or", "um", "uh", "hmm",
+                     "huh", "er", "oh", "ah"}
+
+# Meaningful one-worders: legitimate mid-conversation replies and
+# attention-getters that must NOT be scored like noise just for being
+# short ("yes" answering a question is real speech).
+STRONG_SHORT_REPLIES = {"yes", "no", "yeah", "nope", "sure", "okay", "ok",
+                        "thanks", "bye", "hi", "hello", "why", "how", "what",
+                        "stop", "halt"}
+
+# "This asks for something": command verbs the robot acts on plus
+# question openers. Broader than DOMAIN_VOCAB on purpose - chat requests
+# ("tell me a story") are legitimate LLM work even with zero robot
+# vocabulary in them.
+ACTION_WORDS = {
+    "play", "stop", "halt", "find", "search", "tune", "turn", "go", "come",
+    "tell", "show", "explore", "remember", "remind", "report", "look",
+    "follow", "sing", "say", "set", "list", "skip", "pause", "start",
+    "open", "close", "switch", "change", "describe", "what", "where",
+    "when", "who", "how", "why", "is", "are", "do", "does", "can", "could",
+    "would",
+}
+
+
+def intent_score(text):
+    """Rule-based "does this ask for something" score in 0..1:
+    action/question word x0.5 + content word x0.3 + length bonus x0.2."""
+    toks = tokens(text)
+    if not toks:
+        return 0.0
+    has_action = any(t in ACTION_WORDS or t in DOMAIN_VOCAB for t in toks)
+    has_content = any(len(t) >= 3 and t not in FILLER_WORDS
+                      and t not in ACTION_WORDS for t in toks)
+    length_bonus = min(1.0, (len(toks) - 1) / 4.0)
+    return 0.5 * has_action + 0.3 * has_content + 0.2 * length_bonus
+
+
+def quality_score(text, confidence=None):
+    """0..1 "was this real, directed speech?" - what the LLM paths check
+    before spending a call. A single weak word scores 0 outright; strong
+    short replies keep a floor so a mid-conversation "yes" survives;
+    decoder confidence (when the STT provides one) scales the rest."""
+    toks = tokens(text)
+    if not toks:
+        return 0.0
+    if len(toks) == 1 and toks[0] in WEAK_SINGLE_WORDS:
+        return 0.0
+    score = intent_score(text)
+    if len(toks) <= 2 and any(t in STRONG_SHORT_REPLIES for t in toks):
+        score = max(score, 0.6)
+    if confidence is not None:
+        score *= 0.5 + 0.5 * max(0.0, min(1.0, confidence))
+    return round(score, 3)

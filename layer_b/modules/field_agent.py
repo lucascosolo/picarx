@@ -941,7 +941,8 @@ class FieldAgent:
         remainder = self._strip_wake_phrase(text)
         if remainder is not None:
             self._mark_interaction()
-            self.bus.publish("picarx/audio/unhandled", {"text": remainder})
+            self.bus.publish("picarx/audio/unhandled",
+                             {"text": remainder, "confidence": confidence})
             return
 
         if time.time() - self.last_interaction_at < CONVERSATION_WINDOW_SEC:
@@ -951,7 +952,8 @@ class FieldAgent:
             # command would hold the window open (and burn API calls)
             # indefinitely.
             print(f"(in-conversation, forwarding without wake phrase): '{text}'")
-            self.bus.publish("picarx/audio/unhandled", {"text": text})
+            self.bus.publish("picarx/audio/unhandled",
+                             {"text": text, "confidence": confidence})
             return
 
         # Loop guard: text the arbiter already repaired never re-escalates -

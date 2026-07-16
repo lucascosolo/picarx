@@ -97,6 +97,27 @@ COMPANION_MODEL = str(robot_config.get("companion", "model", "claude-sonnet-5",
 # learning loop: the LLM is the teacher, the cache is what was learned.
 INTENT_MODEL = str(robot_config.get("companion", "intent_model",
                                     "claude-haiku-4-5-20251001", env="INTENT_MODEL"))
+
+# ---------- chat quality gate (noise rejection, zero-LLM) ----------
+# audio_nodes already screens raw decodes, but the chat path deserves its
+# own gate: during the no-wake-word conversation window field_agent
+# forwards EVERYTHING here, so one real command near a chatty TV used to
+# mean 45 seconds of paid LLM calls answering the television. Three tiers
+# on speech_match.quality_score (deterministic word-list arithmetic, no
+# models, no API):
+#   < chat_noise_quality  -> almost certainly noise: SILENT drop (answering
+#                            would be the robot talking to itself), posted
+#                            on picarx/audio/rejected for later debugging;
+#   < chat_min_quality    -> words but no discernible intent: a soft
+#                            "I didn't catch that." (throttled, so a noisy
+#                            room doesn't have the robot muttering it on
+#                            loop) and NO LLM call;
+#   otherwise             -> real speech, full chat pipeline.
+CHAT_NOISE_QUALITY = float(robot_config.get(
+    "companion", "chat_noise_quality", 0.2, env="CHAT_NOISE_QUALITY"))
+CHAT_MIN_QUALITY = float(robot_config.get(
+    "companion", "chat_min_quality", 0.45, env="CHAT_MIN_QUALITY"))
+DIDNT_CATCH_COOLDOWN = 15.0   # min seconds between soft "didn't catch" replies
 LEARNED_INTENTS_PATH = f"{DATA_DIR}/learned_intents.json"
 LEARNED_INTENTS_MAX = 300        # oldest-used entries beyond this get evicted
 INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls
@@ -273,6 +294,7 @@ class Companion:
         # Intent arbiter state
         self.learned_intents = self._load_learned_intents()
         self.last_repair_at = 0.0
+        self._last_didnt_catch_at = 0.0   # throttles the soft low-quality reply
         # Latest camera frame (base64 JPEG) seen on the bus, if any
         self.latest_frame_b64 = None
         self.latest_frame_at = 0.0
@@ -363,8 +385,27 @@ class Companion:
 
     def on_unhandled(self, payload):
         text = (payload.get("text") or "").strip()
-        if text:
-            self.work_queue.put(("chat", text))
+        if not text:
+            return
+        # Quality gate BEFORE anything queues toward the LLM (see the
+        # CHAT_NOISE_QUALITY / CHAT_MIN_QUALITY block up top).
+        quality = speech_match.quality_score(text, payload.get("confidence"))
+        if quality < CHAT_NOISE_QUALITY:
+            print(f"Companion: dropping probable noise '{text}' (quality {quality})")
+            self.bus.publish("picarx/audio/rejected", {
+                "text": text, "quality": quality,
+                "stage": "companion", "ts": time.time()})
+            return
+        if quality < CHAT_MIN_QUALITY:
+            now = time.time()
+            print(f"Companion: no clear intent in '{text}' (quality {quality}), "
+                  f"skipping the LLM")
+            if now - self._last_didnt_catch_at > DIDNT_CATCH_COOLDOWN:
+                self._last_didnt_catch_at = now
+                self.bus.publish("picarx/audio/speak",
+                                 {"text": "I didn't catch that.", "ts": now})
+            return
+        self.work_queue.put(("chat", text))
 
     def on_frame(self, payload):
         b64 = payload.get("jpeg")

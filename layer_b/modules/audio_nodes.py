@@ -69,6 +69,7 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 import robot_config
+import speech_match
 
 import array
 import math
@@ -153,6 +154,30 @@ TRAILING_SILENCE_SEC = 1.2      # keep decoding this long after the last loud ch
 PREBUFFER_CHUNKS = 3            # ~375ms kept during silence so speech onset isn't chopped
 DEBUG_LEVELS = robot_config.get_bool("audio", "debug_levels", False,
                                      env="AUDIO_DEBUG_LEVELS")
+
+# --- noise rejection before publishing picarx/audio/heard ---
+# The energy gate above decides what Kaldi DECODES; this decides what the
+# rest of the system ever HEARS. Background noise regularly decodes to a
+# lone "the" or a limp low-confidence fragment, and every one of those
+# that escapes onto picarx/audio/heard can end in a paid LLM call
+# (companion answering the television). Three cheap checks, applied in
+# _emit_result before publishing - each rejection is printed and posted
+# on picarx/audio/rejected so filtered utterances stay debuggable later:
+#   - decoder confidence below HEARD_MIN_CONFIDENCE (Kaldi's own mean
+#     per-word confidence - garbage decodes score visibly low);
+#   - a single weak filler word alone (speech_match.WEAK_SINGLE_WORDS);
+#   - utterance energy too close to the ambient floor: the gate opens at
+#     NOISE_MULTIPLIER (2.2) x floor, so requiring the utterance PEAK to
+#     have cleared HEARD_MIN_SNR x floor trims the blips that barely
+#     scraped over the trigger and decoded to mush anyway.
+# SAFETY EXCEPTION: text containing "stop"/"halt" is NEVER filtered -
+# a marginal decode of a real stop command must still reach
+# field_agent's stop handler. Worst case is a spurious stop: annoying,
+# and the safe direction to be wrong in.
+HEARD_MIN_CONFIDENCE = float(robot_config.get(
+    "audio", "heard_min_confidence", 0.3, env="HEARD_MIN_CONFIDENCE"))
+HEARD_MIN_SNR = float(robot_config.get(
+    "audio", "heard_min_snr", 2.5, env="HEARD_MIN_SNR"))
 
 # --- stuck-open gate failsafe ---
 # Field data (debug_monitor, 7.5min sample): this process averaged 74%
@@ -396,6 +421,12 @@ class AudioNode:
     def __init__(self):
         self.bus = Bus()
         self.mute_until = 0.0   # mic ignored while our own TTS is playing (see speak())
+        # Per-utterance energy bookkeeping for the HEARD_MIN_SNR check:
+        # the capture loop records the loudest chunk (and the gate's
+        # ambient floor) while the gate is open; _emit_result compares
+        # and resets. Both live here so _emit_result stays unit-testable.
+        self._utt_peak_rms = 0.0
+        self._utt_floor = None
         # Remote mic kill-switch (picarx/audio/mic_control) - lets the
         # web console silence STT entirely in a loud room (or while the
         # radio plays) so background noise can't fire false commands.
@@ -695,6 +726,10 @@ class AudioNode:
                 continue
 
             gate_was_open = True
+            # Track this utterance's loudest chunk + the current ambient
+            # floor for the emit-time SNR check (see HEARD_MIN_SNR).
+            self._utt_peak_rms = max(self._utt_peak_rms, rms)
+            self._utt_floor = gate.noise_floor
 
             # Just triggered (or still within the trailing window) -
             # flush any pre-buffered quiet-adjacent audio first so the
@@ -723,6 +758,27 @@ class AudioNode:
         words = result.get("result") or []
         confidence = (round(sum(w.get("conf", 1.0) for w in words) / len(words), 3)
                       if words else None)
+
+        # ---- noise rejection (see the HEARD_MIN_* block up top) ----
+        peak, floor = self._utt_peak_rms, self._utt_floor
+        self._utt_peak_rms = 0.0   # next utterance starts fresh either way
+        drop = None
+        if "stop" not in text and "halt" not in text:   # safety words never filtered
+            toks = text.split()
+            if confidence is not None and confidence < HEARD_MIN_CONFIDENCE:
+                drop = f"confidence {confidence} < {HEARD_MIN_CONFIDENCE}"
+            elif len(toks) == 1 and toks[0] in speech_match.WEAK_SINGLE_WORDS:
+                drop = "lone filler word"
+            elif floor and peak and peak < floor * HEARD_MIN_SNR:
+                drop = (f"peak rms {peak:.0f} < {HEARD_MIN_SNR} x noise floor "
+                        f"{floor:.0f}")
+        if drop:
+            print(f"(rejected as noise: '{text}' - {drop})")
+            self.bus.publish("picarx/audio/rejected", {
+                "text": text, "confidence": confidence,
+                "reason": drop, "stage": "audio_nodes", "ts": now})
+            return
+
         print(f"Heard locally: '{text}' (conf {confidence})")
         self.bus.publish("picarx/audio/heard", {"text": text, "confidence": confidence})
         # Core local reflex - throttled (see STOP_REFLEX_COOLDOWN) so

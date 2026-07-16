@@ -7,6 +7,9 @@
     "audio.espeak_voice: mb-us1 (US female) / mb-us2, mb-us3 (US male) / mb-en1 (British male); `espeak --voices=mb` lists what's installed.",
     "audio.espeak_pitch: 0-99, empty string = espeak's default.",
     "audio.gain: digital mic amplification for low-gain USB mics (see audio_nodes.py).",
+    "audio.heard_min_confidence: STT decodes below this mean word confidence are dropped as noise (stop/halt always pass).",
+    "audio.heard_min_snr: an utterance's peak level must exceed this multiple of the ambient noise floor.",
+    "companion.chat_noise_quality / chat_min_quality: below the first = silent drop, between = soft 'I didn't catch that' with no LLM call (see speech_match.quality_score).",
     "health.battery_adc: direct ADC battery fallback for setups without world_state - leave false normally (I2C contention).",
     "bluetooth.connect_cmd: {mac} is replaced with the device's MAC address."
   ],
@@ -20,11 +23,15 @@
     "gain": 12.0,
     "bandpass": true,
     "bandpass_hp_hz": 150,
-    "bandpass_lp_hz": 4000
+    "bandpass_lp_hz": 4000,
+    "heard_min_confidence": 0.3,
+    "heard_min_snr": 2.5
   },
   "companion": {
     "model": "claude-sonnet-5",
-    "intent_model": "claude-haiku-4-5-20251001"
+    "intent_model": "claude-haiku-4-5-20251001",
+    "chat_noise_quality": 0.2,
+    "chat_min_quality": 0.45
   },
   "coach": {
     "model": "claude-haiku-4-5-20251001"
