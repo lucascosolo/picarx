@@ -28,6 +28,7 @@ def _bare_node():
     node.kokoro = None
     node._tts_queue = queue.Queue()
     node._tts_worker_started = False
+    node._last_amp_assert_at = 0.0
     return node
 
 
@@ -108,6 +109,45 @@ class TtsFallbackLadderTest(unittest.TestCase):
         audio_nodes.subprocess.Popen = boom
         self.node._render_and_play("silence")   # must not raise
         self.assertNotEqual(self.node.mute_until, float("inf"))
+
+
+class AmpReassertTest(unittest.TestCase):
+    """The amp is re-asserted right before playback (throttled), so a HAT
+    init resetting the GPIO after the boot burst can't leave the robot mute."""
+
+    def setUp(self):
+        self.node = _bare_node()
+        self._orig_popen = audio_nodes.subprocess.Popen
+        self._orig_run = audio_nodes.subprocess.run
+        self.run_calls = []
+        audio_nodes.subprocess.Popen = lambda argv, **kw: _FakePopen(argv, **kw)
+        audio_nodes.subprocess.run = lambda argv, **kw: self.run_calls.append(argv)
+
+    def tearDown(self):
+        audio_nodes.subprocess.Popen = self._orig_popen
+        audio_nodes.subprocess.run = self._orig_run
+
+    def _enable_calls(self):
+        enable_argv = audio_nodes.SPEAKER_ENABLE_CMD.split()
+        return [c for c in self.run_calls if c == enable_argv]
+
+    def test_amp_reasserted_before_utterance(self):
+        self.node._render_and_play("hello")
+        self.assertEqual(len(self._enable_calls()), 1)
+
+    def test_reassert_throttled_within_interval(self):
+        # Two lines back to back: the amp was just asserted, don't pay the
+        # robot_hat CLI spawn again.
+        self.node._render_and_play("line one")
+        self.node._render_and_play("line two")
+        self.assertEqual(len(self._enable_calls()), 1)
+
+    def test_reassert_fires_again_after_interval(self):
+        self.node._render_and_play("early line")
+        # Simulate the throttle window passing (e.g. a reset happened since).
+        self.node._last_amp_assert_at -= (audio_nodes.SPEAKER_REASSERT_INTERVAL + 1)
+        self.node._render_and_play("later line")
+        self.assertEqual(len(self._enable_calls()), 2)
 
 
 class TtsQueueTest(unittest.TestCase):

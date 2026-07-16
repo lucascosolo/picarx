@@ -89,6 +89,23 @@ SPEAKER_ENABLE_CMD = os.environ.get("SPEAKER_ENABLE_CMD", "robot_hat enable_spea
 SPEAKER_ENABLE_RETRIES = 12
 SPEAKER_ENABLE_INTERVAL = 5.0
 
+# The boot-window burst above proved insufficient in the field: on slow
+# boots the HAT init that resets the amp GPIO can land AFTER the whole
+# 60s re-assert window has already been spent, leaving the robot mute
+# until someone manually ran `robot_hat restart_speaker` and restarted
+# the orchestrator. Rather than guessing an ever-later startup delay,
+# the amp is now ALSO re-asserted directly before playback whenever the
+# last assert is older than this - effectively moving "enable speakers"
+# to the latest possible point in startup (right before the first words)
+# and making speech self-healing after any later reset, no matter when
+# it happens. Re-asserting an already-on GPIO is a pop-free no-op; the
+# throttle just keeps a chatty announcement stream from paying the
+# robot_hat CLI's process-spawn cost on every single line.
+# If your amp needs a full power-cycle rather than a plain enable, point
+# SPEAKER_ENABLE_CMD at "robot_hat restart_speaker" instead - both the
+# boot burst and this pre-utterance re-assert run whatever it says.
+SPEAKER_REASSERT_INTERVAL = 10.0
+
 try:
     import audioop  # stdlib; removed in 3.13+, hence the fallback below
 except ImportError:
@@ -394,6 +411,7 @@ class AudioNode:
         # after the first utterance in a process.
         self._tts_queue = queue.Queue()
         self._tts_worker_started = False
+        self._last_amp_assert_at = 0.0   # last pre-utterance amp re-assert (see SPEAKER_REASSERT_INTERVAL)
         self._init_kokoro()
 
         # Initialize local STT Model
@@ -479,6 +497,13 @@ class AudioNode:
         self-mic mute around playback (the mic sits next to the speaker, so
         without this the robot decodes its own voice and holds the gate open)."""
         print(f"PiCar Speaking: {text}")
+        # Re-assert the speaker amp right before speaking (throttled) so a
+        # HAT init or GPIO reset at ANY point after boot can't leave the
+        # robot permanently mute - see the SPEAKER_REASSERT_INTERVAL note.
+        now = time.time()
+        if now - self._last_amp_assert_at >= SPEAKER_REASSERT_INTERVAL:
+            self._last_amp_assert_at = now
+            self._enable_speakers_once()
         self.mute_until = float("inf")
         try:
             if self.kokoro is not None:
