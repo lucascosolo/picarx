@@ -25,11 +25,14 @@ Pi 4 and only happens on a genuinely new situation, so it adds no
 steady-state load.
 """
 import os
+import robot_config
 
-EMBED_MODEL_PATH = os.environ.get(
-    "EMBED_MODEL_PATH", "/home/picarx/layer_b/data/models/minilm/model.onnx")
-EMBED_TOKENIZER_PATH = os.environ.get(
-    "EMBED_TOKENIZER_PATH", "/home/picarx/layer_b/data/models/minilm/tokenizer.json")
+EMBED_MODEL_PATH = str(robot_config.get(
+    "embeddings", "model_path",
+    "/home/picarx/layer_b/data/models/minilm/model.onnx", env="EMBED_MODEL_PATH"))
+EMBED_TOKENIZER_PATH = str(robot_config.get(
+    "embeddings", "tokenizer_path",
+    "/home/picarx/layer_b/data/models/minilm/tokenizer.json", env="EMBED_TOKENIZER_PATH"))
 
 
 class Embedder:

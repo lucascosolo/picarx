@@ -35,6 +35,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 
 import shutil
 import threading
@@ -156,7 +157,8 @@ class HealthDaemon:
         self.battery_low = False          # battery-driven component (hysteresis)
         self.low_power = False            # combined published state
         self.manual_latch = False         # LLM/manual low-power request
-        self.use_adc = bool(os.environ.get("HEALTH_BATTERY_ADC"))
+        self.use_adc = robot_config.get_bool("health", "battery_adc", False,
+                                             env="HEALTH_BATTERY_ADC")
 
     # ---------- inbound ----------
 

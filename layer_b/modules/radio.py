@@ -31,6 +31,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 from radio_browser import RadioBrowser
 
 import json
@@ -80,7 +81,8 @@ def _norm_dial(value):
 # yet keep running - so we announce and report "playing" while dead
 # silent. (The old default here was "robot_speaker" - missing the plug:
 # prefix the comment already claimed it had. That was the bug.)
-RADIO_ALSA_DEVICE = os.environ.get("RADIO_ALSA_DEVICE", "plug:robot_speaker")
+RADIO_ALSA_DEVICE = str(robot_config.get("radio", "alsa_device", "plug:robot_speaker",
+                                         env="RADIO_ALSA_DEVICE"))
 # How long to watch a freshly-started player before trusting it - a bad
 # stream/URL/device makes the player exit within a second, and we'd
 # rather report that than announce a station and sit silent.
@@ -89,7 +91,8 @@ PLAYER_HEALTHCHECK_SEC = 1.3
 # "Tuning to ..." and the stream can't share it. Give the announcement
 # this long to finish before the player seizes the device. Set to 0 if
 # you switch robot_speaker to a mixing (dmix) PCM so both can overlap.
-TTS_SETTLE_SEC = float(os.environ.get("RADIO_TTS_SETTLE", "2.0"))
+TTS_SETTLE_SEC = float(robot_config.get("radio", "tts_settle_sec", 2.0,
+                                        env="RADIO_TTS_SETTLE"))
 # Streams sometimes die moments AFTER the startup healthcheck passed:
 # the player spends the healthcheck window buffering the NETWORK stream
 # and only then opens the ALSA device - which can still be busy with the

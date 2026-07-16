@@ -64,6 +64,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 from semantic_store import SemanticStore
 import speech_match
 
@@ -83,7 +84,8 @@ DATA_DIR = "/home/picarx/layer_b/data"
 COMPANION_MEMORY_PATH = f"{DATA_DIR}/companion_memory.json"
 MEMORY_STALE_GAP = 1800      # seconds of silence before a gap is worth mentioning to the model
 
-COMPANION_MODEL = os.environ.get("COMPANION_MODEL", "claude-sonnet-5")
+COMPANION_MODEL = str(robot_config.get("companion", "model", "claude-sonnet-5",
+                                       env="COMPANION_MODEL"))
 
 # ---------- intent arbiter (picarx/audio/uncertain) ----------
 # The routers escalate command-shaped utterances they couldn't parse
@@ -93,7 +95,8 @@ COMPANION_MODEL = os.environ.get("COMPANION_MODEL", "claude-sonnet-5")
 # so a phrasing only ever costs one API call in the robot's lifetime:
 # afterward it's handled on-board like a native command. That's the
 # learning loop: the LLM is the teacher, the cache is what was learned.
-INTENT_MODEL = os.environ.get("INTENT_MODEL", "claude-haiku-4-5-20251001")
+INTENT_MODEL = str(robot_config.get("companion", "intent_model",
+                                    "claude-haiku-4-5-20251001", env="INTENT_MODEL"))
 LEARNED_INTENTS_PATH = f"{DATA_DIR}/learned_intents.json"
 LEARNED_INTENTS_MAX = 300        # oldest-used entries beyond this get evicted
 INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls

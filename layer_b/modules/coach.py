@@ -77,6 +77,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 from semantic_store import SemanticStore
 from embedding_util import Embedder
 
@@ -137,7 +138,8 @@ MIN_SPEED, MAX_SPEED = 10, 40
 MIN_ANGLE, MAX_ANGLE = -30, 30
 ALLOWED_DIRECTIONS = {"forward", "backward", "stop", "turn"}
 
-COACH_MODEL = os.environ.get("COACH_MODEL", "claude-haiku-4-5-20251001")
+COACH_MODEL = str(robot_config.get("coach", "model", "claude-haiku-4-5-20251001",
+                                   env="COACH_MODEL"))
 
 SYSTEM_PROMPT = """You are a driving coach for a small autonomous robot car (PiCar-X).
 It has either gotten stuck repeatedly bumping something its sensors missed, or it

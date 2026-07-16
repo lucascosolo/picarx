@@ -39,6 +39,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 from semantic_store import SemanticStore
 from spatial_store import SpatialStore
 import pattern_miner
@@ -91,7 +92,8 @@ EXISTING_FACTS_FOR_PROMPT = 25
 # is asked to also emit one diary-style episode summary for that day.
 SESSION_GAP_SEC = 3600.0
 
-REFLECTION_MODEL = os.environ.get("REFLECTION_MODEL", "claude-haiku-4-5-20251001")
+REFLECTION_MODEL = str(robot_config.get("reflection", "model",
+                                        "claude-haiku-4-5-20251001", env="REFLECTION_MODEL"))
 
 # Topics worth reflecting on (a subset of what event_logger records -
 # periodic world snapshots are deliberately excluded, they're noise at

@@ -68,6 +68,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", str(THREAD_LIMIT))
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 
 import array
 import math
@@ -85,7 +86,8 @@ from vosk import Model, KaldiRecognizer
 # startup loses that race, so we re-assert it a few times across the boot
 # window; re-asserting an already-on GPIO is a pop-free no-op, and we stop
 # once the window passes so it costs nothing ongoing.
-SPEAKER_ENABLE_CMD = os.environ.get("SPEAKER_ENABLE_CMD", "robot_hat enable_speaker")
+SPEAKER_ENABLE_CMD = str(robot_config.get(
+    "audio", "speaker_enable_cmd", "robot_hat enable_speaker", env="SPEAKER_ENABLE_CMD"))
 SPEAKER_ENABLE_RETRIES = 12
 SPEAKER_ENABLE_INTERVAL = 5.0
 
@@ -118,14 +120,16 @@ except ImportError:
 # we only ever take the 1-best result, so a wide lattice-beam is pure
 # wasted computation for this pipeline) to cut per-chunk decode cost.
 #
-# To switch models without editing code, point VOSK_MODEL_PATH at any
-# unpacked Vosk model directory (one containing am/, conf/, graph/ ...).
+# To switch models without editing code, point audio.vosk_model_path in
+# config.json (or the VOSK_MODEL_PATH env var) at any unpacked Vosk model
+# directory (one containing am/, conf/, graph/ ...).
 # Grab one from https://alphacephei.com/vosk/models - e.g. the larger
 # vosk-model-en-us-0.22 for better accuracy (needs much more RAM/CPU, so
 # watch this Pi's budget), or a small model for lower latency. The engine
 # and the whole pipeline here are model-agnostic; only this path changes.
-MODEL_PATH = os.environ.get(
-    "VOSK_MODEL_PATH", "/home/picarx/layer_b/modules/models/model-en-lgraph")
+MODEL_PATH = str(robot_config.get(
+    "audio", "vosk_model_path",
+    "/home/picarx/layer_b/modules/models/model-en-lgraph", env="VOSK_MODEL_PATH"))
 
 CHUNK_BYTES = 4000              # ~125ms per chunk at 16kHz/16-bit/mono
 
@@ -147,7 +151,8 @@ NOISE_MULTIPLIER = 2.2          # trigger this many times above the tracked floo
 MIN_THRESHOLD = 60              # absolute floor, in case ambient is near-silent
 TRAILING_SILENCE_SEC = 1.2      # keep decoding this long after the last loud chunk
 PREBUFFER_CHUNKS = 3            # ~375ms kept during silence so speech onset isn't chopped
-DEBUG_LEVELS = bool(os.environ.get("AUDIO_DEBUG_LEVELS"))
+DEBUG_LEVELS = robot_config.get_bool("audio", "debug_levels", False,
+                                     env="AUDIO_DEBUG_LEVELS")
 
 # --- stuck-open gate failsafe ---
 # Field data (debug_monitor, 7.5min sample): this process averaged 74%
@@ -197,15 +202,19 @@ SELF_SPEECH_MUTE_TAIL_SEC = 0.4
 #     espeak -v mb-us1 -s 130 --stdout "Hello, I am your robot" | \
 #         aplay -D plug:robot_speaker -q
 #
-# Voices to try (set ESPEAK_VOICE): mb-us1 (US female, the default here),
-# mb-us2 / mb-us3 (US male), mb-en1 (British male). `espeak --voices=mb`
-# lists everything installed. MBROLA voices read best a bit slower than
-# espeak's 175wpm default, hence ESPEAK_SPEED=130; ESPEAK_PITCH (0-99) is
-# left at espeak's default unless set. All knobs are env vars (same
-# pattern as VOSK_MODEL_PATH) so trying voices needs no code edits.
-ESPEAK_VOICE = os.environ.get("ESPEAK_VOICE", "mb-us1")
-ESPEAK_SPEED = os.environ.get("ESPEAK_SPEED", "130")
-ESPEAK_PITCH = os.environ.get("ESPEAK_PITCH", "")   # empty = espeak's default
+# Voices to try (audio.espeak_voice in config.json, or the ESPEAK_VOICE
+# env var): mb-us1 (US female, the default here), mb-us2 / mb-us3 (US
+# male), mb-en1 (British male). `espeak --voices=mb` lists everything
+# installed. MBROLA voices read best a bit slower than espeak's 175wpm
+# default, hence speed 130; pitch (0-99) is left at espeak's default
+# unless set. All knobs live in config.json so trying voices needs no
+# code edits.
+ESPEAK_VOICE = str(robot_config.get("audio", "espeak_voice", "mb-us1",
+                                    env="ESPEAK_VOICE"))
+ESPEAK_SPEED = str(robot_config.get("audio", "espeak_speed", 130,
+                                    env="ESPEAK_SPEED"))
+ESPEAK_PITCH = str(robot_config.get("audio", "espeak_pitch", "",
+                                    env="ESPEAK_PITCH"))   # "" = espeak's default
 
 
 def _espeak_argv(text, voice=None):
@@ -272,7 +281,7 @@ class EnergyGate:
 # Digital gain applied to every captured chunk before anything else
 # sees it - see the module docstring for why this exists. 1.0 = no
 # change. Tune with AUDIO_DEBUG_LEVELS=1 alongside SILENCE_RMS_THRESHOLD.
-AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "12.0"))
+AUDIO_GAIN = float(robot_config.get("audio", "gain", 12.0, env="AUDIO_GAIN"))
 
 
 def _apply_gain(data, gain):
@@ -311,9 +320,11 @@ def _chunk_rms(data):
 # our chunk rate, negligible next to a single decode step. Entirely
 # fail-soft and env-toggleable; if disabled or it errors, audio passes
 # through untouched and behaviour is exactly as before.
-BANDPASS_ENABLED = os.environ.get("AUDIO_BANDPASS", "1") not in ("0", "", "false", "no")
-BANDPASS_HP_HZ = float(os.environ.get("AUDIO_BANDPASS_HP", "150"))   # kill rumble below this
-BANDPASS_LP_HZ = float(os.environ.get("AUDIO_BANDPASS_LP", "4000"))  # kill hiss above this
+BANDPASS_ENABLED = robot_config.get_bool("audio", "bandpass", True, env="AUDIO_BANDPASS")
+BANDPASS_HP_HZ = float(robot_config.get(
+    "audio", "bandpass_hp_hz", 150, env="AUDIO_BANDPASS_HP"))   # kill rumble below this
+BANDPASS_LP_HZ = float(robot_config.get(
+    "audio", "bandpass_lp_hz", 4000, env="AUDIO_BANDPASS_LP"))  # kill hiss above this
 SAMPLE_RATE = 16000
 
 

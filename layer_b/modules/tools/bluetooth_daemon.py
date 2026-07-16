@@ -37,6 +37,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 
 import json
 import shutil
@@ -55,7 +56,8 @@ BLUETOOTH_PATH = f"{DATA_DIR}/bluetooth.json"
 # How to bring up the PAN link to a PAIRED phone's {mac}. NetworkManager
 # handles a trusted Bluetooth NAP device with a plain `device connect`.
 # Override for a different stack, e.g. "bt-network -c {mac} nap".
-BT_CONNECT_CMD = os.environ.get("BT_CONNECT_CMD", "nmcli device connect {mac}")
+BT_CONNECT_CMD = str(robot_config.get("bluetooth", "connect_cmd",
+                                      "nmcli device connect {mac}", env="BT_CONNECT_CMD"))
 CONNECT_TIMEOUT = 30
 
 DEFAULT_CONFIG = {

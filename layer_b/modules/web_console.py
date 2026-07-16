@@ -33,6 +33,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import robot_config
 
 import base64
 import json
@@ -41,7 +42,7 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(os.environ.get("WEB_CONSOLE_PORT", "8088"))
+PORT = int(robot_config.get("web_console", "port", 8088, env="WEB_CONSOLE_PORT"))
 HTML_PATH = "/home/picarx/layer_b/web_ui/console.html"
 LOG_LINES = 40
 

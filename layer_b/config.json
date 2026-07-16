@@ -1,0 +1,52 @@
+{
+  "_readme": [
+    "Every Layer B tunable, listed at its default value. Edit and restart the orchestrator.",
+    "Precedence per knob: environment variable (the old names still work) > this file > built-in default.",
+    "Fail-soft: delete or break this file and the robot runs on built-in defaults.",
+    "ANTHROPIC_API_KEY stays an environment variable on purpose - never put secrets in this file.",
+    "audio.espeak_voice: mb-us1 (US female) / mb-us2, mb-us3 (US male) / mb-en1 (British male); `espeak --voices=mb` lists what's installed.",
+    "audio.espeak_pitch: 0-99, empty string = espeak's default.",
+    "audio.gain: digital mic amplification for low-gain USB mics (see audio_nodes.py).",
+    "health.battery_adc: direct ADC battery fallback for setups without world_state - leave false normally (I2C contention).",
+    "bluetooth.connect_cmd: {mac} is replaced with the device's MAC address."
+  ],
+  "audio": {
+    "speaker_enable_cmd": "robot_hat enable_speaker",
+    "vosk_model_path": "/home/picarx/layer_b/modules/models/model-en-lgraph",
+    "debug_levels": false,
+    "espeak_voice": "mb-us1",
+    "espeak_speed": 130,
+    "espeak_pitch": "",
+    "gain": 12.0,
+    "bandpass": true,
+    "bandpass_hp_hz": 150,
+    "bandpass_lp_hz": 4000
+  },
+  "companion": {
+    "model": "claude-sonnet-5",
+    "intent_model": "claude-haiku-4-5-20251001"
+  },
+  "coach": {
+    "model": "claude-haiku-4-5-20251001"
+  },
+  "reflection": {
+    "model": "claude-haiku-4-5-20251001"
+  },
+  "radio": {
+    "alsa_device": "plug:robot_speaker",
+    "tts_settle_sec": 2.0
+  },
+  "web_console": {
+    "port": 8088
+  },
+  "bluetooth": {
+    "connect_cmd": "nmcli device connect {mac}"
+  },
+  "health": {
+    "battery_adc": false
+  },
+  "embeddings": {
+    "model_path": "/home/picarx/layer_b/data/models/minilm/model.onnx",
+    "tokenizer_path": "/home/picarx/layer_b/data/models/minilm/tokenizer.json"
+  }
+}
