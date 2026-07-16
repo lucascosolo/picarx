@@ -176,57 +176,49 @@ RESEED_RMS_WINDOW = 40          # chunks (~5s) of recent rms kept for the reseed
 SELF_SPEECH_MUTE_TAIL_SEC = 0.4
 
 # ---------------------------------------------------------------------
-# Text-to-speech: Kokoro (local neural TTS) with a seamless espeak fallback
+# Text-to-speech: espeak + MBROLA diphone voice (plain-espeak fallback)
 # ---------------------------------------------------------------------
-# The robot's primary voice is Kokoro - a small, natural-sounding local
-# neural TTS run through kokoro-onnx, played out with sounddevice. It is a
-# drop-in replacement for the old robotic espeak voice, but espeak is KEPT
-# as an always-available fallback: if the Kokoro model files are missing,
-# the engine fails to initialize, or a runtime error happens mid-synthesis,
-# speech transparently falls back to espeak so the robot never goes mute
-# (and if even espeak is unavailable, we log and carry on - never crash).
+# The robot's voice is espeak driving an MBROLA diphone voice - much more
+# natural than espeak's default formant buzz, while keeping the whole
+# pipeline a near-instant subprocess the Pi 4 doesn't feel. (The Kokoro
+# neural TTS this replaces sounded better still, but its multi-second
+# synthesis latency on the Pi made every reply drag - responsiveness won.)
+# If the MBROLA voice isn't installed, or fails at runtime, speech
+# transparently falls back to espeak's default voice so the robot never
+# goes mute; if even that fails, we log clearly and carry on - never crash.
 #
-# ------------------------------- SETUP (manual, NOT auto-downloaded) ------
-# The model + voice binaries are large and are NOT in git and NOT fetched
-# automatically. To enable the Kokoro voice on the robot:
+# ------------------------------ SETUP (one apt install) -------------------
+# MBROLA and its voices are plain Debian/Raspberry Pi OS packages:
 #
-#   1. Install the Python deps into the robot's environment:
-#          pip install kokoro-onnx sounddevice
-#      sounddevice needs PortAudio at the system level:
-#          sudo apt-get install -y libportaudio2
+#     sudo apt-get install -y mbrola mbrola-us1 mbrola-us2 mbrola-us3 mbrola-en1
 #
-#   2. Download the QUANTIZED model + the voices pack from the kokoro-onnx
-#      releases page (https://github.com/thewh1teagle/kokoro-onnx/releases):
-#          kokoro-v1.0.int8.onnx   (quantized model, ~90 MB - int8 keeps the
-#                                    Pi's CPU/RAM budget; the fp32
-#                                    kokoro-v1.0.onnx also works if preferred)
-#          voices-v1.0.bin         (all voices in one file, ~27 MB)
+# Then verify on the robot's speaker:
 #
-#   3. Drop both into the models dir, alongside the vision models, in a
-#      new kokoro/ subfolder:
-#          /home/picarx/layer_b/modules/models/kokoro/
-#              kokoro-v1.0.int8.onnx
-#              voices-v1.0.bin
+#     espeak -v mb-us1 -s 130 --stdout "Hello, I am your robot" | \
+#         aplay -D plug:robot_speaker -q
 #
-# Any of the paths / the default voice can be overridden with the env vars
-# below (same pattern as VOSK_MODEL_PATH). Nice voices to try in
-# voices-v1.0.bin: af_heart, af_bella, af_sarah (US female), am_adam (US
-# male), bf_emma (British female). Pick one with KOKORO_VOICE.
-KOKORO_DIR = os.environ.get(
-    "KOKORO_DIR", "/home/picarx/layer_b/modules/models/kokoro")
-KOKORO_MODEL_PATH = os.environ.get(
-    "KOKORO_MODEL_PATH", os.path.join(KOKORO_DIR, "kokoro-v1.0.int8.onnx"))
-KOKORO_VOICES_PATH = os.environ.get(
-    "KOKORO_VOICES_PATH", os.path.join(KOKORO_DIR, "voices-v1.0.bin"))
-KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
-KOKORO_LANG = os.environ.get("KOKORO_LANG", "en-us")
-KOKORO_SPEED = float(os.environ.get("KOKORO_SPEED", "1.0"))
+# Voices to try (set ESPEAK_VOICE): mb-us1 (US female, the default here),
+# mb-us2 / mb-us3 (US male), mb-en1 (British male). `espeak --voices=mb`
+# lists everything installed. MBROLA voices read best a bit slower than
+# espeak's 175wpm default, hence ESPEAK_SPEED=130; ESPEAK_PITCH (0-99) is
+# left at espeak's default unless set. All knobs are env vars (same
+# pattern as VOSK_MODEL_PATH) so trying voices needs no code edits.
+ESPEAK_VOICE = os.environ.get("ESPEAK_VOICE", "mb-us1")
+ESPEAK_SPEED = os.environ.get("ESPEAK_SPEED", "130")
+ESPEAK_PITCH = os.environ.get("ESPEAK_PITCH", "")   # empty = espeak's default
 
-# Optional PortAudio output device for sounddevice (index or name substring).
-# Unset -> PortAudio's default. Set this if Kokoro speech comes out of the
-# wrong sink (the espeak fallback targets ALSA plug:robot_speaker directly).
-_tts_out = os.environ.get("TTS_OUTPUT_DEVICE")
-TTS_OUTPUT_DEVICE = int(_tts_out) if _tts_out and _tts_out.lstrip("-").isdigit() else _tts_out
+
+def _espeak_argv(text, voice=None):
+    """argv for one espeak render. voice=None is the proven legacy call
+    (default voice, default rate) used as the last-resort fallback; a named
+    voice brings the speed/pitch knobs along with it."""
+    argv = ["espeak"]
+    if voice:
+        argv += ["-v", voice, "-s", ESPEAK_SPEED]
+        if ESPEAK_PITCH:
+            argv += ["-p", ESPEAK_PITCH]
+    argv += ["--stdout", text]
+    return argv
 
 
 class EnergyGate:
@@ -405,14 +397,14 @@ class AudioNode:
         # immediately, so no bus callback or system task ever blocks on
         # playback. Serializing in one worker preserves the "one utterance
         # at a time" behavior the old blocking aplay path had for free.
-        # Primary engine is Kokoro (see _init_kokoro); espeak is the
-        # always-available fallback. espeak is still shelled out fresh per
-        # call rather than via pyttsx3, whose espeak driver goes silent
-        # after the first utterance in a process.
+        # Voice is espeak + MBROLA (see _init_voice); plain espeak is the
+        # always-available fallback. espeak is shelled out fresh per call
+        # rather than via pyttsx3, whose espeak driver goes silent after
+        # the first utterance in a process.
         self._tts_queue = queue.Queue()
         self._tts_worker_started = False
         self._last_amp_assert_at = 0.0   # last pre-utterance amp re-assert (see SPEAKER_REASSERT_INTERVAL)
-        self._init_kokoro()
+        self._init_voice()
 
         # Initialize local STT Model
         if not os.path.exists(MODEL_PATH):
@@ -437,26 +429,32 @@ class AudioNode:
     # speaker output); cards 2/3 are just the Pi's HDMI outputs.
     AUDIO_OUT_DEVICE = "plug:robot_speaker"
 
-    # ---------- TTS: Kokoro primary, espeak fallback ----------
+    # ---------- TTS: espeak+MBROLA primary, plain espeak fallback ----------
 
-    def _init_kokoro(self):
-        """Load the Kokoro neural TTS engine, fail-soft. Sets self.kokoro to
-        the loaded engine, or None if the model files are absent or the
-        engine can't be imported/loaded - in which case every utterance
-        simply uses the espeak fallback. Never raises."""
-        self.kokoro = None
-        if not (os.path.exists(KOKORO_MODEL_PATH) and os.path.exists(KOKORO_VOICES_PATH)):
-            print(f"Kokoro TTS files not found ({KOKORO_MODEL_PATH} / "
-                  f"{KOKORO_VOICES_PATH}); using the espeak voice. See the SETUP "
-                  f"block in audio_nodes.py to enable the neural voice.")
-            return
+    def _init_voice(self):
+        """Pick the session's voice, fail-soft: render a short probe through
+        the configured MBROLA voice once; anything but a healthy WAV on
+        stdout (voice pack or the mbrola binary not installed, espeak
+        missing...) drops the session to espeak's default voice. Sets
+        self.espeak_voice (name, or None for the default voice). Never
+        raises - a broken TTS stack must not take the STT side down."""
+        self.espeak_voice = None
         try:
-            from kokoro_onnx import Kokoro
-            self.kokoro = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
-            print(f"Kokoro TTS active (voice '{KOKORO_VOICE}', {KOKORO_LANG}).")
+            probe = subprocess.run(
+                _espeak_argv("test", ESPEAK_VOICE),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+            # A working render is a WAV bigger than its own 44-byte header;
+            # a missing mbrola voice exits non-zero or emits nothing.
+            if probe.returncode == 0 and probe.stdout and len(probe.stdout) > 44:
+                self.espeak_voice = ESPEAK_VOICE
+                print(f"TTS voice: espeak {ESPEAK_VOICE} (MBROLA)")
+                return
+            print(f"espeak voice '{ESPEAK_VOICE}' produced no audio "
+                  f"(rc={probe.returncode}).")
         except Exception as e:
-            print(f"Kokoro TTS failed to initialize ({e}); falling back to espeak.")
-            self.kokoro = None
+            print(f"espeak voice '{ESPEAK_VOICE}' probe failed ({e}).")
+        print("Using espeak's default voice. See the SETUP block in "
+              "audio_nodes.py to install the MBROLA voice packs.")
 
     def _ensure_tts_worker(self):
         """Start the single serial playback worker on first use (idempotent)."""
@@ -493,7 +491,8 @@ class AudioNode:
             self._render_and_play(text)
 
     def _render_and_play(self, text):
-        """Speak TEXT: Kokoro first, espeak fallback, never crash. Manages the
+        """Speak TEXT: MBROLA voice first, default espeak fallback, never
+        crash. Manages the
         self-mic mute around playback (the mic sits next to the speaker, so
         without this the robot decodes its own voice and holds the gate open)."""
         print(f"PiCar Speaking: {text}")
@@ -506,38 +505,27 @@ class AudioNode:
             self._enable_speakers_once()
         self.mute_until = float("inf")
         try:
-            if self.kokoro is not None:
+            if self.espeak_voice is not None:
                 try:
-                    self._speak_kokoro(text)
+                    self._speak_espeak(text, voice=self.espeak_voice)
                     return
                 except Exception as e:
-                    print(f"Kokoro TTS runtime error ({e}); using espeak for this line.")
+                    print(f"espeak voice {self.espeak_voice} runtime error ({e}); "
+                          f"default voice for this line.")
             try:
                 self._speak_espeak(text)
             except Exception as e:
-                # Both engines are down. Log clearly and carry on - a mute
-                # robot is bad, a crashed audio node is worse.
-                print(f"TTS failed on both Kokoro and espeak ({e}); staying silent.")
+                # Even plain espeak is down. Log clearly and carry on - a
+                # mute robot is bad, a crashed audio node is worse.
+                print(f"TTS failed entirely ({e}); staying silent.")
         finally:
             self.mute_until = time.time() + SELF_SPEECH_MUTE_TAIL_SEC
 
-    def _speak_kokoro(self, text):
-        """Synthesize with Kokoro and play through sounddevice. sd.play is
-        itself non-blocking (PortAudio streams on its own thread); we sd.wait
-        here only so THIS worker serializes clips - no external caller waits."""
-        import sounddevice as sd
-        samples, sample_rate = self.kokoro.create(
-            text, voice=KOKORO_VOICE, speed=KOKORO_SPEED, lang=KOKORO_LANG)
-        if TTS_OUTPUT_DEVICE is not None:
-            sd.play(samples, sample_rate, device=TTS_OUTPUT_DEVICE)
-        else:
-            sd.play(samples, sample_rate)
-        sd.wait()
-
-    def _speak_espeak(self, text):
-        """Fallback voice: shell espeak --stdout into aplay on the robot
-        speaker (the proven ALSA path). Fresh process per call on purpose."""
-        espeak_proc = subprocess.Popen(["espeak", "--stdout", text], stdout=subprocess.PIPE)
+    def _speak_espeak(self, text, voice=None):
+        """Shell espeak --stdout into aplay on the robot speaker (the proven
+        ALSA path). Fresh process per call on purpose (see __init__ note).
+        voice=None is the untouched legacy default-voice call."""
+        espeak_proc = subprocess.Popen(_espeak_argv(text, voice), stdout=subprocess.PIPE)
         subprocess.run(
             ["aplay", "-D", self.AUDIO_OUT_DEVICE, "-q"],
             stdin=espeak_proc.stdout,
