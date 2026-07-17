@@ -145,6 +145,12 @@ TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
 # short: it's a reply window, not an always-open mic to the LLM.
 CONVERSATION_WINDOW_SEC = 45.0
 
+# Person identity (person_memory.py, optional): greet a recognized person
+# by name, but not every time their face is re-confirmed - once per
+# arrival is friendly, once per second is unbearable.
+PERSON_GREET_COOLDOWN = 300.0
+PERSON_FRESH_SEC = 10.0     # an identity older than this isn't "who I see NOW"
+
 OBSTACLE_DISTANCE_CM = 20  # Adjusted slightly downward to prevent premature triggers
 MIN_ANNOUNCEMENT_GAP = 6.0  # don't let spontaneous remarks spam the speaker
 
@@ -351,6 +357,65 @@ def _vision_obstacle(snapshot):
 def _prune_older_than(dq, window, now):
     while dq and dq[0] < now - window:
         dq.popleft()
+
+
+# ---------------------------------------------------------------------
+# Spoken memory/navigation query parsing (pure functions, unit-testable)
+# ---------------------------------------------------------------------
+# These parse the raw utterance, not the canonicalized form, because the
+# captured group is a NAME the user chose ("kitchen", "watering can") and
+# canonicalization is lossy on names.
+
+def parse_place_name_command(text):
+    """'call this place the kitchen' / 'name this room lucas office'
+    -> 'kitchen' / 'lucas office', else None."""
+    m = re.search(r"\b(?:call|name) this (?:place|room|spot|area)\s+"
+                  r"(?:the\s+)?([a-z][a-z' ]{1,40})", text)
+    if not m:
+        m = re.search(r"\bthis (?:place|room) is (?:called\s+)?"
+                      r"(?:the\s+)?([a-z][a-z' ]{1,40})", text)
+    return m.group(1).strip() if m else None
+
+
+def parse_go_to_command(text):
+    """'go to the kitchen' / 'go back to the living room' -> 'kitchen' /
+    'living room', else None. Deliberately narrow: motion only ever
+    starts from this literal spoken shape, matching the strict local
+    'explore' rule - never from a fuzzy repair or an LLM guess."""
+    m = re.search(r"\bgo (?:back )?to (?:the\s+)?([a-z][a-z' ]{1,40})", text)
+    return m.group(1).strip() if m else None
+
+
+def parse_where_is_query(text):
+    """'where is the bottle' / \"where's my cup\" / 'where did you see
+    the chair' -> 'bottle' / 'cup' / 'chair', else None."""
+    if "where are you" in text:
+        return None  # that's the map report, not an object query
+    m = re.search(r"\bwhere(?:'s| is| was| did you (?:last )?see)\s+"
+                  r"(?:the |my |a |an )?([a-z][a-z' ]{1,40})", text)
+    return m.group(1).strip() if m else None
+
+
+def parse_whats_in_query(text):
+    """\"what's in the kitchen\" / 'what is in the living room' / 'what
+    have you seen in the kitchen' -> 'kitchen' etc., else None."""
+    m = re.search(r"\bwhat(?:'s| is| have you seen| did you see)\s+"
+                  r"(?:is )?in (?:the\s+)?([a-z][a-z' ]{1,40})", text)
+    return m.group(1).strip() if m else None
+
+
+def spoken_age(seconds):
+    """'just now' / '5 minutes ago' / 'about 3 hours ago' - for spoken
+    answers about when something was last seen."""
+    if seconds < 90:
+        return "just now"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        return f"{minutes:.0f} minutes ago"
+    hours = minutes / 60.0
+    if hours < 36:
+        return f"about {hours:.0f} hour{'s' if round(hours) != 1 else ''} ago"
+    return f"about {hours / 24.0:.0f} days ago"
 
 
 # ---- fail-state escalation tuning ----
@@ -613,6 +678,11 @@ class FieldAgent:
         self.face_was_detected = False
         self.known_object_labels = set()
 
+        # Person identity (from person_memory.py, optional/fail-soft).
+        self.latest_person = None       # last identity payload + received_at
+        self.last_greeted_person = None
+        self.last_greeted_at = 0.0
+
         self.last_announcement_at = 0.0
         self.start_time = time.time()
 
@@ -794,6 +864,22 @@ class FieldAgent:
             self.last_veto_code = result.get("reason_code", "unknown")
             self.last_veto_at = time.time()
 
+    # ---------- inbound: person identity (optional module) ----------
+
+    def on_person(self, payload):
+        name = payload.get("name")
+        now = time.time()
+        with self.lock:
+            self.latest_person = {**payload, "received_at": now}
+        if not name:
+            return
+        if (name == self.last_greeted_person
+                and now - self.last_greeted_at < PERSON_GREET_COOLDOWN):
+            return
+        self.last_greeted_person = name
+        self.last_greeted_at = now
+        self.announce(f"Hello, {name}! Good to see you.")
+
     # ---------- inbound: coach ----------
 
     def on_coach_suggestion(self, payload):
@@ -905,6 +991,39 @@ class FieldAgent:
         if "object" in match_text or "what's around" in text or "whats around" in text or "what do you notice" in text:
             self._mark_interaction()
             self.report_objects()
+            return
+
+        # --- spatial/person memory commands (all local, no LLM) ---
+        place_name = parse_place_name_command(text)
+        if place_name:
+            self._mark_interaction()
+            self.name_current_place(place_name)
+            return
+
+        # NOTE raw text only, same rule as "explore" above: motion must
+        # never start off a fuzzy repair, only off the literal words.
+        destination = parse_go_to_command(text)
+        if destination:
+            self._mark_interaction()
+            self.go_to_place(destination)
+            return
+
+        where_query = parse_where_is_query(text)
+        if where_query:
+            self._mark_interaction()
+            self.report_object_location(where_query)
+            return
+
+        whats_in = parse_whats_in_query(text)
+        if whats_in:
+            self._mark_interaction()
+            self.report_place_contents(whats_in)
+            return
+
+        if ("who am i" in text or "who do you see" in text
+                or "do you know me" in text or "who is this" in text):
+            self._mark_interaction()
+            self.report_person()
             return
 
         if "why" in text and ("why did you" in text or text.strip() == "why"):
@@ -1068,6 +1187,98 @@ class FieldAgent:
         if goal:
             parts.append(f"my current mission is to reach {goal.get('label')}")
         self.announce(". ".join(parts) + ".", force=True)
+
+    def name_current_place(self, name):
+        """Route 'call this place the kitchen' to location_graph (the
+        sole spatial.db writer); it renames, confirms out loud, and
+        journals the change. We only update our own cached label."""
+        loc = self._location_context()
+        if not loc or loc.get("id") is None:
+            self.announce("I'm not sure where I am yet. Tell me to explore first, "
+                          "then name the place.", force=True)
+            return
+        self.bus.publish("picarx/exploration/name_place",
+                         {"location_id": loc["id"], "name": name})
+        with self.lock:
+            if self.current_location:
+                self.current_location["label"] = name
+
+    def go_to_place(self, place_query):
+        """'go to the kitchen': adopt a user goal for a known place and
+        start exploring toward it. All motion stays the normal wander/
+        goal-bias pipeline - vetoable intents, nothing new mechanically."""
+        loc = self.spatial.find_location_by_name(place_query)
+        if loc is None:
+            known = [l["label"] for l in self.spatial.all_locations()]
+            hint = f" I know: {', '.join(known[:5])}." if known else \
+                " I haven't mapped anywhere yet - tell me to explore."
+            self.announce(f"I don't know a place called {place_query} yet.{hint}",
+                          force=True)
+            return
+        self.bus.publish("picarx/exploration/goal_request",
+                         {"location_id": loc["id"], "label": loc["label"]})
+        self.publish_decision("go_to_place",
+                              {"location_id": loc["id"], "label": loc["label"]},
+                              f"the user asked me to go to {loc['label']}")
+        if not self.explore_mode:
+            self.explore_mode = True
+            self.given_up = False
+            self.consecutive_coach_failures = 0
+            self.next_fail_state_allowed_at = 0.0
+            self._enter_scanning(time.time(), startup=True)
+        self.announce(f"Heading toward {loc['label']}. I'll keep an eye out for it "
+                      f"as I go.", force=True)
+
+    def report_object_location(self, query):
+        """'where is the bottle' - answered from the sighting store, no
+        LLM: which place, how long ago, how reliably."""
+        label = speech_match.best_label_match(query, self.spatial.sighting_labels())
+        places = self.spatial.object_locations(label) if label else []
+        if not places:
+            self.announce(f"I haven't seen a {query} anywhere yet.", force=True)
+            return
+        top = places[0]
+        when = spoken_age(time.time() - top["last_seen"])
+        speech = f"I last saw a {label} at {top['place']}, {when}"
+        if top["times_seen"] > 1:
+            speech += f". I've spotted it there {top['times_seen']} times"
+        if len(places) > 1:
+            speech += f". I've also seen one at {places[1]['place']}"
+        self.announce(speech + ".", force=True)
+
+    def report_place_contents(self, place_query):
+        """'what's in the kitchen' - the sighting store's inventory of a
+        known place."""
+        loc = self.spatial.find_location_by_name(place_query)
+        if loc is None:
+            self.announce(f"I don't know a place called {place_query} yet.", force=True)
+            return
+        objects = self.spatial.location_objects(loc["id"])
+        if not objects:
+            self.announce(f"I haven't recorded any objects at {loc['label']} yet.",
+                          force=True)
+            return
+        names = ", ".join(o["label"] for o in objects[:6])
+        self.announce(f"At {loc['label']} I've seen: {names}.", force=True)
+
+    def report_person(self):
+        """'who am I' / 'who do you see' - answered from person_memory's
+        published identity, falling back to honest 'a face I don't know'."""
+        with self.lock:
+            person = dict(self.latest_person) if self.latest_person else None
+        now = time.time()
+        if (person and person.get("name")
+                and now - person.get("received_at", 0) < PERSON_FRESH_SEC):
+            self.announce(f"You're {person['name']}, of course.", force=True)
+            return
+        snap = self._snapshot() or {}
+        face = snap.get("face", {})
+        if face.get("detected") and not face.get("stale", True):
+            self.announce("I can see someone, but I don't recognize the face. "
+                          "Say remember me, I am, and then your name, and I'll "
+                          "learn it.", force=True)
+        else:
+            self.announce("I don't see anyone right now.", force=True)
 
     def report_why(self):
         """Self-explanation from the decision journal: read back the
@@ -1946,6 +2157,7 @@ class FieldAgent:
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
         self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
+        self.bus.subscribe("picarx/vision/person", self.on_person)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)
