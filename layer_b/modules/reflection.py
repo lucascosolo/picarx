@@ -199,8 +199,15 @@ class Reflection:
         if topic == "picarx/audio/heard":
             return f"heard: {p.get('text')}"
         if topic == "picarx/coach/episode":
-            act = p.get("action") or {}
-            return (f"coach[{p.get('situation_key')}]: {act.get('direction')}"
+            # Episodes carry an ordered "steps" list; older rows may still
+            # have the legacy single "action" field instead.
+            steps = p.get("steps") or []
+            if steps:
+                moves = ",".join(
+                    (s.get("action") or {}).get("direction") or "?" for s in steps)
+            else:
+                moves = (p.get("action") or {}).get("direction")
+            return (f"coach[{p.get('situation_key')}]: {moves}"
                     f" -> {'worked' if p.get('success') else 'failed'}"
                     f" ({'cached' if p.get('cached') else 'fresh'})")
         if topic == "picarx/exploration/room_scan":

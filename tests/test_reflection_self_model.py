@@ -117,6 +117,31 @@ class SelfModelTest(unittest.TestCase):
                 (3, now - 10, "t", "{}")]
         self.assertIsNone(reflection.Reflection._session_boundary_subject(rows, now))
 
+    # ---- digest line building ----
+
+    def test_summarize_coach_episode_steps_schema(self):
+        # Regression: episodes carry a "steps" list (coach.py's current
+        # schema); the summarizer used to read the long-gone "action" field
+        # and rendered "None" for the maneuver in every digest line.
+        payload = json.dumps({
+            "situation_key": "collision_loop:repeated_veto",
+            "steps": [{"action": {"direction": "backward"}, "duration": 1.0},
+                      {"action": {"direction": "turn", "angle": 20}, "duration": 0.5}],
+            "success": True, "cached": False,
+        })
+        line = reflection.Reflection._summarize_event("picarx/coach/episode", payload)
+        self.assertIn("backward,turn", line)
+        self.assertNotIn("None", line)
+
+    def test_summarize_coach_episode_legacy_action(self):
+        payload = json.dumps({
+            "situation_key": "novel_object:chair",
+            "action": {"direction": "stop"}, "success": False, "cached": True,
+        })
+        line = reflection.Reflection._summarize_event("picarx/coach/episode", payload)
+        self.assertIn("stop", line)
+        self.assertIn("failed", line)
+
 
 if __name__ == "__main__":
     unittest.main()
