@@ -11,7 +11,10 @@
     "audio.heard_min_snr: an utterance's peak level must exceed this multiple of the ambient noise floor.",
     "companion.chat_noise_quality / chat_min_quality: below the first = silent drop, between = soft 'I didn't catch that' with no LLM call (see speech_match.quality_score).",
     "health.battery_adc: direct ADC battery fallback for setups without world_state - leave false normally (I2C contention).",
-    "bluetooth.connect_cmd: {mac} is replaced with the device's MAC address."
+    "bluetooth.connect_cmd: {mac} is replaced with the device's MAC address.",
+    "kinematics.*: physical robot properties used by the smooth steering controller - measure wheelbase_mm on your chassis; steering_rate_deg_per_sec caps commanded slew (lower = smoother arcs).",
+    "steering.area_distance_k: bounding-box-area -> distance calibration (distance_cm ~ k / sqrt(area_ratio)); place an obstacle at a known distance and set k = distance_cm * sqrt(area_ratio). See steering_controller.py.",
+    "steering.clearance_m / curve_slowdown_gain: preferred lateral passing clearance, and how hard speed drops with steering angle (0 = never, 1 = full lock means min speed)."
   ],
   "audio": {
     "speaker_enable_cmd": "robot_hat enable_speaker",
@@ -55,5 +58,16 @@
   "embeddings": {
     "model_path": "/home/picarx/layer_b/data/models/minilm/model.onnx",
     "tokenizer_path": "/home/picarx/layer_b/data/models/minilm/tokenizer.json"
+  },
+  "kinematics": {
+    "wheelbase_mm": 95,
+    "max_steer_deg": 30,
+    "steering_rate_deg_per_sec": 60
+  },
+  "steering": {
+    "area_distance_k": 35.0,
+    "clearance_m": 0.15,
+    "cruise_speed": 25,
+    "curve_slowdown_gain": 0.9
   }
 }
