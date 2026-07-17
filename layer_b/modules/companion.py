@@ -66,6 +66,7 @@ sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 import robot_config
 from semantic_store import SemanticStore
+from spatial_store import SpatialStore
 import speech_match
 
 import threading
@@ -74,7 +75,7 @@ import time
 import json
 from collections import deque
 
-HISTORY_TURNS = 12          # user+assistant messages kept for context
+HISTORY_TURNS = 20          # user+assistant messages kept for context
 SELF_MODEL_MAX = 5          # self-model facts folded into the personality prompt
 WORKER_THREADS = 2
 REPLY_TIMEOUT = 8.0
@@ -231,6 +232,27 @@ TOOLS = [
          "name": {"type": "string",
                   "description": "optional saved phone name to tether to"}},
          "required": []}},
+    {"name": "where_is_object",
+     "description": "Look up in your spatial memory where an object was last "
+                    "seen while exploring (which place, how long ago). Use when "
+                    "the person asks where something is or where you saw it.",
+     "input_schema": {"type": "object", "properties": {
+         "label": {"type": "string",
+                   "description": "the object, e.g. 'bottle' or 'chair'"}},
+         "required": ["label"]}},
+    {"name": "recall_memory",
+     "description": "Search your long-term memory of learned facts about the "
+                    "home, the people in it, and your own experiences. Use when "
+                    "asked what you know or remember about something.",
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string",
+                   "description": "a word or short phrase to search for"}},
+         "required": ["query"]}},
+    {"name": "list_known_people",
+     "description": "List the people whose faces you have learned to recognize. "
+                    "Use when asked who you know or whether you'd recognize "
+                    "someone.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "check_vital_stats",
      "description": "Check your own physical health: battery voltage/percentage, "
                     "CPU temperature, and free disk space. Use when the person asks "
@@ -247,6 +269,32 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 ]
 
+PEOPLE_DIR = f"{DATA_DIR}/people"
+
+
+def _known_people():
+    """Names of enrolled people (person_memory.py owns data/people/);
+    fail-soft to [] when face memory isn't set up."""
+    try:
+        return sorted(d for d in os.listdir(PEOPLE_DIR)
+                      if os.path.isdir(os.path.join(PEOPLE_DIR, d)))
+    except OSError:
+        return []
+
+
+def _spoken_age(seconds):
+    """'just now' / '5 minutes ago' / 'about 3 hours ago'."""
+    if seconds < 90:
+        return "just now"
+    minutes = seconds / 60.0
+    if minutes < 90:
+        return f"{minutes:.0f} minutes ago"
+    hours = minutes / 60.0
+    if hours < 36:
+        return f"about {hours:.0f} hour{'s' if round(hours) != 1 else ''} ago"
+    return f"about {hours / 24.0:.0f} days ago"
+
+
 SYSTEM_PROMPT = """You are the voice and personality of a small autonomous robot car (PiCar-X).
 You are friendly, a little playful, and curious about the world you're rolling around in.
 
@@ -261,9 +309,15 @@ asked directly what you see/sense.
 
 You do NOT control your own motors from this conversation - a separate, instant,
 safety-critical command system handles "explore", "stop", "status", "objects",
-"history", and "battery". If someone asks you to move, stop, explore, or asks a
+"history", "battery", "go to <place>", "where is <object>", "call this place
+<name>", and "who am I". If someone asks you to move, stop, explore, or asks a
 question one of those commands already answers, tell them briefly to just say that
-word directly instead of trying to comply here yourself.
+phrase directly instead of trying to comply here yourself.
+
+If the sensor snapshot names the person you're looking at, that IS who you're
+talking to - address them by name naturally, like a friend would. If someone new
+wants you to remember them, tell them to face you and say "remember me, I am"
+followed by their name.
 
 Some messages include a photo: that is what you see through your camera RIGHT NOW.
 Use it naturally - describe what's actually in it when asked what you see or what
@@ -291,6 +345,9 @@ class Companion:
         # Read-only view of what reflection.py has learned; fail-soft
         # (returns [] until the first reflection has ever run).
         self.semantic = SemanticStore(readonly=True)
+        # Read-only view of the spatial map + object sightings
+        # (location_graph owns spatial.db); fail-soft to "no map yet".
+        self.spatial = SpatialStore(readonly=True)
         # Intent arbiter state
         self.learned_intents = self._load_learned_intents()
         self.last_repair_at = 0.0
@@ -491,7 +548,11 @@ class Companion:
 
         parts = []
         face = snap.get("face", {})
-        parts.append("sees a face" if face.get("detected") and not face.get("stale", True) else "doesn't currently see a face")
+        person = snap.get("person", {})
+        if person.get("name") and not person.get("stale", True):
+            parts.append(f"recognizes the person in front of it: {person['name']}")
+        else:
+            parts.append("sees a face" if face.get("detected") and not face.get("stale", True) else "doesn't currently see a face")
 
         objects = snap.get("objects", {})
         if not objects.get("stale", True) and objects.get("items"):
@@ -736,6 +797,37 @@ class Companion:
                     req["name"] = tool_input["name"]
                 self.bus.publish(BLUETOOTH_CONNECT_TOPIC, req)
                 return "Trying to tether over Bluetooth to the phone."
+            if name == "where_is_object":
+                label_query = str(tool_input.get("label") or "").strip().lower()
+                if not label_query:
+                    return "No object name was given."
+                label = speech_match.best_label_match(
+                    label_query, self.spatial.sighting_labels())
+                places = self.spatial.object_locations(label) if label else []
+                if not places:
+                    return f"No memory of ever seeing a {label_query} anywhere."
+                top = places[0]
+                out = (f"Last saw a {label} at {top['place']}, "
+                       f"{_spoken_age(time.time() - top['last_seen'])}; "
+                       f"seen there {top['times_seen']} time(s).")
+                if len(places) > 1:
+                    out += f" Also seen at {places[1]['place']}."
+                return out
+            if name == "recall_memory":
+                query = str(tool_input.get("query") or "").strip()
+                if not query:
+                    return "No search query was given."
+                facts = self.semantic.search_facts(query)
+                if not facts:
+                    return f"Nothing in long-term memory matches '{query}'."
+                return " | ".join(f"{f['subject']}: {f['fact']}" for f in facts)
+            if name == "list_known_people":
+                names = _known_people()
+                if not names:
+                    return ("No faces learned yet. A person can say 'remember "
+                            "me, I am <name>' while facing the camera to be "
+                            "learned.")
+                return "Recognizes these people by face: " + ", ".join(names)
             if name == "check_vital_stats":
                 with self.lock:
                     health = dict(self.latest_health) if self.latest_health else None
