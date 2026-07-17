@@ -103,13 +103,21 @@ class SteerAroundTickTest(unittest.TestCase):
         return [p["action"] for p in self.bus.of("picarx/intent/move")]
 
     def test_steers_around_and_keeps_moving(self):
+        # The smooth controller alternates primitives (steer tick, then
+        # drive tick) through the arbiter's one-intent-per-source channel,
+        # so both appear across TWO ticks, with a float angle and a
+        # curvature/proximity-scaled speed.
+        self._drive(_world([_obj(area=0.3, offset=80)]))
         self._drive(_world([_obj(area=0.3, offset=80)]))
         self.assertEqual(self.fa.state, "CRUISING")        # no evasion
         turns = [a for a in self._intents() if a.get("direction") == "turn"]
         forwards = [a for a in self._intents() if a.get("direction") == "forward"]
         self.assertTrue(turns and turns[-1]["angle"] < 0)  # away from the right
+        self.assertIsInstance(turns[-1]["angle"], float)
         self.assertTrue(forwards)
-        self.assertEqual(forwards[-1]["speed"], field_agent.AVOID_SPEED)
+        c = self.fa.steering
+        self.assertLessEqual(forwards[-1]["speed"], c.cruise_speed)
+        self.assertGreater(forwards[-1]["speed"], 0)
         self.assertIsNotNone(self.fa.avoid_active_angle)
 
     def test_journal_entry_on_activation_only(self):
