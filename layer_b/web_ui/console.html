@@ -40,6 +40,14 @@
   #log .robot { color:var(--accent); }
   #log .you, #log .heard { color:var(--ok); }
   #conn { float:right; font-size:.75rem; color:var(--dim); }
+  .fbbtn { padding:0 7px; font-size:.8rem; border-radius:6px; margin-left:4px;
+           background:#2a323d; line-height:1.5; }
+  .fbbtn.ok:hover { background:var(--ok); color:#08130c; }
+  .fbbtn.bad:hover { background:var(--off); color:#180808; }
+  .fb { margin-left:6px; font-weight:700; }
+  .fb.correct { color:var(--ok); }
+  .fb.incorrect { color:var(--off); }
+  .hint { color:var(--dim); font-size:.8rem; margin-top:6px; }
 </style>
 </head>
 <body>
@@ -74,7 +82,43 @@
     <button onclick="say('why did you do that')">Why?</button>
     <button onclick="say('history')">History</button>
     <button onclick="say('battery')">Battery</button>
+    <button onclick="say('who do you see')">Who's there?</button>
   </div>
+</div>
+
+<div class="card">
+  <h2>Memory &amp; navigation</h2>
+  <div class="row">
+    <input type="text" id="whereis" placeholder="object e.g. bottle">
+    <button onclick="sayWith('whereis', 'where is the ')">Where is…</button>
+  </div>
+  <div class="row">
+    <input type="text" id="goto" list="places-list" placeholder="place e.g. kitchen">
+    <button onclick="sayWith('goto', 'go to the ')">Go to</button>
+    <button onclick="sayWith('goto', &quot;what's in the &quot;)">What's in…</button>
+  </div>
+  <div class="row">
+    <input type="text" id="placename" placeholder="name for the current spot">
+    <button onclick="sayWith('placename', 'call this place the ')">Name this place</button>
+  </div>
+  <datalist id="places-list"></datalist>
+  <div class="hint" id="places-known">no places mapped yet</div>
+</div>
+
+<div class="card">
+  <h2>People &amp; following</h2>
+  <div class="grid">
+    <button onclick="say('robot, follow me')">Follow me</button>
+    <button onclick="say('stop following')">Stop following</button>
+    <button onclick="say('who am i')">Who am I?</button>
+  </div>
+  <div class="row">
+    <input type="text" id="enroll" placeholder="first name">
+    <button onclick="sayWith('enroll', 'remember me, i am ')">Learn my face</button>
+  </div>
+  <div class="hint">face the robot's camera while it learns · say
+    "forget &lt;name&gt;" to remove someone</div>
+  <div class="hint" id="people-known">no faces learned yet</div>
 </div>
 
 <div class="card">
@@ -83,7 +127,7 @@
     <button onclick="say('play radio')">Play</button>
     <button onclick="say('stop radio')">Stop</button>
     <button onclick="say('next station')">Next</button>
-    <button onclick="say(\"what's playing\")">Now playing</button>
+    <button onclick="say(&quot;what's playing&quot;)">Now playing</button>
     <button onclick="say('list stations')">Saved list</button>
   </div>
   <div class="row">
@@ -110,11 +154,16 @@
   <div class="stat"><span>Obstacle distance</span><span id="s-dist">–</span></div>
   <div class="stat"><span>Location</span><span id="s-loc">–</span></div>
   <div class="stat"><span>Mission</span><span id="s-goal">–</span></div>
+  <div class="stat"><span>Sees</span><span id="s-sees">–</span></div>
+  <div class="stat"><span>Talking to</span><span id="s-person">–</span></div>
+  <div class="stat"><span>Following</span><span id="s-follow">–</span></div>
   <div class="stat"><span>Radio</span><span id="s-radio">–</span></div>
 </div>
 
 <div class="card">
   <h2>Log</h2>
+  <div class="hint">✓ / ✗ a robot line to teach it whether it understood you -
+    ✗ asks what you actually wanted</div>
   <div id="log"></div>
 </div>
 
@@ -127,6 +176,8 @@ async function post(path, body) {
   catch (e) { /* poll loop shows disconnect */ }
 }
 function say(text) { post('/say', {text}); }
+function sayWith(inputId, prefix) { const el = document.getElementById(inputId);
+  if (el.value.trim()) { say(prefix + el.value.trim()); el.value=''; } }
 function freeSay() { const el = document.getElementById('free');
   if (el.value.trim()) { say(el.value.trim()); el.value=''; } }
 function tune() { const el = document.getElementById('dial');
@@ -178,6 +229,39 @@ window.addEventListener('pagehide', () => {
 
 function esc(s) { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }
 
+// ---- intent feedback (check / X on robot responses) ----
+let logEntries = [];
+document.getElementById('log').addEventListener('click', async ev => {
+  const btn = ev.target.closest('button[data-fb]');
+  if (!btn) return;
+  const e = logEntries[+btn.dataset.idx];
+  const verdict = btn.dataset.fb;
+  let correction = '';
+  if (verdict === 'incorrect') {
+    correction = (prompt(
+      'What did you want the robot to do?\n' +
+      '(it will do it now AND learn the phrasing - leave blank to just flag it)')
+      || '').trim();
+  }
+  await post('/feedback', {verdict, utterance: e.re || '',
+                           response: e.text, correction});
+  poll();  // pick up the ✓/✗ mark immediately
+});
+
+function renderLog(entries) {
+  logEntries = entries;
+  document.getElementById('log').innerHTML = entries.map((e, i) => {
+    let fb = '';
+    if (e.kind === 'robot') {
+      fb = e.fb
+        ? `<span class="fb ${e.fb}">${e.fb === 'correct' ? '✓' : '✗'}</span>`
+        : `<button class="fbbtn ok" data-fb="correct" data-idx="${i}" title="understood me">✓</button>` +
+          `<button class="fbbtn bad" data-fb="incorrect" data-idx="${i}" title="misunderstood me">✗</button>`;
+    }
+    return `<div class="${e.kind}">${e.t} ${e.kind==='robot'?'🤖':'🗣'} ${esc(e.text)}${fb}</div>`;
+  }).join('');
+}
+
 async function poll() {
   try {
     const r = await fetch('/state'); const s = await r.json();
@@ -194,8 +278,19 @@ async function poll() {
     document.getElementById('s-goal').textContent = s.goal.label || 'none';
     document.getElementById('s-radio').textContent =
       s.radio.playing ? (s.radio.station + (s.radio.dial ? ' ('+s.radio.dial+')' : '')) : 'off';
-    document.getElementById('log').innerHTML = s.log.map(e =>
-      `<div class="${e.kind}">${e.t} ${e.kind==='robot'?'🤖':'🗣'} ${esc(e.text)}</div>`).join('');
+    document.getElementById('s-sees').textContent =
+      (s.sees && s.sees.length) ? s.sees.join(', ') : 'nothing recognized';
+    document.getElementById('s-person').textContent = s.person || '–';
+    document.getElementById('s-follow').textContent = s.follow ? 'YES' : 'no';
+    document.getElementById('places-list').innerHTML =
+      (s.places || []).map(p => `<option value="${esc(p)}">`).join('');
+    document.getElementById('places-known').textContent =
+      (s.places && s.places.length) ? 'known places: ' + s.places.join(', ')
+                                    : 'no places mapped yet';
+    document.getElementById('people-known').textContent =
+      (s.people && s.people.length) ? 'recognizes: ' + s.people.join(', ')
+                                    : 'no faces learned yet';
+    renderLog(s.log);
   } catch (e) {
     document.getElementById('conn').textContent = 'disconnected';
   }

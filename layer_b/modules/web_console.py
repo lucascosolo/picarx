@@ -32,8 +32,11 @@ os.getlogin = getpass.getuser
 
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, "/home/picarx/layer_b/modules")
 from broker_client import Bus
 import robot_config
+from spatial_store import SpatialStore
+import person_memory
 
 import base64
 import json
@@ -66,7 +69,12 @@ class ConsoleState:
         self.location = {}
         self.goal = {}
         self.world = {}
+        self.follow = {}
         self.log = deque(maxlen=LOG_LINES)
+        # Most recent user text ("you" or "heard") - each robot log line
+        # records it as "re", so the check/X feedback buttons know which
+        # utterance a response was interpreting.
+        self.last_user_text = None
         # Live camera view
         self.camera_jpeg = None       # latest JPEG bytes, or None until first frame
         self.camera_ts = 0.0          # when that frame was captured (robot clock)
@@ -75,7 +83,24 @@ class ConsoleState:
 
     def add_log(self, kind, text):
         with self.lock:
-            self.log.appendleft({"t": time.strftime("%H:%M:%S"), "kind": kind, "text": text})
+            entry = {"t": time.strftime("%H:%M:%S"), "kind": kind, "text": text}
+            if kind in ("you", "heard"):
+                self.last_user_text = text
+            elif kind == "robot":
+                entry["re"] = self.last_user_text
+            self.log.appendleft(entry)
+
+    def mark_feedback(self, response_text, verdict):
+        """Stamp the newest un-judged robot log line matching this
+        response with the user's verdict, so the UI shows it persistently
+        across re-renders. Returns True if a line was marked."""
+        with self.lock:
+            for entry in self.log:
+                if (entry["kind"] == "robot" and entry["text"] == response_text
+                        and "fb" not in entry):
+                    entry["fb"] = verdict
+                    return True
+        return False
 
     def set_camera_frame(self, jpeg_bytes, ts):
         with self.lock:
@@ -115,6 +140,10 @@ class ConsoleState:
     def snapshot(self):
         with self.lock:
             battery = (self.world.get("battery") or {})
+            objects = (self.world.get("objects") or {})
+            person = (self.world.get("person") or {})
+            seen = sorted({o.get("label") for o in objects.get("items", [])
+                           if o.get("label")}) if not objects.get("stale", True) else []
             return {
                 "mic_enabled": self.mic_enabled,
                 "radio": self.radio,
@@ -123,12 +152,28 @@ class ConsoleState:
                 "battery_v": battery.get("voltage"),
                 "battery_low": battery.get("low"),
                 "distance_cm": self.world.get("distance_cm"),
+                "sees": seen,
+                "person": person.get("name") if not person.get("stale", True) else None,
+                "follow": bool(self.follow.get("enabled")),
                 "log": list(self.log),
             }
 
 
 STATE = ConsoleState()
 BUS = None  # set in main
+# Read-only map access for the places list (location_graph owns writes);
+# fail-soft to "no places yet" like every other reader.
+SPATIAL = SpatialStore(readonly=True)
+
+
+def _memory_snapshot():
+    """Known places + enrolled people for the UI (place buttons, roster).
+    Cheap reads at poll cadence; both fail soft to empty lists."""
+    try:
+        places = [l["label"] for l in SPATIAL.all_locations()]
+    except Exception:
+        places = []
+    return {"places": places[:20], "people": person_memory.known_people()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -160,7 +205,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, b"<h1>PicarX console</h1><p>web_ui/console.html missing.</p>",
                            "text/html; charset=utf-8")
         elif self.path == "/state":
-            self._send(200, STATE.snapshot())
+            self._send(200, {**STATE.snapshot(), **_memory_snapshot()})
         elif self.path == "/camera.jpg" or self.path.startswith("/camera.jpg?"):
             # Fetching a frame is itself the "someone is watching" signal:
             # start vision's stream on the first request, keep the
@@ -194,6 +239,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         elif self.path == "/mic":
             BUS.publish("picarx/audio/mic_control", {"enabled": bool(body.get("enabled", True))})
+            self._send(200, {"ok": True})
+        elif self.path == "/feedback":
+            # Check/X on a robot response: grade how the last utterance
+            # was interpreted. Rides the same MQTT bus as everything else
+            # (picarx/intent/feedback -> companion's intent teacher). A
+            # typed correction additionally executes through the normal
+            # heard pipeline, exactly like the /say box - same trust.
+            verdict = body.get("verdict")
+            if verdict not in ("correct", "incorrect"):
+                self._send(400, {"error": "verdict must be correct|incorrect"})
+                return
+            utterance = (body.get("utterance") or "").strip().lower()
+            response = (body.get("response") or "").strip()
+            correction = (body.get("correction") or "").strip().lower()
+            payload = {"verdict": verdict, "utterance": utterance,
+                       "response": response, "origin": "web", "ts": time.time()}
+            if correction:
+                payload["correction"] = correction
+            BUS.publish("picarx/intent/feedback", payload)
+            STATE.mark_feedback(response, verdict)
+            if correction:
+                BUS.publish("picarx/audio/heard",
+                            {"text": correction, "source": "user_correction"})
+                STATE.add_log("you", correction)
             self._send(200, {"ok": True})
         elif self.path == "/camera":
             # Explicit toggle from the live-view switch. Turning it off
@@ -244,6 +313,10 @@ def on_goal(p):
     with STATE.lock:
         STATE.goal = p if p.get("location_id") is not None else {}
 
+def on_follow_state(p):
+    with STATE.lock:
+        STATE.follow = p
+
 def on_vision_frame(p):
     b64 = p.get("jpeg")
     if not b64:
@@ -275,6 +348,7 @@ def main():
     BUS.subscribe("picarx/state/world", on_world)
     BUS.subscribe("picarx/exploration/location_change", on_location)
     BUS.subscribe("picarx/exploration/active_goal", on_goal)
+    BUS.subscribe("picarx/tools/follow/state", on_follow_state)
     BUS.subscribe(VISION_FRAME_TOPIC, on_vision_frame)
 
     try:
