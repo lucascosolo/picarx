@@ -61,13 +61,13 @@ def _side_to_digits(tokens):
     if all(t in _ONES for t in tokens):
         return "".join(str(_ONES[t]) for t in tokens)
     # Otherwise grouped arithmetic ("ninety eight", "one hundred eight").
-    total, current = 0, 0
+    current = 0
     for t in tokens:
         if t == "hundred":
             current = (current or 1) * 100
         else:
             current += _NUMWORD[t]
-    return str(total + current)
+    return str(current)
 
 
 def parse_dial(text):
@@ -75,7 +75,7 @@ def parse_dial(text):
     frequency, or None if the text doesn't clearly contain one."""
     text = text.lower()
     # Digits already present: "98.7", "98 7", "1025", "987".
-    m = re.search(r"\b(\d{2,3})(?:[.\s](\d))?\b", text)
+    m = re.search(r"\b(\d{2,4})(?:[.\s](\d))?\b", text)
     if m and m.group(2):
         return f"{m.group(1)}.{m.group(2)}"
     if m and len(m.group(1)) >= 4:                    # e.g. "1025" -> 102.5
@@ -145,7 +145,11 @@ RULES = [
                 r"\b(?:station|song)\b.*\b(?:next|skip)\b"),
      "picarx/tools/radio", lambda m, t: {"command": "next"}),
     # Tune to a frequency/dial: needs a tuning word AND a number.
-    (re.compile(r"\b(?:tune|station|frequency|dial|fm|to)\b.*\d|"
+    # NOTE: "to" is deliberately NOT a tuning word - "\bto\b.*\d" matched
+    # any utterance shaped like "... to <number> ..." ("set a timer to 20
+    # minutes", "count to 10") and hijacked it into a radio tune. Real
+    # tune requests always carry one of the actual radio words below.
+    (re.compile(r"\b(?:tune|station|frequency|dial|fm)\b.*\d|"
                 r"\b(?:tune|station|frequency|dial|fm)\b.*\b(?:one|two|three|four|five|six|"
                 r"seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
                 r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
