@@ -139,3 +139,25 @@ Note: the orchestrator runs `layer_b/modules/`; the root-level
 `field_agent.py`/`coach.py`/`audio_nodes.py` copies are kept in sync
 with `modules/` as of this work (the modules/ copies had fallen behind
 the newer root copies — both now match).
+
+## Smooth Ackermann steering controller (2026-07-17)
+
+`layer_b/modules/steering_controller.py` replaces the discrete
+steer-around law with a continuous local-arc planner: vision objects
+become (bearing, distance) estimates, opposite-side threats sum and
+cancel (gap threading), and a pure-pursuit arc (`kappa = 2*sin(alpha)/Ld`,
+`angle = atan(wheelbase * kappa)`) produces FLOAT steering angles that
+are exponentially filtered and hard rate-limited, with speed scaled down
+by curvature and proximity. field_agent publishes its output as ordinary
+vetoable intents, alternating one primitive per tick (steer/drive) so
+both reach the safety daemon through the arbiter's one-intent-per-source
+channel; emergencies (evade/coach/hypothesis) still preempt it, and if
+the module fails to import the old discrete law runs unchanged.
+
+Tuning (config.json): `kinematics.wheelbase_mm` (measure your chassis),
+`kinematics.steering_rate_deg_per_sec` (lower = smoother arcs),
+`steering.area_distance_k` (area->distance calibration: put an obstacle
+at a known distance and set `k = distance_cm * sqrt(area_ratio)`),
+`steering.clearance_m` (lateral passing clearance),
+`steering.curve_slowdown_gain` (speed drop with steering angle).
+Inspect behaviour off-robot with `python3 tools/simulate_steer.py`.
