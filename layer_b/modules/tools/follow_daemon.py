@@ -99,6 +99,7 @@ class FollowDaemon:
         self.bus = Bus()
         self.lock = threading.Lock()
         self.enabled = False
+        self.enabled_at = 0.0
         # Latest target info: (offset_px, frame_width, area_ratio_or_None, ts)
         self.person = None
         self.face = None
@@ -114,6 +115,17 @@ class FollowDaemon:
             self.enabled = want
             self.last_sent_angle = 0
             self.lost_announced = False
+            if want and not was:
+                # Fresh start: forget sightings from before this session (a
+                # person box from an hour ago must not count as "just lost")
+                # and remember when following began, so the lost-target
+                # timers measure from NOW, not from epoch 0 - without this,
+                # enabling follow before the detector has produced a person
+                # made gone_for huge and the daemon gave up ("I lost you")
+                # in the very first tick after saying it would follow.
+                self.enabled_at = time.time()
+                self.person = None
+                self.face = None
         if want and not was:
             self.bus.publish(SPEAK_TOPIC, {"text": "Okay, I'll follow you.", "ts": time.time()})
         elif was and not want:
@@ -201,9 +213,13 @@ class FollowDaemon:
 
     def _handle_lost(self, now):
         # Find the freshest sighting timestamp to measure how long it's been.
+        # Never seen anyone this session -> measure from when follow was
+        # enabled, so the robot waits the normal windows to acquire a target
+        # instead of instantly concluding it lost one it never had.
         with self.lock:
             stamps = [t[3] for t in (self.person, self.face) if t]
-        last_seen = max(stamps) if stamps else 0.0
+            enabled_at = self.enabled_at
+        last_seen = max(stamps) if stamps else enabled_at
         gone_for = now - last_seen
         if gone_for >= LOST_GIVEUP_SEC:
             with self.lock:

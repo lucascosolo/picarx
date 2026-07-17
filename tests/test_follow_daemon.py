@@ -112,6 +112,24 @@ class FollowDaemonBehaviourTest(unittest.TestCase):
         self.d._tick(base + fd.LOST_GIVEUP_SEC + 0.1)  # long lost -> disable
         self.assertFalse(self.d.enabled)
 
+    def test_enable_without_target_waits_instead_of_instant_giveup(self):
+        # Regression: enabling follow before the detector has produced a
+        # person (its SSD pass runs every ~1.5s) measured "lost" time from
+        # epoch 0 and disabled itself with "I lost you" on the first tick.
+        self.d.on_control({"enabled": True})
+        self.d._tick(time.time())
+        self.assertTrue(self.d.enabled)
+        # Holds still while waiting to acquire, doesn't drive blind.
+        self.assertEqual(self._intents()[-1]["action"], {"direction": "stop"})
+
+    def test_enable_clears_stale_sightings(self):
+        # A person box from a previous session must not seed the new one.
+        self.d.person = (0, 640, 0.1, 12345.0)
+        self.d.face = (0, 640, None, 12345.0)
+        self.d.on_control({"enabled": True})
+        self.assertIsNone(self.d.person)
+        self.assertIsNone(self.d.face)
+
     def test_spoken_stop_disables(self):
         self.d.on_control({"enabled": True})
         self.assertTrue(self.d.enabled)
