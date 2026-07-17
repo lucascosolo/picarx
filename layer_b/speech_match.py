@@ -99,6 +99,26 @@ def looks_command_like(canonical_text):
     return any(t in DOMAIN_VOCAB for t in canonical_text.split())
 
 
+def best_label_match(query, labels):
+    """Match a spoken name against a set of known labels (object labels
+    from the sighting store, place labels from the map). Tolerant the
+    same way the rest of this module is: exact beats substring beats a
+    conservative difflib snap ('bottel' -> 'bottle'), and None means
+    'honestly unknown' rather than a risky guess."""
+    q = (query or "").strip().lower()
+    labels = [l for l in (labels or []) if l]
+    if not q or not labels:
+        return None
+    lowered = {l.lower(): l for l in labels}
+    if q in lowered:
+        return lowered[q]
+    for low, original in lowered.items():
+        if q in low or low in q:
+            return original
+    close = difflib.get_close_matches(q, list(lowered), n=1, cutoff=0.75)
+    return lowered[close[0]] if close else None
+
+
 # ---------------------------------------------------------------------
 # Utterance quality scoring (noise rejection)
 # ---------------------------------------------------------------------
