@@ -107,6 +107,7 @@ INTERESTING_TOPICS = (
     "picarx/exploration/goal_progress",
     "picarx/coach/surprise",
     "picarx/action/result",
+    "picarx/intent/feedback",
 )
 
 SYSTEM_PROMPT = """You are the offline reflection process of a small autonomous robot car
@@ -230,6 +231,14 @@ class Reflection:
             where = (p.get("location") or {}).get("label") or "unknown place"
             return (f"sensor hypothesis test at {where}: {p.get('question')} "
                     f"resolved to {p.get('resolution')}")
+        if topic == "picarx/intent/feedback":
+            utterance = p.get("utterance")
+            if not utterance:
+                return None
+            if p.get("verdict") == "incorrect":
+                wanted = f" (they wanted: {p['correction']})" if p.get("correction") else ""
+                return f"user flagged a MISUNDERSTOOD request: '{utterance}'{wanted}"
+            return f"user confirmed a request was understood right: '{utterance}'"
         if topic == "picarx/action/result":
             result = p.get("result") or {}
             if result.get("status") == "vetoed":

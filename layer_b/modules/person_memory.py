@@ -65,6 +65,17 @@ FACE_CROP_TOPIC = "picarx/vision/face_crop"
 PERSON_TOPIC = "picarx/vision/person"
 SPEAK_TOPIC = "picarx/audio/speak"
 
+def known_people(people_dir=PEOPLE_DIR):
+    """Names of enrolled people (one directory per person). Module-level
+    so light consumers (field_agent's reports, the web console) can ask
+    without constructing a recognizer. Fail-soft to []."""
+    try:
+        return sorted(d for d in os.listdir(people_dir)
+                      if os.path.isdir(os.path.join(people_dir, d)))
+    except OSError:
+        return []
+
+
 ENROLL_SAMPLES = 8          # face crops collected per enrollment
 ENROLL_TIMEOUT = 25.0       # give up if the face wanders off mid-enrollment
 MAX_SAMPLES_PER_PERSON = 40 # rolling cap; newest samples win
@@ -153,11 +164,7 @@ class FaceRecognizer:
 
     def _people(self):
         """Sorted list of enrolled names (one directory per person)."""
-        try:
-            return sorted(d for d in os.listdir(self.people_dir)
-                          if os.path.isdir(os.path.join(self.people_dir, d)))
-        except OSError:
-            return []
+        return known_people(self.people_dir)
 
     def known_names(self):
         return self._people()
