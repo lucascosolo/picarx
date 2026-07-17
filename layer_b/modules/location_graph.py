@@ -73,6 +73,16 @@ class LocationGraph:
         now = time.time()
         loc = self.store.match_or_create(fingerprint, now)
 
+        # Object-place memory: every label this sweep saw is recorded
+        # against the resolved place, so "where is the bottle?" has a
+        # durable answer ("the kitchen, 20 minutes ago") instead of only
+        # the last few seconds of tracked objects.
+        labels = {label
+                  for s in payload.get("sightings") or []
+                  for label in s.get("labels") or []}
+        if labels:
+            self.store.note_sightings(loc["id"], labels, now)
+
         with self.lock:
             prev_id = self.current_id
             changed = loc["id"] != prev_id
@@ -123,6 +133,41 @@ class LocationGraph:
             "reason": reason, "location": location, "ts": time.time(),
         })
 
+    # ---------- inbound: user names a place ----------
+
+    def on_name_place(self, payload):
+        """Voice command routed by field_agent ("call this place the
+        kitchen"): rename a location. The write stays here because
+        location_graph is the SOLE writer to spatial.db. Defaults to the
+        current location when no explicit id is given."""
+        name = (payload.get("name") or "").strip()
+        if not name:
+            return
+        loc_id = payload.get("location_id")
+        if loc_id is None:
+            with self.lock:
+                loc_id = self.current_id
+        if loc_id is None:
+            self.bus.publish("picarx/audio/speak", {
+                "text": "I'm not sure where I am yet - let me scan around first.",
+                "ts": time.time()})
+            return
+        old = self.store.get_location(loc_id)
+        new_label = self.store.rename_location(loc_id, name)
+        if new_label is None:
+            return
+        with self.lock:
+            if self.current_id == loc_id:
+                self.current_label = new_label
+        print(f"Location graph: renamed '{old['label'] if old else loc_id}' -> '{new_label}'")
+        self.publish_decision(
+            "place_named",
+            {"location_id": loc_id, "label": new_label},
+            f"the user told me this place is called {new_label}",
+            location={"id": loc_id, "label": new_label})
+        self.bus.publish("picarx/audio/speak", {
+            "text": f"Got it, this is {new_label}.", "ts": time.time()})
+
     # ---------- inbound: physical hypothesis outcomes (map decay) ----------
 
     def on_hypothesis(self, payload):
@@ -168,6 +213,7 @@ class LocationGraph:
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
         self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
+        self.bus.subscribe("picarx/exploration/name_place", self.on_name_place)
         print(f"Location graph active ({self.store.location_count()} places known)")
         while True:
             time.sleep(5)

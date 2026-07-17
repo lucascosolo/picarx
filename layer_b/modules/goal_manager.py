@@ -91,6 +91,57 @@ class GoalManager:
         elif active is None:
             self._maybe_adopt_goal(now)
 
+    def on_goal_request(self, payload):
+        """A user asked for a destination out loud ("go to the kitchen",
+        routed by field_agent). A user goal replaces whatever curiosity
+        goal is active and skips the uncertainty-score bar - the person
+        outranks the robot's own wanderlust. It still expires on the
+        normal deadline, and the unreachable-place blacklist is bypassed
+        too: an explicit ask deserves a fresh attempt."""
+        location_id = payload.get("location_id")
+        if location_id is None:
+            return
+        loc = self.store.get_location(location_id)
+        if loc is None:
+            return
+        now = time.time()
+        with self.lock:
+            previous = dict(self.active) if self.active else None
+        if previous is not None and previous["location_id"] != location_id:
+            # Superseded, not abandoned: the robot didn't fail to reach the
+            # old goal, the user changed the plan - so no failure is counted
+            # against the old goal's location.
+            self.bus.publish("picarx/exploration/goal_progress", {
+                "goal_id": previous["goal_id"], "status": "superseded",
+                "location_id": previous["location_id"], "label": previous["label"],
+                "elapsed": round(now - previous["started_at"], 1), "ts": now,
+            })
+        target_labels = sorted({l.split(":", 1)[1]
+                                for l in loc["fingerprint"].get("labels") or []})
+        goal = {
+            "goal_id": str(uuid.uuid4()),
+            "location_id": location_id,
+            "label": loc["label"],
+            "started_at": now,
+            "deadline": now + GOAL_DEADLINE_SEC,
+            "user_requested": True,
+        }
+        with self.lock:
+            self.active = goal
+        reason = "the user asked me to go there"
+        print(f"Goal manager: user goal -> {loc['label']}")
+        self.bus.publish("picarx/exploration/active_goal", {
+            "goal_id": goal["goal_id"], "location_id": location_id,
+            "label": loc["label"], "target_labels": target_labels,
+            "reason": reason, "deadline": goal["deadline"], "ts": now,
+        })
+        self.bus.publish("picarx/decision", {
+            "source": "goal_manager", "kind": "goal_adopted",
+            "choice": {"location_id": location_id, "label": loc["label"],
+                       "user_requested": True},
+            "reason": reason, "ts": now,
+        })
+
     # ---------- goal lifecycle ----------
 
     def _maybe_adopt_goal(self, now):
@@ -172,6 +223,7 @@ class GoalManager:
     def run(self):
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
+        self.bus.subscribe("picarx/exploration/goal_request", self.on_goal_request)
         print(f"Goal manager active ({len(self.failures)} places with failed attempts on record)")
         while True:
             time.sleep(CHECK_INTERVAL)
