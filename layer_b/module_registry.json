@@ -1,5 +1,6 @@
 [
   {"name": "vision_basic", "version": "0.1", "entrypoint": "vision_basic.py", "enabled": true},
+  {"name": "person_memory", "version": "0.1", "entrypoint": "person_memory.py", "enabled": true},
   {"name": "distance_sensor", "version": "0.1", "entrypoint": "distance_sensor.py", "enabled": true},
   {"name": "audio_nodes", "version": "0.1", "entrypoint": "audio_nodes.py", "enabled": true},
   {"name": "arbiter", "version": "0.1", "entrypoint": "arbiter.py", "enabled": true},

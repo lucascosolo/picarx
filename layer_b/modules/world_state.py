@@ -105,6 +105,10 @@ STALE_AFTER = {
     "objects": 2.0,
     "heard": 15.0,
     "battery": 20.0,
+    # Identity is re-asserted every few seconds while the person is in
+    # view (person_memory's REPUBLISH_INTERVAL is 3s), so anything much
+    # older means they've stepped away.
+    "person": 10.0,
 }
 
 # An object counts as "approaching" once its bounding-box area grows
@@ -124,6 +128,9 @@ class WorldState:
 
         self.state = {
             "face": {"detected": False, "updated_at": None},
+            # Recognized person (person_memory.py, optional): who the
+            # robot currently believes it's looking at.
+            "person": {"name": None, "confidence": None, "updated_at": None},
             "distance_cm": None,
             "distance_updated_at": None,
             "objects": {},  # id -> tracked object record (see on_objects)
@@ -146,6 +153,14 @@ class WorldState:
     def on_face(self, payload):
         with self.lock:
             self.state["face"] = {**payload, "updated_at": time.time()}
+
+    def on_person(self, payload):
+        with self.lock:
+            self.state["person"] = {
+                "name": payload.get("name"),
+                "confidence": payload.get("confidence"),
+                "updated_at": time.time(),
+            }
 
     def on_distance(self, payload):
         with self.lock:
@@ -252,6 +267,7 @@ class WorldState:
     def build_snapshot(self):
         with self.lock:
             face = dict(self.state["face"])
+            person = dict(self.state["person"])
             distance_cm = self.state["distance_cm"]
             distance_updated_at = self.state["distance_updated_at"]
             objects = {tid: dict(obj) for tid, obj in self.state["objects"].items()}
@@ -268,6 +284,10 @@ class WorldState:
             "face": {
                 **face,
                 "stale": self._is_stale(face.get("updated_at"), "face"),
+            },
+            "person": {
+                **person,
+                "stale": self._is_stale(person.get("updated_at"), "person"),
             },
             "distance_cm": distance_cm,
             "distance_stale": self._is_stale(distance_updated_at, "distance"),
@@ -296,6 +316,7 @@ class WorldState:
 
     def run(self):
         self.bus.subscribe("picarx/vision/faces", self.on_face)
+        self.bus.subscribe("picarx/vision/person", self.on_person)
         self.bus.subscribe("picarx/vision/objects", self.on_objects)
         self.bus.subscribe("picarx/sensors/distance", self.on_distance)
         self.bus.subscribe("picarx/audio/heard", self.on_heard)

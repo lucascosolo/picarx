@@ -133,6 +133,18 @@ LOW_POWER_OBJECT_DETECT_INTERVAL = 15.0
 
 FACE_CONFIRM_FRAMES = 3        # consecutive frames before reporting a face
 
+# ---- face crops for person recognition (person_memory.py) ----
+# While a face is confirmed, a small grayscale crop of it is published so
+# person_memory can identify (or learn) WHO it is. Throttled and tiny
+# (100x100 JPEG about once a second) so it costs effectively nothing on
+# top of the Haar pass we already ran; nothing is published while no face
+# is confirmed, and if person_memory isn't running the topic just goes
+# nowhere - same fail-soft optionality as every other consumer.
+FACE_CROP_TOPIC = "picarx/vision/face_crop"
+FACE_CROP_INTERVAL = 1.0
+FACE_CROP_SIZE = (100, 100)
+FACE_CROP_MARGIN = 0.15        # fraction of bbox padded on each side
+
 OBJECT_CONFIRM_HITS = 2        # separate detection passes before publishing a track
 OBJECT_MAX_DISAPPEARED_SEC = 3.0   # how long to keep a track alive with no match
 OBJECT_MATCH_MAX_DIST = 120        # pixels; centroid match distance cap
@@ -529,6 +541,7 @@ def run():
           f"publishing to picarx/vision/faces and picarx/vision/objects")
 
     face_streak = 0
+    last_face_crop = 0.0
     last_object_detect = 0.0
     last_forced_detect = 0.0
     last_motion_thumb = None
@@ -563,6 +576,23 @@ def run():
                 "frame_width": frame_w,
                 "frame_center_offset": (x + w // 2) - (frame_w // 2),
             })
+            # Face crop for person_memory (throttled - see FACE_CROP_*).
+            crop_now = time.time()
+            if crop_now - last_face_crop >= FACE_CROP_INTERVAL:
+                last_face_crop = crop_now
+                mx, my = int(w * FACE_CROP_MARGIN), int(h * FACE_CROP_MARGIN)
+                x1, y1 = max(0, x - mx), max(0, y - my)
+                x2, y2 = min(frame_w, x + w + mx), min(frame_h, y + h + my)
+                if x2 > x1 and y2 > y1:
+                    crop = cv2.resize(gray[y1:y2, x1:x2], FACE_CROP_SIZE)
+                    ok, buf = cv2.imencode(
+                        ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ok:
+                        bus.publish(FACE_CROP_TOPIC, {
+                            "jpeg": base64.b64encode(buf.tobytes()).decode("ascii"),
+                            "w": FACE_CROP_SIZE[0], "h": FACE_CROP_SIZE[1],
+                            "ts": crop_now,
+                        })
         else:
             bus.publish("picarx/vision/faces", {"detected": False})
 

@@ -160,6 +160,20 @@ class SemanticStore:
         facts.sort(key=lambda f: f["confidence"], reverse=True)
         return facts[:limit]
 
+    def search_facts(self, query, limit=5, include_superseded=False):
+        """Facts whose subject OR text contains `query` (case-insensitive
+        LIKE), freshest first. Powers conversational memory recall ("what
+        do you remember about the kitchen?") without needing the exact
+        subject string."""
+        like = f"%{(query or '').strip()[:60]}%"
+        status_sql = "" if include_superseded else "AND status = 'active' "
+        rows = self._query(
+            f"SELECT {self._FACT_COLS} FROM facts "
+            f"WHERE (subject LIKE ? OR fact LIKE ?) {status_sql}"
+            f"ORDER BY updated_at DESC LIMIT ?", (like, like, limit))
+        now = time.time()
+        return [self._fact_dict(r, now) for r in rows]
+
     def fact_count(self):
         rows = self._query("SELECT COUNT(*) FROM facts")
         return rows[0][0] if rows else 0

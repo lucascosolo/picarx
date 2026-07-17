@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS sightings (
+    location_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    times_seen INTEGER NOT NULL DEFAULT 1,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (location_id, label)
+);
 """
 
 
@@ -166,6 +174,50 @@ class SpatialStore:
         rows = self._query("SELECT COUNT(*) FROM locations")
         return rows[0][0] if rows else 0
 
+    def find_location_by_name(self, name):
+        """Location dict whose label best matches a spoken place name
+        ("kitchen" matches both a renamed "kitchen" and the auto label
+        "place 3 (kitchen table)"). Exact match beats substring; None if
+        nothing matches."""
+        want = (name or "").strip().lower()
+        if not want:
+            return None
+        locations = self.all_locations()
+        for loc in locations:
+            if loc["label"].lower() == want:
+                return loc
+        for loc in locations:
+            label = loc["label"].lower()
+            if want in label or label in want:
+                return loc
+        return None
+
+    def object_locations(self, label, limit=3):
+        """Where a given object label has been seen: most recent first.
+        [{'location_id','place','times_seen','last_seen'}]"""
+        rows = self._query(
+            "SELECT s.location_id, l.label, s.times_seen, s.last_seen"
+            " FROM sightings s JOIN locations l ON l.id = s.location_id"
+            " WHERE s.label = ? ORDER BY s.last_seen DESC LIMIT ?",
+            (label, limit))
+        return [{"location_id": lid, "place": place,
+                 "times_seen": times, "last_seen": last}
+                for lid, place, times, last in rows]
+
+    def location_objects(self, location_id, limit=8):
+        """What's been seen at a place, most-often-seen first.
+        [{'label','times_seen','last_seen'}]"""
+        rows = self._query(
+            "SELECT label, times_seen, last_seen FROM sightings"
+            " WHERE location_id = ? ORDER BY times_seen DESC, last_seen DESC LIMIT ?",
+            (location_id, limit))
+        return [{"label": lb, "times_seen": t, "last_seen": ls}
+                for lb, t, ls in rows]
+
+    def sighting_labels(self):
+        """Every object label ever recorded at any place."""
+        return [r[0] for r in self._query("SELECT DISTINCT label FROM sightings")]
+
     @staticmethod
     def _row_to_location(r):
         return {
@@ -248,6 +300,37 @@ class SpatialStore:
             "UPDATE locations SET veto_count = MAX(0, veto_count - ?) WHERE id = ?",
             (int(amount), location_id))
         self.conn.commit()
+
+    def note_sightings(self, location_id, labels, now=None):
+        """Record that these object labels were visible at a place (one
+        completed room scan). Repeat sightings bump times_seen/last_seen,
+        so 'where is the bottle' can answer with the place it's seen
+        most recently and most reliably."""
+        self._assert_writer()
+        now = now if now is not None else time.time()
+        for label in set(labels or []):
+            if not label:
+                continue
+            self.conn.execute(
+                "INSERT INTO sightings (location_id, label, times_seen, first_seen, last_seen)"
+                " VALUES (?, ?, 1, ?, ?)"
+                " ON CONFLICT(location_id, label) DO UPDATE SET"
+                " times_seen = times_seen + 1, last_seen = excluded.last_seen",
+                (location_id, label, now, now))
+        self.conn.commit()
+
+    def rename_location(self, location_id, name):
+        """Give a place a human name ('the kitchen'). Returns the new
+        label, or None if the location doesn't exist. The name replaces
+        the auto-generated 'place N (...)' label everywhere it's spoken."""
+        self._assert_writer()
+        name = (name or "").strip()[:60]
+        if not name or self.get_location(location_id) is None:
+            return None
+        self.conn.execute("UPDATE locations SET label = ? WHERE id = ?",
+                          (name, location_id))
+        self.conn.commit()
+        return name
 
     def note_coach_outcome(self, location_id, success):
         self._assert_writer()
