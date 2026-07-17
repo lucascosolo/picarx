@@ -588,15 +588,18 @@ class AudioNode:
         text = payload.get("text", "")
         if not text:
             return
-        ts = payload.get("ts")
-        if ts is not None and (time.time() - float(ts)) > self.SPEAK_MAX_AGE_SEC:
+        try:
+            ts = float(payload["ts"]) if payload.get("ts") is not None else None
+        except (TypeError, ValueError):
+            ts = None   # malformed timestamp - treat as untimed, still speak it
+        if ts is not None and (time.time() - ts) > self.SPEAK_MAX_AGE_SEC:
             print(f"(dropping stale queued announcement: {text})")
             return
         # Enqueue for the serial worker (non-blocking). Carry ts so a clip
         # that goes stale WHILE queued during a busy stretch is dropped at
         # dequeue too, not just here at enqueue.
         self._ensure_tts_worker()
-        self._tts_queue.put((text, float(ts) if ts is not None else None))
+        self._tts_queue.put((text, ts))
 
     def _enable_speakers_once(self):
         """Assert the amp-enable GPIO once. Returns True if the command
