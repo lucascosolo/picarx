@@ -125,32 +125,41 @@ INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls
 INTENT_TIMEOUT = 6.0
 INTENT_MAX_TOKENS = 80
 
-# Commands the arbiter may emit. Deliberately EXCLUDES "explore" and
-# any movement: motion must only ever start from the literal spoken
-# word through field_agent's strict local path, never from an LLM's
-# guess about a garbled transcript.
+# Commands the arbiter may emit. Deliberately EXCLUDES "explore",
+# "go to <place>" and any other movement: motion must only ever start
+# from the literal spoken word through field_agent's strict local path,
+# never from an LLM's guess about a garbled transcript. (field_agent
+# additionally refuses motion commands arriving with source=
+# intent_repair, so this exclusion is enforced on both ends.)
 ALLOWED_INTENTS = {
     "stop", "battery", "status", "history", "objects", "map", "why",
-    "hello", "play radio", "stop radio", "next station",
+    "hello", "who am i", "where are you",
+    "play radio", "stop radio", "next station",
     "what's playing", "list stations",
 }
-ALLOWED_INTENT_PREFIXES = ("tune to ", "radio find ", "station ")
+ALLOWED_INTENT_PREFIXES = ("tune to ", "radio find ", "station ",
+                           "where is ", "what's in ", "call this place ")
 
 INTENT_SYSTEM_PROMPT = """You repair garbled voice-command transcripts for a small robot car.
 The transcript comes from an offline speech recognizer and may contain misheard words.
 
-Known commands: stop, battery, status, history, objects, map, why, hello, play radio,
-stop radio, next station, what's playing, list stations, tune to <number>,
-radio find <keywords>, station <name>.
+Known commands: stop, battery, status, history, objects, map, why, hello, who am i,
+where are you, play radio, stop radio, next station, what's playing, list stations,
+tune to <number>, radio find <keywords>, station <name>,
+where is <object>  (asks the robot's memory where it last saw an object),
+what's in <place>  (asks what objects it has seen at a named place),
+call this place <name>  (names the robot's current location).
 
 Reply with JSON only, one of:
 {"command": "<one known command, with its parameter filled in if it takes one>"}
   - only if the transcript was clearly an attempt at that command
-{"chat": true}   - it was speech directed at the robot, but not a command
+{"chat": true}   - it was speech directed at the robot, but not one of the commands
 {"ignore": true} - background noise, TV, or speech not meant for the robot
 
-NEVER return a movement command: requests to explore, drive, turn, or go somewhere
-must be answered with {"chat": true}, not a command."""
+NEVER return a movement command: requests to explore, drive, turn, go somewhere, or
+follow someone must be answered with {"chat": true}, not a command - the chat layer
+has its own carefully-gated tools for those. Requests to set reminders, to be
+remembered/recognized, or to share a connection are also {"chat": true}."""
 
 # ---------- camera-grounded chat ----------
 # When someone asks the robot what it's looking at (or teaches it a new
