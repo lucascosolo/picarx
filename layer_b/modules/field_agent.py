@@ -895,6 +895,31 @@ class FieldAgent:
             self.last_veto_code = result.get("reason_code", "unknown")
             self.last_veto_at = time.time()
 
+    # ---------- inbound: follow-mode coordination ----------
+
+    def on_follow_state(self, payload):
+        """Follow mode owns the wheel while it's on (priority 7 beats
+        exploring's 5/6 in the arbiter), but leaving explore_mode running
+        underneath means this module keeps publishing headings - and its
+        EVADE/COACH reflexes (priority 8/9) can outrank and fight the
+        follow behaviour, e.g. treating the approaching person as an
+        obstacle to reverse away from. One driver at a time: following
+        pauses exploration outright."""
+        if payload.get("enabled") and self.explore_mode:
+            self.explore_mode = False
+            self.cancel_intent()
+            print("Field agent: pausing exploration - follow mode took the wheel")
+            self.publish_decision(
+                "explore_paused", {"by": "follow"},
+                "following was enabled, so I stopped exploring instead of "
+                "fighting it for the wheel")
+
+    def _stop_following(self):
+        """The inverse handoff: starting to explore (or navigate to a
+        place) takes the wheel back from follow mode. A no-op in
+        follow_daemon when following isn't active."""
+        self.bus.publish("picarx/tools/follow/set", {"enabled": False})
+
     # ---------- inbound: person identity (optional module) ----------
 
     def on_person(self, payload):
@@ -1016,6 +1041,7 @@ class FieldAgent:
         if "explore" in text and not from_repair:
             self._mark_interaction()
             if not self.explore_mode:
+                self._stop_following()
                 self.explore_mode = True
                 self.given_up = False
                 self.consecutive_coach_failures = 0
@@ -1306,6 +1332,7 @@ class FieldAgent:
                               {"location_id": loc["id"], "label": loc["label"]},
                               f"the user asked me to go to {loc['label']}")
         if not self.explore_mode:
+            self._stop_following()
             self.explore_mode = True
             self.given_up = False
             self.consecutive_coach_failures = 0
@@ -1881,6 +1908,12 @@ class FieldAgent:
         self.scan_sightings = []
         self.scan_dwell_until = now + self.scan_dwell_sec
         self.forward_since = None
+        # Arm the timed steering reset so the FIRST cruise tick after this
+        # scan straightens the wheels on a dedicated tick. The servo holds
+        # whatever angle the previous behaviour (smooth avoidance, follow,
+        # a wander arc) left behind, and driving off on a stale angle is
+        # how "resume cruising" turns into an unintended circle.
+        self.steering_active_until = now
         self.publish_look(self.scan_angles[0])
 
     def _handle_scanning_tick(self, now):
@@ -2202,6 +2235,11 @@ class FieldAgent:
         if self.steering_active_until != 0 and now >= self.steering_active_until:
             self.publish_intent({"direction": "turn", "angle": 0})
             self.steering_active_until = 0
+            if self.steering is not None:
+                # Keep the smooth controller's internal angle mirror in
+                # sync with the servo we just zeroed, so its next active
+                # command slews from reality instead of a stale model.
+                self.steering._angle = 0.0
             return
 
         # --- Handle Periodic Spontaneous Wandering ---
@@ -2289,6 +2327,7 @@ class FieldAgent:
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
         self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
         self.bus.subscribe("picarx/vision/person", self.on_person)
+        self.bus.subscribe("picarx/tools/follow/state", self.on_follow_state)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)

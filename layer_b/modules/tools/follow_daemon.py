@@ -57,8 +57,16 @@ INTENT_TTL = 0.5           # short: if this daemon dies, the intent lapses fast
 CONTROL_HZ = 8.0
 MAX_STEER_ANGLE = 30       # PiCar-X steering limit used elsewhere
 STEER_DEADBAND = 6         # ignore tiny offsets so we don't wobble on center
-ANGLE_RESEND_DELTA = 4     # only re-aim the servo when the target angle really moved
+ANGLE_RESEND_DELTA = 4     # legacy constant (kept for tests/tuning reference)
 FOLLOW_SPEED = 18          # bounded, gentle approach speed
+# Commanded-steering slew cap: the proportional law can demand full lock
+# the instant a person appears near the frame edge, which on an Ackermann
+# chassis at speed is a violent swerve that swings the (body-fixed)
+# camera off the target - the "hard turn until I couldn't see you"
+# failure. Steering now RAMPS toward the target at most this fast.
+FOLLOW_STEER_RATE = 90.0   # deg/s
+STEER_SEND_DEADBAND = 1.0  # min commanded change (deg) worth a steer tick
+DT_MIN, DT_MAX = 0.02, 0.5 # clamp on measured tick spacing
 STOP_AREA_RATIO = 0.35     # person's box fills this much of the frame -> close enough, stop
 FRESH_TARGET_SEC = 1.2     # a detection older than this is stale (SSD updates ~every 1.5s)
 LOST_HOLD_SEC = 2.0        # target stale this long -> hold still (stop)
@@ -103,8 +111,19 @@ class FollowDaemon:
         # Latest target info: (offset_px, frame_width, area_ratio_or_None, ts)
         self.person = None
         self.face = None
-        self.last_sent_angle = 0
         self.lost_announced = False
+        # Steering state. _cmd_angle mirrors what we have actually
+        # COMMANDED the servo to (the daemon's MotionSmoother holds the
+        # last angle forever, so assuming "wheels are straight" at enable
+        # time is exactly the bug that sent the robot into a half-circle:
+        # stale wheel angle + centered person = zero correction demanded,
+        # and the robot arcs on whatever angle the previous behaviour
+        # left behind). _pending_straighten forces an explicit turn-0
+        # before the first drive so the mirror starts true.
+        self._cmd_angle = 0.0
+        self._pending_straighten = False
+        self._steered_last_tick = False
+        self._last_tick_ts = None
 
     # ---------- inbound ----------
 
@@ -113,8 +132,11 @@ class FollowDaemon:
         with self.lock:
             was = self.enabled
             self.enabled = want
-            self.last_sent_angle = 0
             self.lost_announced = False
+            self._cmd_angle = 0.0
+            self._pending_straighten = want
+            self._steered_last_tick = False
+            self._last_tick_ts = None
             if want and not was:
                 # Fresh start: forget sightings from before this session (a
                 # person box from an hour ago must not count as "just lost")
@@ -127,6 +149,13 @@ class FollowDaemon:
                 self.person = None
                 self.face = None
         if want and not was:
+            # Recenter the camera head: the follow geometry assumes the
+            # frame looks where the body points, and a head left panned
+            # sideways by an interrupted scan makes "centered in frame"
+            # mean 70 degrees off-course - another way to circle.
+            self.bus.publish("picarx/intent/look", {
+                "source": SOURCE_NAME,
+                "action": {"direction": "look", "pan": 0, "tilt": 0}})
             self.bus.publish(SPEAK_TOPIC, {"text": "Okay, I'll follow you.", "ts": time.time()})
         elif was and not want:
             self._release()
@@ -190,6 +219,9 @@ class FollowDaemon:
         return None
 
     def _tick(self, now):
+        dt = (1.0 / CONTROL_HZ) if self._last_tick_ts is None else \
+            min(DT_MAX, max(DT_MIN, now - self._last_tick_ts))
+        self._last_tick_ts = now
         target = self._fresh_target(now)
         if target is None:
             self._handle_lost(now)
@@ -198,18 +230,39 @@ class FollowDaemon:
         offset, frame_width, area_ratio = target
         drive, speed = drive_decision(area_ratio)
         if drive == "stop":
-            # Close enough - hold position (still gated by the safety daemon).
+            # Close enough - hold position (still gated by the safety
+            # daemon). Turned wheels while stopped are harmless; the
+            # straighten below only matters before we actually drive.
+            self._steered_last_tick = False
             self._publish_intent({"direction": "stop"})
             return
-        target_angle = steer_angle(offset, frame_width)
-        # Ackermann: aim the servo on ticks where the heading needs to change,
-        # then drive forward on the others (the servo holds its angle). This
-        # matches how field_agent arcs - one primitive per tick to the arbiter.
-        if abs(target_angle - self.last_sent_angle) >= ANGLE_RESEND_DELTA:
-            self._publish_intent({"direction": "turn", "angle": target_angle})
-            self.last_sent_angle = target_angle
-        else:
-            self._publish_intent({"direction": "forward", "speed": speed})
+        # Before the FIRST drive of a session, explicitly zero the servo
+        # so the _cmd_angle mirror starts true whatever angle the last
+        # behaviour left the wheels at.
+        if self._pending_straighten:
+            self._pending_straighten = False
+            self._steered_last_tick = True
+            self._cmd_angle = 0.0
+            self._publish_intent({"direction": "turn", "angle": 0})
+            return
+        # Slew the commanded angle toward the proportional target instead
+        # of jumping there - fluid corrections, no full-lock swerves.
+        raw_target = steer_angle(offset, frame_width)
+        max_step = FOLLOW_STEER_RATE * dt
+        step = max(-max_step, min(max_step, raw_target - self._cmd_angle))
+        desired = self._cmd_angle + step
+        # One primitive per tick through the arbiter's single-intent
+        # channel: steer when the command materially moved, never twice
+        # in a row so forward (and the safety daemon's forward checks)
+        # keeps flowing. Same pattern field_agent's controller path uses.
+        if (not self._steered_last_tick
+                and abs(desired - self._cmd_angle) >= STEER_SEND_DEADBAND):
+            self._cmd_angle = desired
+            self._steered_last_tick = True
+            self._publish_intent({"direction": "turn", "angle": desired})
+            return
+        self._steered_last_tick = False
+        self._publish_intent({"direction": "forward", "speed": speed})
 
     def _handle_lost(self, now):
         # Find the freshest sighting timestamp to measure how long it's been.
