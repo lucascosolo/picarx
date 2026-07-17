@@ -125,6 +125,23 @@ INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls
 INTENT_TIMEOUT = 6.0
 INTENT_MAX_TOKENS = 80
 
+# ---------- intent feedback (the user grading interpretations) ----------
+# picarx/intent/feedback carries explicit judgments - the web console's
+# check/X buttons and spoken phrases like "that's not what I meant"
+# (routed by field_agent with the utterance being judged attached).
+#   correct   -> reinforce the cached phrase mapping, if one produced it.
+#   incorrect -> DELETE the cached mapping (it taught the wrong thing),
+#                learn from a supplied correction, or - voice only - ask
+#                "what did you want?" and treat the next utterance as
+#                the answer. The answer executes through the normal
+#                heard pipeline on its own; here it's only LEARNED FROM:
+#                normalized onto a known command (allowlist first, one
+#                small LLM call only if it's fuzzy) and cached against
+#                the ORIGINAL phrasing, so next time it's on-board.
+# Motion stays out of the cache in every path, same invariant as ever.
+FEEDBACK_TOPIC = "picarx/intent/feedback"
+CORRECTION_WINDOW_SEC = 45.0     # how long "what did you want?" waits for an answer
+
 # Commands the arbiter may emit. Deliberately EXCLUDES "explore",
 # "go to <place>" and any other movement: motion must only ever start
 # from the literal spoken word through field_agent's strict local path,
@@ -366,6 +383,9 @@ class Companion:
         self.latest_frame_at = 0.0
         # Latest vital stats from health_daemon (for the check_vital_stats tool)
         self.latest_health = None
+        # Pending "what did you want me to do?" question, or None:
+        # {"utterance": <original misread phrasing>, "until": <deadline>}
+        self.awaiting_correction = None
 
     # ---------- memory persistence ----------
 
@@ -506,6 +526,118 @@ class Companion:
             return "My vital stats are unavailable right now."
         return "; ".join(parts) + "."
 
+    # ---------- intent feedback ----------
+
+    def _say(self, text):
+        self.bus.publish("picarx/audio/speak", {"text": text, "ts": time.time()})
+
+    def _journal_feedback(self, verdict, utterance, detail):
+        self.bus.publish("picarx/decision", {
+            "source": "companion", "kind": "intent_feedback",
+            "choice": {"verdict": verdict, **detail},
+            "reason": f"user judged the interpretation of: '{utterance}'",
+            "ts": time.time()})
+
+    def on_heard(self, payload):
+        """Only consumed while a 'what did you want me to do?' question
+        is pending: the next human utterance is the answer, captured for
+        LEARNING. It also executes through field_agent's normal pipeline
+        on its own - this handler never dispatches anything."""
+        if payload.get("source") in ("intent_repair", "user_correction"):
+            return
+        text = (payload.get("text") or "").strip()
+        if not text or speech_match.parse_feedback(text):
+            return
+        with self.lock:
+            awaiting = self.awaiting_correction
+            self.awaiting_correction = None
+        if not awaiting or time.time() > awaiting["until"]:
+            return
+        self.work_queue.put(("learn", (awaiting["utterance"], text)))
+
+    def on_feedback(self, payload):
+        verdict = payload.get("verdict")
+        if verdict not in ("correct", "incorrect"):
+            return
+        utterance = (payload.get("utterance") or "").strip()
+        correction = (payload.get("correction") or "").strip()
+        origin = payload.get("origin", "web")
+        key = speech_match.canonicalize(utterance) if utterance else None
+        now = time.time()
+
+        if verdict == "correct":
+            reinforced = False
+            with self.lock:
+                entry = self.learned_intents.get(key) if key else None
+                if entry:
+                    entry["count"] = entry.get("count", 0) + 1
+                    entry["last"] = now
+                    entry["confirmed"] = True
+                    reinforced = True
+            if reinforced:
+                self._save_learned_intents()
+            print(f"Companion: feedback CORRECT on '{utterance}'"
+                  f"{' (mapping reinforced)' if reinforced else ''}")
+            self._journal_feedback(verdict, utterance, {"reinforced": reinforced})
+            if origin == "voice":
+                self._say("Good to know, thanks.")
+            return
+
+        # incorrect: a wrong mapping must not fire a second time.
+        removed = None
+        with self.lock:
+            if key and key in self.learned_intents:
+                removed = self.learned_intents.pop(key)["command"]
+        if removed:
+            self._save_learned_intents()
+            print(f"Companion: feedback INCORRECT - unlearned '{utterance}' -> '{removed}'")
+        else:
+            print(f"Companion: feedback INCORRECT on '{utterance}' (nothing cached)")
+        self._journal_feedback(verdict, utterance,
+                               {"unlearned": removed, "correction": correction or None})
+        if correction and utterance:
+            self.work_queue.put(("learn", (utterance, correction)))
+        elif origin == "voice":
+            if utterance:
+                with self.lock:
+                    self.awaiting_correction = {
+                        "utterance": utterance, "until": now + CORRECTION_WINDOW_SEC}
+                self._say("Sorry about that. What did you want me to do?")
+            else:
+                self._say("Sorry about that.")
+
+    def _learn_correction(self, original, answer):
+        """Cache original-phrasing -> intended command. The answer may be
+        a clean command ('battery') or free-form ('I wanted to know the
+        battery level'); try the allowlist directly first, and only spend
+        an LLM call to normalize a fuzzy answer. Motion commands are never
+        cached (the arbiter allowlist enforces it), matching the standing
+        invariant that the cache can't start the robot moving."""
+        key = speech_match.canonicalize(original)
+        command = answer.strip().lower()
+        if not self._intent_allowed(command):
+            verdict = self._arbiter_verdict(
+                f"Transcript: {original}\n"
+                f"The user says the robot misunderstood, and clarified they "
+                f"actually wanted: {answer}") or {}
+            command = (verdict.get("command") or "").strip().lower()
+        if command and self._intent_allowed(command):
+            with self.lock:
+                self.learned_intents[key] = {
+                    "command": command, "count": 1, "last": time.time(),
+                    "taught": True}
+            self._save_learned_intents()
+            print(f"Companion: user-taught mapping '{original}' -> '{command}'")
+            self._journal_feedback("correction", original, {"learned": command})
+            self._say(f"Got it. When you say that, I'll take it as: {command}.")
+            return True
+        print(f"Companion: couldn't map correction for '{original}' "
+              f"(answer: '{answer}') onto a safe known command")
+        self._journal_feedback("correction", original,
+                               {"learned": None, "answer": answer})
+        self._say("Thanks, I'll keep that in mind.")
+        return False
+
     def on_uncertain(self, payload):
         """A router escalated a command-shaped utterance it couldn't
         parse. Cheap path first: the learned phrase cache handles it
@@ -630,19 +762,19 @@ class Companion:
             span = f"{minutes / 60.0:.1f} hours"
         return f"[picked back up after {span} of silence]\n"
 
-    def _repair_intent(self, text):
-        """One strict, tiny LLM call: map a garbled utterance onto a
-        known command (cached for next time), route it to chat, or
-        drop it as noise. Fail-soft: any error just drops the text."""
+    def _arbiter_verdict(self, content):
+        """One strict, tiny LLM call against the intent prompt. Returns
+        the parsed verdict dict ({"command"} / {"chat"} / {"ignore"}) or
+        None on any failure - callers fail soft."""
         client = self._get_client()
         if client is None:
-            return
+            return None
         try:
             response = client.messages.create(
                 model=INTENT_MODEL,
                 max_tokens=INTENT_MAX_TOKENS,
                 system=INTENT_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": f"Transcript: {text}"}],
+                messages=[{"role": "user", "content": content}],
                 timeout=INTENT_TIMEOUT,
             )
             raw = "".join(b.text for b in response.content
@@ -652,19 +784,28 @@ class Companion:
                 if raw.startswith("json"):
                     raw = raw[4:]
             verdict = json.loads(raw)
+            return verdict if isinstance(verdict, dict) else None
         except Exception as e:
-            print(f"Companion arbiter: repair failed ({e}), dropping '{text}'")
+            print(f"Companion arbiter: LLM verdict failed ({e})")
+            return None
+
+    def _repair_intent(self, text):
+        """One strict, tiny LLM call: map a garbled utterance onto a
+        known command (cached for next time), route it to chat, or
+        drop it as noise. Fail-soft: any error just drops the text."""
+        verdict = self._arbiter_verdict(f"Transcript: {text}")
+        if verdict is None:
+            print(f"Companion arbiter: repair failed, dropping '{text}'")
             return
 
-        command = (verdict.get("command") or "").strip().lower() \
-            if isinstance(verdict, dict) else ""
+        command = (verdict.get("command") or "").strip().lower()
         if command and self._intent_allowed(command):
             with self.lock:
                 self.learned_intents[speech_match.canonicalize(text)] = {
                     "command": command, "count": 1, "last": time.time()}
             self._save_learned_intents()
             self._dispatch_repaired(command, text, learned=False)
-        elif isinstance(verdict, dict) and verdict.get("chat"):
+        elif verdict.get("chat"):
             self._handle_utterance(text)
         else:
             # ignore verdict, disallowed command, or junk output - all
@@ -903,20 +1044,24 @@ class Companion:
 
     def _worker_loop(self):
         while True:
-            kind, text = self.work_queue.get()
+            kind, item = self.work_queue.get()
             try:
                 if kind == "repair":
-                    self._repair_intent(text)
+                    self._repair_intent(item)
+                elif kind == "learn":
+                    self._learn_correction(*item)
                 else:
-                    self._handle_utterance(text)
+                    self._handle_utterance(item)
             except Exception as e:
-                print(f"Companion: error handling {kind} '{text}': {e}")
+                print(f"Companion: error handling {kind} '{item}': {e}")
 
     # ---------- main loop ----------
 
     def run(self):
         self.bus.subscribe("picarx/audio/unhandled", self.on_unhandled)
         self.bus.subscribe("picarx/audio/uncertain", self.on_uncertain)
+        self.bus.subscribe("picarx/audio/heard", self.on_heard)
+        self.bus.subscribe(FEEDBACK_TOPIC, self.on_feedback)
         self.bus.subscribe(VISION_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)

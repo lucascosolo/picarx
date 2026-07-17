@@ -100,6 +100,7 @@ import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
 from spatial_store import SpatialStore
+import person_memory
 import speech_match
 
 import sqlite3
@@ -683,6 +684,12 @@ class FieldAgent:
         self.last_greeted_person = None
         self.last_greeted_at = 0.0
 
+        # The most recent human utterance handled (never a repair or a
+        # console correction) - what spoken feedback like "that's not
+        # what I meant" refers to, so the intent teacher knows WHICH
+        # phrasing to unlearn or re-map.
+        self.last_utterance = None
+
         self.last_announcement_at = 0.0
         self.start_time = time.time()
 
@@ -953,6 +960,22 @@ class FieldAgent:
         # motion (explore / go to) only ever starts from literally heard
         # words, never from any model's rewrite of a garbled transcript.
         from_repair = source == "intent_repair"
+        from_human = source not in ("intent_repair", "user_correction")
+
+        # Spoken feedback on the last interpretation ("that's not what I
+        # meant" / "good robot") goes to the intent teacher (companion),
+        # tagged with the utterance being judged - never treated as a
+        # command or chat itself.
+        if from_human:
+            verdict = speech_match.parse_feedback(text)
+            if verdict:
+                self._mark_interaction()
+                print(f"(intent feedback '{verdict}' on: '{self.last_utterance}')")
+                self.bus.publish("picarx/intent/feedback", {
+                    "verdict": verdict, "utterance": self.last_utterance,
+                    "origin": "voice", "ts": time.time()})
+                return
+            self.last_utterance = text
 
         # Tool commands belong to tools_registry.py / their tool module.
         if any(k in match_text for k in TOOL_KEYWORDS):
@@ -1182,6 +1205,7 @@ class FieldAgent:
             return
         items = objects["items"]
         descriptions = []
+        known_places = {}   # label -> place name, from the sighting store
         for obj in items:
             label = obj.get("label", "something")
             age = time.time() - obj.get("first_seen", time.time())
@@ -1189,7 +1213,16 @@ class FieldAgent:
                 descriptions.append(f"a {label} I just noticed")
             else:
                 descriptions.append(f"a {label} I've been tracking for a bit")
-        self.announce(f"I currently see {len(items)}: " + ", ".join(descriptions) + ".", force=True)
+            if label not in known_places:
+                places = self.spatial.object_locations(label, limit=1)
+                if places and places[0]["times_seen"] > 1:
+                    known_places[label] = places[0]["place"]
+        speech = f"I currently see {len(items)}: " + ", ".join(descriptions)
+        # Spatial recall makes this more than a live list: say where the
+        # robot usually finds one of these, when it actually knows.
+        for label, place in list(known_places.items())[:2]:
+            speech += f". I usually see a {label} at {place}"
+        self.announce(speech + ".", force=True)
 
     def report_map(self):
         """Spoken summary of the spatial map: where am I, how much of
@@ -1392,8 +1425,19 @@ class FieldAgent:
         parts = [f"I have {total} recorded events"]
         if oldest_ts:
             minutes = (time.time() - oldest_ts) / 60.0
-            parts.append(f"going back about {minutes:.0f} minutes")
+            if minutes < 120:
+                parts.append(f"going back about {minutes:.0f} minutes")
+            else:
+                parts.append(f"going back about {minutes / 60.0:.0f} hours")
         parts.append(f"and I've been stopped by obstacles {vetoed} times recently")
+        # Fold in what the robot has actually LEARNED, not just what it
+        # logged: map coverage and the people it can recognize.
+        place_count = self.spatial.location_count()
+        if place_count:
+            parts.append(f"I've mapped {place_count} place{'s' if place_count != 1 else ''}")
+        people = person_memory.known_people()
+        if people:
+            parts.append(f"I can recognize {', '.join(people)}")
         if recent_phrases:
             parts.append(f"the last thing I heard was: {recent_phrases[0]}")
 

@@ -169,6 +169,13 @@ class EventLogger:
         # phantom ultrasonic readings").
         self.log_event("picarx/exploration/hypothesis", payload)
 
+    def on_intent_feedback(self, payload):
+        # Explicit user judgments on how an utterance was interpreted
+        # (web console check/X, or spoken "that's not what I meant").
+        # The highest-signal training data the robot ever gets - a human
+        # labeled an example - so it must be durable for reflection.
+        self.log_event("picarx/intent/feedback", payload)
+
     def on_decision(self, payload):
         # The decision journal: every non-trivial choice any module
         # makes, with its stated reason. This is what lets the robot
@@ -221,6 +228,7 @@ class EventLogger:
         self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
         self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
         self.bus.subscribe("picarx/exploration/goal_progress", self.on_goal_progress)
+        self.bus.subscribe("picarx/intent/feedback", self.on_intent_feedback)
         self.bus.subscribe("picarx/decision", self.on_decision)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 

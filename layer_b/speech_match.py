@@ -140,6 +140,42 @@ def looks_directed_command(text):
     return i < len(toks) and toks[i] in COMMAND_VERBS
 
 
+# ---------------------------------------------------------------------
+# Intent-feedback phrases ("that's not what I meant")
+# ---------------------------------------------------------------------
+# Spoken judgments on the robot's LAST interpretation. Deliberately
+# phrase-based and conservative: a bare "no" or "wrong" mid-sentence is
+# far too ambiguous to treat as feedback, but nobody says "that's not
+# what I meant" to their television. Matched with apostrophes stripped,
+# since the STT emits both "that's" and "thats".
+
+_FEEDBACK_INCORRECT = (
+    "thats wrong", "that was wrong", "thats not what i meant",
+    "not what i meant", "thats not what i wanted", "not what i wanted",
+    "thats not right", "that is wrong", "that is not what i meant",
+    "bad robot", "wrong answer", "you misunderstood", "you misunderstood me",
+)
+_FEEDBACK_CORRECT = (
+    "thats right", "that was right", "thats correct", "that is correct",
+    "good robot", "well done", "good job", "exactly right", "you got it",
+    "thats what i meant", "thats what i wanted",
+)
+
+
+def parse_feedback(text):
+    """'incorrect' / 'correct' when an utterance is a judgment on the
+    robot's last interpretation, else None. Incorrect is checked first:
+    "that's not right" must never substring-match into "that's right"."""
+    norm = " ".join(tokens((text or "").replace("'", "")))
+    if not norm:
+        return None
+    if any(p in norm for p in _FEEDBACK_INCORRECT):
+        return "incorrect"
+    if any(p in norm for p in _FEEDBACK_CORRECT):
+        return "correct"
+    return None
+
+
 def best_label_match(query, labels):
     """Match a spoken name against a set of known labels (object labels
     from the sighting store, place labels from the map). Tolerant the
