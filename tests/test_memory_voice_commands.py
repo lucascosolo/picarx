@@ -76,9 +76,14 @@ class FieldAgentMemoryCommandTest(unittest.TestCase):
         self.fa.handle_voice_command("where is the bottel")
         self.assertIn("kitchen", self._spoken())
 
-    def test_where_is_unknown_object(self):
+    def test_where_is_unknown_object_falls_through_to_chat(self):
+        # No sighting match -> it's a question for the chat layer (which
+        # has the sighting tool AND world knowledge), not a canned miss.
         self.fa.handle_voice_command("where is the unicorn")
-        self.assertIn("haven't seen a unicorn", self._spoken())
+        forwarded = self.fa.bus.last("picarx/audio/unhandled")
+        self.assertIsNotNone(forwarded)
+        self.assertIn("unicorn", forwarded["text"])
+        self.assertEqual(self.fa.bus.of("picarx/audio/speak"), [])
 
     def test_whats_in_place(self):
         self.fa.handle_voice_command("what's in the kitchen")

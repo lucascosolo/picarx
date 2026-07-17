@@ -56,6 +56,10 @@ DOMAIN_VOCAB = {
     "explore", "stop", "halt", "battery", "charge", "status", "report",
     "history", "objects", "object", "notice", "map", "places", "where",
     "hello",
+    # person/place memory + behaviours (person_memory, follow_daemon,
+    # reminder_daemon) - here both as escalation triggers and as snap
+    # targets ("folow me" -> "follow me").
+    "follow", "remember", "forget", "remind", "reminder", "place", "room",
 }
 
 # Only snap tokens of this length or more (short words collide too
@@ -97,6 +101,43 @@ def looks_command_like(canonical_text):
     the cheap signal that an unmatched utterance deserves escalation to
     the LLM intent arbiter rather than being dropped."""
     return any(t in DOMAIN_VOCAB for t in canonical_text.split())
+
+
+# Verbs a spoken command to the robot plausibly OPENS with. Used by
+# looks_directed_command below - position matters (imperatives start with
+# the verb), so common words here don't make ordinary chatter escalate.
+COMMAND_VERBS = {
+    "go", "come", "take", "bring", "follow", "find", "show", "tell", "play",
+    "stop", "halt", "turn", "remember", "forget", "remind", "name", "call",
+    "head", "drive", "move", "look", "check", "search", "list", "tune",
+    "report", "describe", "say", "explore", "start", "give",
+}
+
+# Address/politeness tokens that legitimately precede the verb ("hey
+# robot, could you please follow me").
+_PRE_VERB_TOKENS = {"hey", "robot", "computer", "please", "ok", "okay",
+                    "hi", "so", "now", "can", "could", "would", "will",
+                    "you", "and", "then"}
+
+
+def looks_directed_command(text):
+    """True when an utterance is SHAPED like a command aimed at the robot:
+    after stripping address/politeness prefixes ("hey", "please", "could
+    you"), it opens with an imperative verb.
+
+    Complements looks_command_like(): that one needs robot VOCABULARY
+    somewhere in the text, so paraphrases built entirely from plain verbs
+    ("take me to the kitchen", "come with me") never escalated to the
+    intent arbiter and were silently dropped. This catches those by
+    sentence shape instead of word lists. First-position only, so
+    declarative chatter ("the weather is nice", "we stopped by earlier")
+    stays out - the point is a cheap, conservative "this was probably an
+    instruction" signal, with the LLM arbiter making the real call."""
+    toks = tokens(text)
+    i = 0
+    while i < len(toks) and toks[i] in _PRE_VERB_TOKENS:
+        i += 1
+    return i < len(toks) and toks[i] in COMMAND_VERBS
 
 
 def best_label_match(query, labels):

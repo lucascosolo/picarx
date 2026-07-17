@@ -938,11 +938,21 @@ class FieldAgent:
                                   source=payload.get("source"))
 
     def handle_voice_command(self, text, confidence=None, source=None):
-        # Substring checks below run against the raw text PLUS its
-        # canonicalized form, so filler never blocks a match and an STT
-        # near-miss ("batery", "radial") still lands on the right word.
+        # Checks below run against the raw text PLUS its canonicalized
+        # form, so filler never blocks a match and an STT near-miss
+        # ("batery", "radial") still lands on the right word. Single
+        # keywords are matched as whole TOKENS, not substrings - "we
+        # stopped by earlier" must not halt exploration, and "who's in
+        # charge here" must not read out the battery. Phrases stay
+        # substring checks.
         canon = speech_match.canonicalize(text)
         match_text = f"{text} {canon}"
+        toks = set(speech_match.tokens(match_text))
+        # Repaired text comes from the LLM intent arbiter. Its allowlist
+        # already excludes motion, but enforce the invariant here too:
+        # motion (explore / go to) only ever starts from literally heard
+        # words, never from any model's rewrite of a garbled transcript.
+        from_repair = source == "intent_repair"
 
         # Tool commands belong to tools_registry.py / their tool module.
         if any(k in match_text for k in TOOL_KEYWORDS):
@@ -956,7 +966,7 @@ class FieldAgent:
         # "moves around on boot" behavior. Default state is stationary.
         # NOTE this checks raw text only, deliberately: motion must never
         # start off a fuzzy repair, only off the literal word.
-        if "explore" in text:
+        if "explore" in text and not from_repair:
             self._mark_interaction()
             if not self.explore_mode:
                 self.explore_mode = True
@@ -969,7 +979,7 @@ class FieldAgent:
                 self.announce("Starting exploration. Let me take a look around first.", force=True)
             return
 
-        if "stop" in match_text or "halt" in match_text:
+        if "stop" in toks or "halt" in toks:
             self._mark_interaction()
             if self.explore_mode:
                 self.explore_mode = False
@@ -978,17 +988,21 @@ class FieldAgent:
                 self.announce("Stopping.", force=True)
             return
 
-        if "battery" in match_text or "charge" in match_text or "level" in match_text:
+        # Deliberately narrow: just "battery"/"power" as whole tokens.
+        # Looser phrasings ("how's your charge?") escalate to the intent
+        # arbiter below, get mapped to "battery" once, and are cached -
+        # so precision here costs nothing but the first-ever API call.
+        if "battery" in toks or "power" in toks:
             self._mark_interaction()
             self.report_battery()
             return
 
-        if "history" in match_text or "what have you done" in text or "what happened" in text:
+        if "history" in toks or "what have you done" in text or "what happened" in text:
             self._mark_interaction()
             self.report_history()
             return
 
-        if "object" in match_text or "what's around" in text or "whats around" in text or "what do you notice" in text:
+        if "object" in toks or "objects" in toks or "what's around" in text or "whats around" in text or "what do you notice" in text:
             self._mark_interaction()
             self.report_objects()
             return
@@ -1002,7 +1016,7 @@ class FieldAgent:
 
         # NOTE raw text only, same rule as "explore" above: motion must
         # never start off a fuzzy repair, only off the literal words.
-        destination = parse_go_to_command(text)
+        destination = parse_go_to_command(text) if not from_repair else None
         if destination:
             self._mark_interaction()
             self.go_to_place(destination)
@@ -1011,7 +1025,14 @@ class FieldAgent:
         where_query = parse_where_is_query(text)
         if where_query:
             self._mark_interaction()
-            self.report_object_location(where_query)
+            if not self.report_object_location(where_query):
+                # Nothing in spatial memory matches - that makes this a
+                # QUESTION, not a failed command. Hand it to the chat
+                # layer, which has both the sighting-store tool and
+                # general knowledge, instead of a canned brush-off.
+                print(f"(no sighting match for '{where_query}', forwarding to chat): '{text}'")
+                self.bus.publish("picarx/audio/unhandled",
+                                 {"text": text, "confidence": confidence})
             return
 
         whats_in = parse_whats_in_query(text)
@@ -1077,7 +1098,14 @@ class FieldAgent:
 
         # Loop guard: text the arbiter already repaired never re-escalates -
         # if its best repair still matched nothing, it dies here.
-        if source != "intent_repair" and speech_match.looks_command_like(canon):
+        # Two independent "this was probably meant for the robot" signals:
+        # robot vocabulary anywhere in it (looks_command_like), or an
+        # imperative sentence shape ("take me to the kitchen", "come with
+        # me") that contains no domain word at all (looks_directed_command).
+        # Either way the LLM arbiter makes the real intent call, and its
+        # phrase cache means each phrasing is only ever paid for once.
+        if not from_repair and (speech_match.looks_command_like(canon)
+                                or speech_match.looks_directed_command(text)):
             print(f"(command-shaped but unmatched, escalating to arbiter): '{text}'")
             self.bus.publish("picarx/audio/uncertain", {
                 "text": text, "confidence": confidence, "from": SOURCE_NAME})
@@ -1231,12 +1259,13 @@ class FieldAgent:
 
     def report_object_location(self, query):
         """'where is the bottle' - answered from the sighting store, no
-        LLM: which place, how long ago, how reliably."""
+        LLM: which place, how long ago, how reliably. Returns True if it
+        answered; False when the store has no match, so the caller can
+        route the utterance to chat instead of a canned miss."""
         label = speech_match.best_label_match(query, self.spatial.sighting_labels())
         places = self.spatial.object_locations(label) if label else []
         if not places:
-            self.announce(f"I haven't seen a {query} anywhere yet.", force=True)
-            return
+            return False
         top = places[0]
         when = spoken_age(time.time() - top["last_seen"])
         speech = f"I last saw a {label} at {top['place']}, {when}"
@@ -1245,6 +1274,7 @@ class FieldAgent:
         if len(places) > 1:
             speech += f". I've also seen one at {places[1]['place']}"
         self.announce(speech + ".", force=True)
+        return True
 
     def report_place_contents(self, place_query):
         """'what's in the kitchen' - the sighting store's inventory of a
