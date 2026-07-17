@@ -63,8 +63,17 @@ def start_module(entry):
 
 def stop_module(name):
     if name in running_processes:
-        running_processes[name].terminate()
-        running_processes[name].wait()
+        proc = running_processes[name]
+        proc.terminate()
+        # A module wedged in uninterruptible I/O (hardware, a dead socket)
+        # can ignore SIGTERM; an unbounded wait() here would hang the whole
+        # supervisor and stop every other module from being managed.
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print(f"{name} ignored SIGTERM for 10s, killing it")
+            proc.kill()
+            proc.wait()
         del running_processes[name]
         running_mtimes.pop(name, None)
         print(f"Stopped {name}")

@@ -974,9 +974,15 @@ class FieldAgent:
     @staticmethod
     def _strip_wake_phrase(text):
         for phrase in WAKE_PHRASES:
-            if text.startswith(phrase):
-                remainder = text[len(phrase):].strip(" ,.:;-")
-                return remainder if remainder else "hello"
+            if not text.startswith(phrase):
+                continue
+            # Whole-word match only: "robotics class was fun" starts with
+            # "robot" but was never addressed to the robot.
+            rest = text[len(phrase):]
+            if rest and rest[0].isalnum():
+                continue
+            remainder = rest.strip(" ,.:;-!?")
+            return remainder if remainder else "hello"
         return None
 
     # ---------- spoken reports ----------
@@ -1278,7 +1284,6 @@ class FieldAgent:
         if rationale:
             return f"{source} {maneuver}. {rationale}"
         return f"{source} {maneuver}."
-        # else: stale/unknown query id (already timed out or superseded) - ignore
 
     def _episode_moved(self, steps, motion_max):
         """Did the robot actually GO anywhere during a maneuver? "No veto"

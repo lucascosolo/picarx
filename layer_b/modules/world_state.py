@@ -219,12 +219,11 @@ class WorldState:
 
     def query_battery(self):
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(0.3)
-            s.connect(SOCKET_PATH)
-            s.sendall(json.dumps({"query": "battery_status"}).encode())
-            data = s.recv(1024)
-            s.close()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                s.connect(SOCKET_PATH)
+                s.sendall(json.dumps({"query": "battery_status"}).encode())
+                data = s.recv(1024)
             return json.loads(data.decode())
         except Exception as e:
             print(f"World state: battery query failed: {e}")

@@ -117,12 +117,11 @@ class Arbiter:
 
     def send_to_safety(self, action):
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(0.3)
-            s.connect(SOCKET_PATH)
-            s.sendall(json.dumps(action).encode())
-            data = s.recv(1024)
-            s.close()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                s.connect(SOCKET_PATH)
+                s.sendall(json.dumps(action).encode())
+                data = s.recv(1024)
             return json.loads(data.decode())
         except Exception as e:
             print(f"Arbiter: safety link error: {e}")

@@ -152,6 +152,11 @@ class HealthDaemon:
     def __init__(self):
         self.bus = Bus()
         self.lock = threading.Lock()
+        # _evaluate runs from both the MQTT callback thread (on_world_state,
+        # on_lowpower_request) and the main loop; serializing it keeps the
+        # low_power read-modify-write from racing and double-publishing (or
+        # missing) a transition.
+        self._eval_lock = threading.Lock()
         self.battery_v = None
         self.battery_critical = False
         self.battery_low = False          # battery-driven component (hysteresis)
@@ -236,6 +241,10 @@ class HealthDaemon:
     def _evaluate(self, now, voltage=None):
         """Recompute low-power = (battery low) OR (manual latch), publish +
         announce on any transition. Manual latch auto-clears once healthy."""
+        with self._eval_lock:
+            self._evaluate_locked(now, voltage)
+
+    def _evaluate_locked(self, now, voltage=None):
         if voltage is None:
             voltage = self._battery_voltage()
         with self.lock:

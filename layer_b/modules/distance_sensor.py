@@ -14,11 +14,11 @@ SOCKET_PATH = "/tmp/picarx_safety.sock"
 
 def query_safety_distance():
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(SOCKET_PATH)
-        s.sendall(json.dumps({"query": "distance"}).encode())
-        resp = s.recv(1024)
-        s.close()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect(SOCKET_PATH)
+            s.sendall(json.dumps({"query": "distance"}).encode())
+            resp = s.recv(1024)
         return json.loads(resp.decode())
     except Exception as e:
         return {"error": str(e)}
