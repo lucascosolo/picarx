@@ -108,6 +108,7 @@ INTERESTING_TOPICS = (
     "picarx/coach/surprise",
     "picarx/action/result",
     "picarx/intent/feedback",
+    "picarx/rc/demonstration",
 )
 
 SYSTEM_PROMPT = """You are the offline reflection process of a small autonomous robot car
@@ -120,6 +121,11 @@ stable properties of the environment or its interactions ("the area with the sof
 tvmonitor causes repeated collisions", "escape maneuvers that reverse work better than
 turning here", "someone often asks about the battery"). Do NOT restate single transient
 events, speculate beyond the data, or include timestamps.
+
+USER DEMONSTRATION entries show how a human manually drove the robot out of
+situations it struggles with - the highest-value material here. When the same
+kind of demonstration repeats, extract the human's TACTIC as a fact (e.g.
+"when blocked near the sofa, backing up then turning right works").
 
 Up to 2 of the entries may instead use the subject "idea": a specific, safe
 "what if ..." experiment the digest genuinely motivates (especially anything marked
@@ -231,6 +237,15 @@ class Reflection:
             where = (p.get("location") or {}).get("label") or "unknown place"
             return (f"sensor hypothesis test at {where}: {p.get('question')} "
                     f"resolved to {p.get('resolution')}")
+        if topic == "picarx/rc/demonstration":
+            ctx = p.get("context") or {}
+            where = (ctx.get("location") or {}).get("label") or "an unknown place"
+            objects = ",".join(ctx.get("objects") or []) or "nothing recognized"
+            moves = ",".join((s.get("action") or {}).get("direction", "?")
+                             for s in p.get("actions") or [])
+            return (f"USER DEMONSTRATION at {where} ({p.get('situation')}, "
+                    f"seeing {objects}): the human drove {moves} -> "
+                    f"{'cleared it' if p.get('resolved') else 'did not clear it'}")
         if topic == "picarx/intent/feedback":
             utterance = p.get("utterance")
             if not utterance:

@@ -244,6 +244,25 @@ VETO_PROBE_CLEAR_SEC = 3.0        # no veto for this long -> "might be clear"
 CURIOSITY_SETTLED_SCORE = 0.45
 CURIOSITY_BIAS_PROB = 0.7      # biased wanders still keep 30% pure randomness
 
+# ---------------------------------------------------------------------
+# RC mode: passive demonstration learning
+# ---------------------------------------------------------------------
+# While the human drives (picarx/rc/mode active), the AI doesn't act -
+# but it WATCHES. When an obstacle-like situation appears (the same
+# triggers exploration reacts to), a bounded "demonstration" episode
+# opens: the situation context is snapshotted and the human's RC
+# commands are collected (consecutive duplicates collapsed) until the
+# path clears or the window closes. One picarx/rc/demonstration event
+# per episode goes to events.db, where reflection later distills
+# repeated demonstrations into durable tactics - a second coach whose
+# suggestions come from the human's own driving. Rate-limited so a
+# session of joyriding never floods episodic memory with turn-by-turn
+# noise.
+RC_DEMO_TRIGGER_CM = 30        # fresh ultrasonic below this opens an episode
+RC_DEMO_CLEAR_CM = 45          # ...and above this (with clear vision) resolves it
+RC_DEMO_MAX_SEC = 10.0         # hard bound on one episode
+RC_DEMO_COOLDOWN = 30.0        # min seconds between episodes
+
 # Evasion/coaching priorities - both outrank normal exploring (5), and
 # COACH_PRIORITY outranks the canned evasion sequence (8) too, since a
 # coach-directed maneuver during a fail state should win over whatever
@@ -700,6 +719,15 @@ class FieldAgent:
         # phrasing to unlearn or re-map.
         self.last_utterance = None
 
+        # RC mode (picarx/rc/mode): the human has the wheel; we only
+        # observe. rc_demo holds the in-flight demonstration episode (or
+        # None); rc_pending_actions is the cross-thread inbox of the
+        # human's executed/vetoed RC commands.
+        self.rc_active = False
+        self.rc_demo = None
+        self.rc_pending_actions = deque()
+        self.last_rc_demo_at = 0.0
+
         self.last_announcement_at = 0.0
         self.start_time = time.time()
 
@@ -882,6 +910,15 @@ class FieldAgent:
     # ---------- inbound: safety-daemon outcomes ----------
 
     def on_action_result(self, payload):
+        if payload.get("source") == "rc":
+            # Human RC commands: collected only while a demonstration
+            # episode is open (see _rc_observer_tick), never acted on.
+            with self.lock:
+                if self.rc_demo is not None:
+                    self.rc_pending_actions.append(
+                        (time.time(), payload.get("action") or {},
+                         (payload.get("result") or {}).get("status")))
+            return
         if payload.get("source") != SOURCE_NAME:
             return
         result = payload.get("result") or {}
@@ -919,6 +956,129 @@ class FieldAgent:
         place) takes the wheel back from follow mode. A no-op in
         follow_daemon when following isn't active."""
         self.bus.publish("picarx/tools/follow/set", {"enabled": False})
+
+    # ---------- inbound: RC mode (human takes the wheel) ----------
+
+    def on_rc_mode(self, payload):
+        active = bool(payload.get("active"))
+        if active == self.rc_active:
+            return
+        self.rc_active = active
+        with self.lock:
+            self.rc_demo = None
+            self.rc_pending_actions.clear()
+        if active:
+            if self.explore_mode:
+                self.explore_mode = False
+                self.cancel_intent()
+            self._stop_following()
+            print("Field agent: RC mode ON - standing down, watching the human drive")
+            self.publish_decision(
+                "rc_mode", {"active": True},
+                "the user took manual control, so I stopped driving and am "
+                "watching how they handle things")
+        else:
+            print("Field agent: RC mode off - autonomy available again (say explore)")
+            self.publish_decision("rc_mode", {"active": False},
+                                  "manual control ended")
+
+    # ---------- RC observation (passive demonstration learning) ----------
+
+    def _rc_situation(self, snap):
+        """Obstacle-like trigger, mirroring what exploration reacts to.
+        Returns a situation string or None."""
+        if snap is None:
+            return None
+        distance = snap.get("distance_cm")
+        if (distance is not None and not snap.get("distance_stale", True)
+                and 0 < distance < RC_DEMO_TRIGGER_CM):
+            return "obstacle_ahead"
+        if _vision_obstacle(snap) is not None:
+            return "vision_obstacle"
+        return None
+
+    def _rc_situation_cleared(self, snap):
+        if snap is None:
+            return False
+        distance = snap.get("distance_cm")
+        ultra_clear = (distance is not None and not snap.get("distance_stale", True)
+                       and distance > RC_DEMO_CLEAR_CM)
+        return ultra_clear and _vision_obstacle(snap) is None
+
+    @staticmethod
+    def _compress_rc_actions(raw):
+        """[(ts, action, status), ...] -> deduped [{"action","status",
+        "count"}] - the SHAPE of the maneuver, not every repeated tick."""
+        steps = []
+        for _ts, action, status in raw:
+            if steps and steps[-1]["action"] == action and steps[-1]["status"] == status:
+                steps[-1]["count"] += 1
+                continue
+            steps.append({"action": action, "status": status, "count": 1})
+        return steps
+
+    def _rc_observer_tick(self, now):
+        snap = self._snapshot()
+        with self.lock:
+            demo = self.rc_demo
+            pending = list(self.rc_pending_actions)
+            self.rc_pending_actions.clear()
+
+        if demo is None:
+            if now - self.last_rc_demo_at < RC_DEMO_COOLDOWN:
+                return
+            situation = self._rc_situation(snap)
+            if situation is None:
+                return
+            demo = {
+                "situation": situation,
+                "started_at": now,
+                "raw_actions": [],
+                "context": {
+                    "distance_cm": (snap or {}).get("distance_cm"),
+                    "objects": [o.get("label") for o in
+                                ((snap or {}).get("objects") or {}).get("items", [])],
+                    "location": self._location_context(),
+                },
+            }
+            with self.lock:
+                self.rc_demo = demo
+            print(f"Field agent: watching how the user handles: {situation}")
+            return
+
+        demo["raw_actions"].extend(pending)
+        cleared = self._rc_situation_cleared(snap)
+        if not cleared and now - demo["started_at"] < RC_DEMO_MAX_SEC:
+            with self.lock:
+                self.rc_demo = demo
+            return
+
+        # Episode over: publish one compact demonstration record - but
+        # only if the human actually DID something (an empty window is
+        # noise, not a lesson).
+        with self.lock:
+            self.rc_demo = None
+        self.last_rc_demo_at = now
+        steps = self._compress_rc_actions(demo["raw_actions"])
+        if not steps:
+            return
+        record = {
+            "situation": demo["situation"],
+            "context": demo["context"],
+            "actions": steps,
+            "resolved": cleared,
+            "duration": round(now - demo["started_at"], 1),
+            "ts": now,
+        }
+        moves = ",".join(s["action"].get("direction", "?") for s in steps)
+        print(f"Field agent: recorded RC demonstration ({demo['situation']} -> "
+              f"{moves} -> {'cleared' if cleared else 'unresolved'})")
+        self.bus.publish("picarx/rc/demonstration", record)
+        self.publish_decision(
+            "rc_demonstration",
+            {"situation": demo["situation"], "moves": moves, "resolved": cleared},
+            "I watched how the user drove out of a situation I usually "
+            "struggle with, and saved it to learn from")
 
     # ---------- inbound: person identity (optional module) ----------
 
@@ -1040,6 +1200,12 @@ class FieldAgent:
         # start off a fuzzy repair, only off the literal word.
         if "explore" in text and not from_repair:
             self._mark_interaction()
+            if self.rc_active:
+                # The human literally has the wheel - autonomy resumes
+                # only after RC mode is switched off at the console.
+                self.announce("You're driving me right now. Turn off R C mode "
+                              "first and I'll explore.", force=True)
+                return
             if not self.explore_mode:
                 self._stop_following()
                 self.explore_mode = True
@@ -2328,6 +2494,7 @@ class FieldAgent:
         self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
         self.bus.subscribe("picarx/vision/person", self.on_person)
         self.bus.subscribe("picarx/tools/follow/state", self.on_follow_state)
+        self.bus.subscribe("picarx/rc/mode", self.on_rc_mode)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)
@@ -2337,6 +2504,8 @@ class FieldAgent:
             self._perception_tick()
             if self.explore_mode:
                 self.explore_tick()
+            elif self.rc_active:
+                self._rc_observer_tick(time.time())
             time.sleep(period)
 
 

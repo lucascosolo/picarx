@@ -432,6 +432,14 @@ class AudioNode:
         # radio plays) so background noise can't fire false commands.
         # Speech OUT is unaffected; only recognition is gated.
         self.mic_enabled = True
+        # Remote speaker kill-switch (picarx/audio/speaker_control): while
+        # off, every TTS request is dropped (at enqueue AND dequeue, so
+        # nothing backs up to blurt out later). Toggling back ON runs the
+        # amp-enable command (robot_hat enable_speaker) before anything
+        # plays - the HAT can reset the amp GPIO while we were muted, and
+        # "unmuted but silent" is the worst failure mode. Only gates TTS;
+        # the radio stream has its own stop/play controls.
+        self.speaker_enabled = True
 
         # TTS output path: a single dedicated worker thread drains a queue
         # and plays one clip at a time. Callers (the picarx/audio/speak bus
@@ -524,6 +532,9 @@ class AudioNode:
                 text, ts = self._tts_queue.get()
             except Exception:
                 continue
+            if not self.speaker_enabled:
+                print(f"(speaker disabled, dropping: {text})")
+                continue
             # Drop announcements that went stale while queued: playback is
             # serial, so during a busy stretch old lines would otherwise play
             # long after the moment they described (same rule as at enqueue).
@@ -588,6 +599,9 @@ class AudioNode:
         text = payload.get("text", "")
         if not text:
             return
+        if not self.speaker_enabled:
+            print(f"(speaker disabled, dropping: {text})")
+            return
         try:
             ts = float(payload["ts"]) if payload.get("ts") is not None else None
         except (TypeError, ValueError):
@@ -644,9 +658,24 @@ class AudioNode:
         self.bus.publish("picarx/audio/mic_state",
                          {"enabled": self.mic_enabled, "ts": time.time()})
 
+    def on_speaker_control(self, payload):
+        enabled = bool(payload.get("enabled", True))
+        if enabled != self.speaker_enabled:
+            self.speaker_enabled = enabled
+            print(f"Audio node: speaker {'enabled' if enabled else 'disabled'} remotely")
+            if enabled:
+                # Re-assert the amp on the off->on press: the HAT may have
+                # reset the amp GPIO while we were muted, and coming back
+                # "on" but inaudible would look like a broken robot.
+                self._last_amp_assert_at = time.time()
+                self._enable_speakers_once()
+        self.bus.publish("picarx/audio/speaker_state",
+                         {"enabled": self.speaker_enabled, "ts": time.time()})
+
     def run(self):
         self.bus.subscribe("picarx/audio/speak", self.handle_speak_request)
         self.bus.subscribe("picarx/audio/mic_control", self.on_mic_control)
+        self.bus.subscribe("picarx/audio/speaker_control", self.on_speaker_control)
         self._enable_speakers()
         self._ensure_tts_worker()
 
