@@ -26,6 +26,7 @@ def _bare_node():
     node = audio_nodes.AudioNode.__new__(audio_nodes.AudioNode)
     node.mute_until = 0.0
     node.espeak_voice = None
+    node.speaker_enabled = True
     node._tts_queue = queue.Queue()
     node._tts_worker_started = False
     node._last_amp_assert_at = 0.0
