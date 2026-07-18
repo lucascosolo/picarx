@@ -384,8 +384,12 @@ def _vision_obstacle(snapshot):
             "frame_width": best.get("frame_width", 0)}
 
 
-def _prune_older_than(dq, window, now):
-    while dq and dq[0] < now - window:
+def _prune_older_than(dq, window, now, key=None):
+    """Drop leading entries older than the window. `key` extracts the
+    timestamp when entries aren't bare floats (veto_events holds
+    (ts, reason_code) tuples so episode records can say WHICH veto)."""
+    ts = key if key is not None else (lambda e: e)
+    while dq and ts(dq[0]) < now - window:
         dq.popleft()
 
 
@@ -544,7 +548,7 @@ class HypothesisTask:
         """Did the safety daemon veto any of OUR intents since the probe
         began? That is the physical answer we are listening for."""
         with self.agent.lock:
-            return any(t > self.started_at for t in self.agent.veto_events)
+            return any(t > self.started_at for t, _code in self.agent.veto_events)
 
     def resolve(self, now, resolution, why, **details):
         """Single exit point for EVERY hypothesis type: publish the
@@ -739,6 +743,7 @@ class FieldAgent:
         self.state = "CRUISING"  # CRUISING, SCANNING, EVADING, COACHING, HYPOTHESIS
         self.evade_stage = 0     # 0:stop 1:pre-turn 2:reverse-arc 3:straighten+go
         self.evade_angle = 0     # steering angle held through the reverse arc
+        self.evade_reason = None # what triggered the current evasion (journaled)
         self.state_until = 0.0
         self.evasion_fail_events = deque()
         self.next_fail_state_allowed_at = 0.0
@@ -925,11 +930,13 @@ class FieldAgent:
         if result.get("status") != "vetoed":
             return
         with self.lock:
-            self.veto_events.append(time.time())
-            # Remember WHAT kind of veto it was: recovery tactics for a
-            # cliff are different from an unseen obstacle, so the coach
-            # gets told which failure mode it's actually escaping.
-            self.last_veto_code = result.get("reason_code", "unknown")
+            # (ts, reason_code): the code rides along so episode/outcome
+            # records can say WHICH veto ended a maneuver, not just THAT
+            # one did - a cliff veto and an unseen-obstacle veto call for
+            # different corrections.
+            code = result.get("reason_code", "unknown")
+            self.veto_events.append((time.time(), code))
+            self.last_veto_code = code
             self.last_veto_at = time.time()
 
     # ---------- inbound: follow-mode coordination ----------
@@ -1008,14 +1015,37 @@ class FieldAgent:
     @staticmethod
     def _compress_rc_actions(raw):
         """[(ts, action, status), ...] -> deduped [{"action","status",
-        "count"}] - the SHAPE of the maneuver, not every repeated tick."""
+        "count","duration"}] - the SHAPE of the maneuver, not every
+        repeated tick, but WITH real timing: "backed up for 1.2 seconds"
+        is the correction-relevant fact, and duration also makes these
+        steps schema-compatible with the coach's own {"action","duration"}
+        arms. Duration spans first to last confirmation of the identical
+        command plus one arbiter tick (the command is held ~0.1s past its
+        final confirmation). Held stops are under-counted (the arbiter
+        dedups repeated stops) - fine, stop length rarely matters."""
         steps = []
-        for _ts, action, status in raw:
+        for ts, action, status in raw:
             if steps and steps[-1]["action"] == action and steps[-1]["status"] == status:
                 steps[-1]["count"] += 1
+                steps[-1]["_last_ts"] = ts
                 continue
-            steps.append({"action": action, "status": status, "count": 1})
+            steps.append({"action": action, "status": status, "count": 1,
+                          "_first_ts": ts, "_last_ts": ts})
+        for s in steps:
+            s["duration"] = round(s.pop("_last_ts") - s.pop("_first_ts") + 0.1, 2)
         return steps
+
+    @staticmethod
+    def _demo_object(obj):
+        """Compact, geometry-aware object record for demonstration
+        context: which side it sat on (same l/c/r convention as place
+        fingerprints), how big it loomed, and whether it was closing."""
+        frame_w = obj.get("frame_width") or 0
+        offset_frac = (obj.get("center_offset", 0) / (frame_w / 2.0)) if frame_w else 0
+        side = "l" if offset_frac < -0.15 else ("r" if offset_frac > 0.15 else "c")
+        return {"label": obj.get("label", "something"), "side": side,
+                "area_ratio": round(obj.get("area_ratio") or 0.0, 2),
+                "approaching": bool(obj.get("approaching"))}
 
     def _rc_observer_tick(self, now):
         snap = self._snapshot()
@@ -1036,7 +1066,9 @@ class FieldAgent:
                 "raw_actions": [],
                 "context": {
                     "distance_cm": (snap or {}).get("distance_cm"),
-                    "objects": [o.get("label") for o in
+                    # Geometry matters for corrections: an obstacle on the
+                    # LEFT is a different lesson than one on the right.
+                    "objects": [self._demo_object(o) for o in
                                 ((snap or {}).get("objects") or {}).get("items", [])],
                     "location": self._location_context(),
                 },
@@ -1803,7 +1835,9 @@ class FieldAgent:
 
     def _finish_coach_episode(self, now):
         with self.lock:
-            veto_free = not any(t > self.coach_action_started_at for t in self.veto_events)
+            episode_vetoes = [(t, code) for t, code in self.veto_events
+                              if t > self.coach_action_started_at]
+        veto_free = not episode_vetoes
         succeeded = veto_free and self._episode_moved(self.coach_steps, self.coach_motion_max)
         query_id = self.last_coach_query_id_used
         situation_key = self.last_coach_situation_key
@@ -1815,11 +1849,18 @@ class FieldAgent:
         self.publish_intent({"direction": "turn", "angle": 0}, priority=COACH_PRIORITY)
         self.state = "CRUISING"
         self.last_wander = now
+        # The bare boolean isn't enough to correct from: say WHY it
+        # failed (a veto, and of which kind, vs. grinding in place with
+        # no visual motion) and how long the whole maneuver ran.
         self.bus.publish("picarx/coach/outcome", {
             "query_id": query_id,
             "situation_key": situation_key,
             "source": SOURCE_NAME,
             "success": succeeded,
+            "vetoed": not veto_free,
+            "veto_code": episode_vetoes[-1][1] if episode_vetoes else None,
+            "motion_max": self.coach_motion_max,
+            "duration": round(now - self.coach_action_started_at, 1),
         })
         if succeeded:
             self.consecutive_coach_failures = 0
@@ -1853,7 +1894,8 @@ class FieldAgent:
 
     def _finish_watch_episode(self):
         with self.lock:
-            succeeded = not any(t > self.watch_action_started_at for t in self.veto_events)
+            succeeded = not any(t > self.watch_action_started_at
+                                for t, _code in self.veto_events)
         self.bus.publish("picarx/coach/outcome", {
             "query_id": self.watch_query_id_used,
             "situation_key": self.watch_situation_key,
@@ -1963,6 +2005,7 @@ class FieldAgent:
     def _begin_evasion(self, reason, away_hint=None):
         now = time.time()
         self.forward_since = None
+        self.evade_reason = reason   # journaled with the chosen angle at stage 1
         # Escape-side hint from the caller (signed angle, or None): set
         # fresh on EVERY entry so a stale hint from a previous vision
         # evasion can never steer an unrelated later escape.
@@ -2167,7 +2210,7 @@ class FieldAgent:
         now = time.time()
 
         with self.lock:
-            _prune_older_than(self.veto_events, VETO_WINDOW, now)
+            _prune_older_than(self.veto_events, VETO_WINDOW, now, key=lambda e: e[0])
             veto_count = len(self.veto_events)
 
         if self.state == "SCANNING":
@@ -2236,6 +2279,16 @@ class FieldAgent:
                     if self.evade_angle is None:
                         self.evade_angle = random.choice([-30, 30])
                     self.state_until = now + 0.3
+                    # Journal the maneuver the moment its shape is decided:
+                    # evasions are the robot's most common maneuver, and
+                    # without this "why did you back up?" had no answer and
+                    # reflection couldn't see evasion choices at all.
+                    self.publish_decision(
+                        "evade",
+                        {"angle": self.evade_angle,
+                         "trigger": getattr(self, "evade_reason", "unknown")},
+                        f"escaping {getattr(self, 'evade_reason', 'an obstacle')} by "
+                        f"reversing along a {'left' if self.evade_angle < 0 else 'right'} arc")
                     self.publish_intent({"direction": "turn", "angle": self.evade_angle}, priority=EVADE_PRIORITY)
                 elif self.evade_stage == 2:
                     # Reverse along the arc (wheels stay turned - backward

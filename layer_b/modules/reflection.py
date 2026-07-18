@@ -154,6 +154,14 @@ Reply with a JSON array only, no prose:
 Return [] if nothing is worth remembering."""
 
 
+def _move_with_duration(step):
+    """'backward 1.2s' from a step dict; direction alone for old rows
+    recorded before durations existed."""
+    direction = (step.get("action") or {}).get("direction") or "?"
+    duration = step.get("duration")
+    return f"{direction} {duration:.1f}s" if duration is not None else direction
+
+
 class Reflection:
     def __init__(self):
         self.bus = Bus()
@@ -207,15 +215,24 @@ class Reflection:
             return f"heard: {p.get('text')}"
         if topic == "picarx/coach/episode":
             # Episodes carry an ordered "steps" list; older rows may still
-            # have the legacy single "action" field instead.
+            # have the legacy single "action" field instead. Durations and
+            # the failure cause ride along - "backward 1.0s failed, vetoed:
+            # cliff" teaches something "failed" alone never could.
             steps = p.get("steps") or []
             if steps:
-                moves = ",".join(
-                    (s.get("action") or {}).get("direction") or "?" for s in steps)
+                moves = ",".join(_move_with_duration(s) for s in steps)
             else:
                 moves = (p.get("action") or {}).get("direction")
+            if p.get("success"):
+                outcome = "worked"
+            elif p.get("vetoed"):
+                outcome = f"failed - vetoed ({p.get('veto_code') or 'unknown'})"
+            elif p.get("motion_max") is not None and p["motion_max"] < 3.0:
+                outcome = "failed - never visibly moved"
+            else:
+                outcome = "failed"
             return (f"coach[{p.get('situation_key')}]: {moves}"
-                    f" -> {'worked' if p.get('success') else 'failed'}"
+                    f" -> {outcome}"
                     f" ({'cached' if p.get('cached') else 'fresh'})")
         if topic == "picarx/exploration/room_scan":
             parts = [f"{s.get('pan')}deg:{','.join(s.get('labels') or ['-'])}"
@@ -240,9 +257,12 @@ class Reflection:
         if topic == "picarx/rc/demonstration":
             ctx = p.get("context") or {}
             where = (ctx.get("location") or {}).get("label") or "an unknown place"
-            objects = ",".join(ctx.get("objects") or []) or "nothing recognized"
-            moves = ",".join((s.get("action") or {}).get("direction", "?")
-                             for s in p.get("actions") or [])
+            # Objects are {"label","side",...} dicts now; old rows in the
+            # DB may still hold bare label strings.
+            objects = ",".join(
+                o if isinstance(o, str) else f"{o.get('label')}({o.get('side', '?')})"
+                for o in ctx.get("objects") or []) or "nothing recognized"
+            moves = ",".join(_move_with_duration(s) for s in p.get("actions") or [])
             return (f"USER DEMONSTRATION at {where} ({p.get('situation')}, "
                     f"seeing {objects}): the human drove {moves} -> "
                     f"{'cleared it' if p.get('resolved') else 'did not clear it'}")

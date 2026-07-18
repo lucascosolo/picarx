@@ -123,6 +123,17 @@ EMBED_THRESHOLD_BY_SITUATION = {"novel_object": 0.70, "collision_loop": 0.78}
 
 MAX_STEPS = 4                 # cap on how many actions one maneuver may chain
 
+# Human demonstrations (picarx/rc/demonstration, from RC mode): the last
+# few are persisted inside the policy file under a reserved "_" key and
+# included in every LLM coaching query, so the model can IMITATE how a
+# human actually drove out of a similar spot - its imitation becomes an
+# ordinary arm the bandit then validates like anything else. Steps are
+# clamped through the same bounds as the coach's own arms, and vetoed
+# commands are never taught from.
+DEMONSTRATIONS_KEY = "_demonstrations"
+MAX_DEMONSTRATIONS = 10
+DEMONSTRATIONS_IN_PROMPT = 4
+
 WORKER_THREADS = 2          # query handling runs off the MQTT callback thread
 
 DEFAULT_SPEED = 25
@@ -170,8 +181,14 @@ must actually reposition. You may be told what has already been tried here and
 whether it worked - prefer maneuvers unlike the ones that have failed. You may also
 receive "learned_patterns" (statistics mined from the car's own history) and the
 failure mode that triggered this (obstacle / cliff / reverse_limit) - a cliff needs
-a different escape than an unseen obstacle, so weigh both. The safety layer vetoes
-anything truly unsafe, so suggest a real corrective maneuver.
+a different escape than an unseen obstacle, so weigh both.
+
+"human_demonstrations" are maneuvers a HUMAN drove with the remote control to get
+out of situations like these, with real step durations and where the obstacles sat
+(side l/c/r). When one matches the current situation - especially a resolved one -
+strongly prefer imitating its shape and timing over inventing something new.
+
+The safety layer vetoes anything truly unsafe, so suggest a real corrective maneuver.
 """
 
 
@@ -201,6 +218,9 @@ class Coach:
             return {}
         policy = {}
         for key, entry in raw.items():
+            if key.startswith("_"):
+                policy[key] = entry   # reserved sections (e.g. _demonstrations)
+                continue
             if not (isinstance(entry, dict) and "arms" in entry):
                 print(f"Coach: dropping legacy-format policy entry for {key} (pre-bandit cache schema)")
                 continue
@@ -347,7 +367,8 @@ class Coach:
             payload.get("situation"), EMBED_SIMILARITY_THRESHOLD)
         best_key, best_sim = None, threshold
         for key, entry in self.policy.items():
-            if key == situation_key or not entry.get("arms") or not entry.get("embedding"):
+            if (key == situation_key or not isinstance(entry, dict)
+                    or not entry.get("arms") or not entry.get("embedding")):
                 continue
             sim = self.embedder.cosine(query_vec, entry["embedding"])
             if sim >= best_sim:
@@ -442,6 +463,7 @@ class Coach:
             "already_tried_here": self._tried_before(situation_key),
             "things_ive_learned": self._learned_facts(),
             "learned_patterns": self._learned_patterns(),
+            "human_demonstrations": self._recent_demonstrations(),
         }
         if experiment:
             message["experiment_request"] = (
@@ -504,6 +526,55 @@ class Coach:
             raise ValueError("no steps in plan")
         steps = [cls._clamp_step(s) for s in raw_steps[:MAX_STEPS]]
         return steps, rationale
+
+    # ---------- inbound: human demonstrations ----------
+
+    def on_demonstration(self, payload):
+        """A human drove out of an obstacle situation in RC mode. Keep
+        the maneuver (clamped to the same safe bounds as any arm; vetoed
+        commands excluded) so future LLM queries can imitate it."""
+        steps = []
+        for s in (payload.get("actions") or [])[:MAX_STEPS]:
+            if s.get("status") not in (None, "executed"):
+                continue   # the safety daemon refused it - not a lesson
+            try:
+                steps.append(self._clamp_step(
+                    {**(s.get("action") or {}), "duration": s.get("duration")}))
+            except (ValueError, TypeError):
+                continue
+        if not steps:
+            return
+        demo = {
+            "situation": payload.get("situation"),
+            "context": payload.get("context"),
+            "steps": steps,
+            "resolved": bool(payload.get("resolved")),
+            "ts": payload.get("ts") or time.time(),
+        }
+        with self.lock:
+            demos = self.policy.setdefault(DEMONSTRATIONS_KEY, [])
+            demos.append(demo)
+            del demos[:-MAX_DEMONSTRATIONS]
+        self._save_policy()
+        moves = ", ".join(f"{s['action'].get('direction')} {s['duration']:.1f}s"
+                          for s in steps)
+        print(f"Coach: stored human demonstration ({payload.get('situation')}: "
+              f"{moves}, {'resolved' if demo['resolved'] else 'unresolved'})")
+
+    def _recent_demonstrations(self):
+        """Freshest few demonstrations for the prompt, resolved ones first."""
+        with self.lock:
+            demos = list(self.policy.get(DEMONSTRATIONS_KEY) or [])
+        demos.sort(key=lambda d: (bool(d.get("resolved")), d.get("ts", 0)),
+                   reverse=True)
+        return [{"situation": d.get("situation"),
+                 "context": d.get("context"),
+                 "steps": [{"direction": s["action"].get("direction"),
+                            **{k: v for k, v in s["action"].items()
+                               if k in ("speed", "angle")},
+                            "duration": s["duration"]} for s in d.get("steps", [])],
+                 "resolved": d.get("resolved")}
+                for d in demos[:DEMONSTRATIONS_IN_PROMPT]]
 
     # ---------- inbound: queries ----------
 
@@ -686,6 +757,14 @@ class Coach:
             "cached": pending["cached"],
             "experimental": pending.get("experimental", False),
             "success": success,
+            # HOW it ended, not just whether: which veto cut it short (if
+            # any), whether the robot visibly moved, and how long it ran -
+            # the difference between "reverse harder" and "reverse the
+            # other way" when correcting later.
+            "vetoed": payload.get("vetoed"),
+            "veto_code": payload.get("veto_code"),
+            "motion_max": payload.get("motion_max"),
+            "duration": payload.get("duration"),
             "issued_at": pending["issued_at"],
             "finished_at": time.time(),
         })
@@ -705,6 +784,7 @@ class Coach:
     def run(self):
         self.bus.subscribe("picarx/coach/query", self.on_query)
         self.bus.subscribe("picarx/coach/outcome", self.on_outcome)
+        self.bus.subscribe("picarx/rc/demonstration", self.on_demonstration)
 
         for _ in range(WORKER_THREADS):
             threading.Thread(target=self._worker_loop, daemon=True).start()

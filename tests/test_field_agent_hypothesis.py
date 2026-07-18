@@ -65,7 +65,7 @@ class HypothesisFrameworkTest(unittest.TestCase):
                                 "objects": {"stale": False, "items": [],
                                             "close_object": False}}
         self.fa._maybe_start_sensor_probe(200.0, self.fa.latest_world, 18)
-        self.fa.veto_events.append(200.3)  # safety daemon vetoes the creep
+        self.fa.veto_events.append((200.3, "obstacle"))  # safety daemon vetoes the creep
         self.fa._handle_hypothesis_tick(200.5)
         h = self._hyps()[-1]
         self.assertEqual(h["resolution"], "real_obstacle")
@@ -109,7 +109,7 @@ class HypothesisFrameworkTest(unittest.TestCase):
         self._arm_veto_prone()
         self.fa._maybe_start_veto_prone_probe(300.0)
         self.fa._handle_hypothesis_tick(300.3)     # creeping
-        self.fa.veto_events.append(300.4)          # daemon flags it
+        self.fa.veto_events.append((300.4, "obstacle"))  # daemon flags it
         self.fa._handle_hypothesis_tick(300.6)
         h = self._hyps()[-1]
         self.assertEqual(h["resolution"], "still_blocked")

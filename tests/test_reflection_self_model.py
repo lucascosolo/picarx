@@ -130,7 +130,7 @@ class SelfModelTest(unittest.TestCase):
             "success": True, "cached": False,
         })
         line = reflection.Reflection._summarize_event("picarx/coach/episode", payload)
-        self.assertIn("backward,turn", line)
+        self.assertIn("backward 1.0s,turn 0.5s", line)
         self.assertNotIn("None", line)
 
     def test_summarize_coach_episode_legacy_action(self):
