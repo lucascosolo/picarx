@@ -161,3 +161,27 @@ at a known distance and set `k = distance_cm * sqrt(area_ratio)`),
 `steering.clearance_m` (lateral passing clearance),
 `steering.curve_slowdown_gain` (speed drop with steering angle).
 Inspect behaviour off-robot with `python3 tools/simulate_steer.py`.
+
+## RC mode + camera overlay + speaker toggle (2026-07-17)
+
+The web console can now hand the wheel to a human. RC mode publishes
+ordinary vetoable intents (source "rc", priority 10 - above every AI
+source, so manual input preempts queued AI motion) while
+picarx/rc/mode tells the AI side to stand down; the safety daemon's
+veto authority is untouched. Drive with WASD/arrows or the on-screen
+D-pad; layered fail-safes (0.5s intent TTL, 4Hz client keep-alive,
+0.8s dead-man stop, 60s mode timeout) mean a closed laptop lid stops
+the robot, not the ceiling.
+
+While the human drives, field_agent passively records "demonstrations":
+when an obstacle-like situation appears, it snapshots the context and
+collects the human's (deduped) maneuver until the path clears - one
+picarx/rc/demonstration event per episode, rate-limited, persisted to
+events.db and fed to reflection, which is prompted to distill repeated
+demonstrations into durable tactics. A human coach, learned offline.
+
+The live camera view draws real-time labeled bounding boxes (objects,
+faces, recognized people by name) scaled over the JPEG feed, and the
+Audio card gains a speaker kill-switch: off silences TTS, and the
+off->on press re-runs `robot_hat enable_speaker` so the amp is always
+re-asserted before speech resumes.
