@@ -2,9 +2,11 @@
 questions and answer capture, reflection's immediate human-label writes, and
 the web console's identification-vs-interpretation feedback split."""
 import os
+import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,9 +14,31 @@ import harness  # noqa: E402
 
 import vision_basic  # noqa: E402
 import curiosity  # noqa: E402
+import companion  # noqa: E402
 import reflection  # noqa: E402
 import web_console  # noqa: E402
 from semantic_store import SemanticStore  # noqa: E402
+
+
+class _FakeBlock:
+    def __init__(self, text):
+        self.type = "text"
+        self.text = text
+
+
+class _FakeResp:
+    def __init__(self, text):
+        self.content = [_FakeBlock(text)]
+
+
+class _FakeClient:
+    """Minimal Anthropic client stand-in: returns a fixed reply text."""
+    def __init__(self, reply):
+        self._reply = reply
+        self.messages = self
+
+    def create(self, **kwargs):
+        return _FakeResp(self._reply)
 
 
 class ContestedLabelTest(unittest.TestCase):
@@ -137,6 +161,40 @@ class CuriosityAnswerTest(unittest.TestCase):
         self.assertIsNone(self.c.bus.last("picarx/perception/label"))
 
 
+class CuriosityLlmEscalationTest(unittest.TestCase):
+    def setUp(self):
+        self.c = curiosity.Curiosity()
+        self.c.on_objects({"objects": [{"id": "object_0", "label": "chair",
+                                        "alt_label": "speaker", "confidence": 0.7}]})
+        self.c.bus.clear()
+
+    def _expire(self):
+        self.c.pending["until"] = curiosity.time.time() - 1
+
+    def test_unanswered_question_escalates_to_llm(self):
+        self._expire()
+        self.c.on_objects({"objects": []})
+        req = self.c.bus.last("picarx/perception/identify_request")
+        self.assertIsNotNone(req)
+        self.assertEqual(req["object_id"], "object_0")
+        self.assertEqual(req["guess"], "chair")
+        self.assertIsNone(self.c.pending)
+
+    def test_answered_question_never_escalates(self):
+        self.c.on_heard({"text": "it's a speaker"})   # answered before timeout
+        self.c.on_objects({"objects": []})
+        self.assertIsNone(self.c.bus.last("picarx/perception/identify_request"))
+
+    def test_escalation_is_throttled(self):
+        self._expire()
+        self.c.on_objects({"objects": []})            # escalates once
+        # A second timed-out question inside the cooldown must not re-escalate.
+        self.c.pending = {"object_id": "object_9", "guess": "bottle",
+                          "options": ["bottle"], "until": curiosity.time.time() - 1}
+        self.c.on_objects({"objects": []})
+        self.assertEqual(len(self.c.bus.of("picarx/perception/identify_request")), 1)
+
+
 class ReflectionHumanLabelTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -170,6 +228,52 @@ class ReflectionHumanLabelTest(unittest.TestCase):
     def test_empty_label_is_ignored(self):
         self.r.on_label({"correct_label": "  ", "guess": "chair"})
         self.assertEqual(self.r.store.fact_count(), 0)
+
+
+class CompanionIdentifyTest(unittest.TestCase):
+    def _make(self, reply="watering can"):
+        c = companion.Companion.__new__(companion.Companion)
+        c.bus = harness.FakeBus()
+        c.lock = threading.Lock()
+        c.work_queue = queue.Queue()
+        c._last_identify_at = 0.0
+        c._client = _FakeClient(reply)
+        c.latest_frame_b64 = "ZmFrZQ=="   # a fresh frame so _get_camera_frame returns at once
+        c.latest_frame_at = time.time()
+        return c
+
+    def test_clean_label_normalizes(self):
+        self.assertEqual(companion.Companion._clean_identify_label("Watering Can."),
+                         "watering can")
+
+    def test_clean_label_rejects_unknown_and_sentences(self):
+        self.assertIsNone(companion.Companion._clean_identify_label("unknown"))
+        self.assertIsNone(companion.Companion._clean_identify_label(
+            "it is a coffee mug on the table"))
+        self.assertIsNone(companion.Companion._clean_identify_label(""))
+
+    def test_on_identify_queues_then_throttles(self):
+        c = self._make()
+        c.on_identify({"object_id": "object_0", "guess": "chair"})
+        self.assertEqual(c.work_queue.get_nowait()[0], "identify")
+        c.on_identify({"object_id": "object_0", "guess": "chair"})  # within cooldown
+        self.assertTrue(c.work_queue.empty())
+
+    def test_identify_publishes_llm_label_and_speaks(self):
+        c = self._make("watering can")
+        c._identify_object({"object_id": "object_0", "guess": "chair"})
+        label = c.bus.last("picarx/perception/label")
+        self.assertEqual(label["correct_label"], "watering can")
+        self.assertEqual(label["guess"], "chair")
+        self.assertEqual(label["origin"], "llm")
+        speak = c.bus.last("picarx/audio/speak")
+        self.assertIn("watering can", speak["text"])
+        self.assertEqual(speak["kind"], "observation")
+
+    def test_identify_unsure_publishes_nothing(self):
+        c = self._make("unknown")
+        c._identify_object({"object_id": "object_0", "guess": "chair"})
+        self.assertIsNone(c.bus.last("picarx/perception/label"))
 
 
 class ConsoleObservationFeedbackTest(unittest.TestCase):

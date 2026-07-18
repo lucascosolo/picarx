@@ -53,6 +53,11 @@ OBJECTS_TOPIC = "picarx/vision/objects"
 HEARD_TOPIC = "picarx/audio/heard"
 SPEAK_TOPIC = "picarx/audio/speak"
 LABEL_TOPIC = "picarx/perception/label"
+# LAST-resort tier: when a spoken question goes unanswered, hand the object
+# to companion.py to identify with the cloud LLM. companion feeds the answer
+# back on LABEL_TOPIC, which trains the on-board memory - so the cloud is
+# needed at most once per object kind, then never again for that look.
+IDENTIFY_TOPIC = "picarx/perception/identify_request"
 
 # Below this reported confidence a single (uncontested) guess is shaky
 # enough to be worth a "what is that?" - above the OBJECT_CONFIDENCE_THRESHOLD
@@ -61,6 +66,7 @@ LOW_CONF_THRESHOLD = 0.6
 ASK_COOLDOWN = 30.0          # min seconds between spoken questions
 ANSWER_WINDOW_SEC = 12.0     # how long the next utterance counts as the answer
 ASKED_MEMORY = 300           # cap on remembered "already asked" object ids
+LLM_COOLDOWN = 60.0          # min seconds between cloud identify escalations
 
 # Words that aren't the noun in a spoken answer ("it's a speaker", "I think
 # that's a chair", "no, a mug") - stripped so what's left is the label.
@@ -94,6 +100,7 @@ class Curiosity:
         self.asked = set()          # object ids already asked about
         self.pending = None         # open question, or None (see _ask)
         self.last_ask_at = 0.0
+        self.last_llm_at = 0.0      # last cloud identify escalation
 
     # ---------- speaking ----------
 
@@ -123,6 +130,13 @@ class Curiosity:
 
     def on_objects(self, payload):
         now = time.time()
+        expired = None
+        with self.lock:
+            if self.pending and now > self.pending["until"]:
+                expired = self.pending   # question timed out with no answer
+                self.pending = None
+        if expired:
+            self._escalate_to_llm(expired, now)
         with self.lock:
             if self.pending and now <= self.pending["until"]:
                 return  # one open question at a time
@@ -131,6 +145,21 @@ class Curiosity:
         target = self._pick_uncertain(payload.get("objects") or [])
         if target:
             self._ask(target, now)
+
+    def _escalate_to_llm(self, pending, now):
+        """A spoken question went unanswered - fall through to the cloud LLM
+        as the LAST resort (hard-throttled, since it costs money and network).
+        companion.py does the identify call and feeds the answer back on
+        LABEL_TOPIC, which trains the on-board memory for next time."""
+        with self.lock:
+            if now - self.last_llm_at < LLM_COOLDOWN:
+                return
+            self.last_llm_at = now
+        self.bus.publish(IDENTIFY_TOPIC, {
+            "object_id": pending["object_id"], "guess": pending["guess"],
+            "options": pending["options"], "ts": now})
+        print(f"Curiosity: no answer about {pending['object_id']} - "
+              f"asking the LLM to identify it (last resort)")
 
     def _ask(self, target, now):
         guess, alt = target["guess"], target["alt"]

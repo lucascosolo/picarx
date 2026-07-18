@@ -188,6 +188,24 @@ VISION_STREAM_CONTROL = "picarx/vision/stream_control"
 VISION_FRAME_TOPIC = "picarx/vision/frame"
 FRAME_FRESH_SEC = 2.0            # a frame this recent is "now" - reuse it
 FRAME_WAIT_SEC = 4.0             # how long to wait for a requested frame
+
+# ---------- perception LAST resort (picarx/perception/identify_request) ----------
+# When the on-board detector is unsure AND the on-board label memory can't help
+# AND a spoken question to a human went unanswered, curiosity.py hands the
+# object here. We identify it with one cheap camera-grounded LLM call and feed
+# the answer back on picarx/perception/label - which both trains the on-board
+# visual memory (vision_basic) and records a durable fact (reflection). So the
+# cloud is the LAST tier and is paid at most once per object kind. Hard
+# throttled; fail-soft (no key / no frame -> silently give up).
+PERCEPTION_IDENTIFY_TOPIC = "picarx/perception/identify_request"
+PERCEPTION_LABEL_TOPIC = "picarx/perception/label"
+IDENTIFY_COOLDOWN = 45.0
+IDENTIFY_MAX_TOKENS = 20
+IDENTIFY_SYSTEM_PROMPT = (
+    "You name what a small robot's camera is looking at. Reply with just the "
+    "single most prominent physical object in the photo, in 1 to 3 words, "
+    "lowercase, no punctuation and no sentence (e.g. 'watering can', 'slipper', "
+    "'coffee mug'). If you cannot tell, reply exactly 'unknown'.")
 CAMERA_TRIGGERS = (
     "what is this", "what's this", "what is that", "what do you see",
     "what are you looking at", "look at this", "what am i holding",
@@ -386,6 +404,7 @@ class Companion:
         # Pending "what did you want me to do?" question, or None:
         # {"utterance": <original misread phrasing>, "until": <deadline>}
         self.awaiting_correction = None
+        self._last_identify_at = 0.0      # throttles the cloud identify tier
 
     # ---------- memory persistence ----------
 
@@ -499,6 +518,17 @@ class Companion:
             with self.lock:
                 self.latest_frame_b64 = b64
                 self.latest_frame_at = time.time()
+
+    def on_identify(self, payload):
+        """Last-resort identify request from curiosity.py. Throttled here too
+        (belt-and-suspenders with curiosity's own cooldown), then handed to a
+        worker so the camera wait/LLM call never blocks the MQTT thread."""
+        now = time.time()
+        with self.lock:
+            if now - self._last_identify_at < IDENTIFY_COOLDOWN:
+                return
+            self._last_identify_at = now
+        self.work_queue.put(("identify", payload))
 
     def on_health(self, payload):
         # Vital stats from health_daemon, cached for the check_vital_stats tool.
@@ -841,6 +871,64 @@ class Companion:
         lowered = text.lower()
         return any(t in lowered for t in CAMERA_TRIGGERS)
 
+    # ---------- perception last resort ----------
+
+    @staticmethod
+    def _clean_identify_label(raw):
+        """A short, storable label from the identify model's reply, or None
+        (unsure / junk). Keeps it to a 1-3 word noun phrase."""
+        lines = (raw or "").strip().lower().splitlines()
+        text = lines[0].strip().strip(".!?\"'").strip() if lines else ""
+        if not text or "unknown" in text or len(text) > 40 or len(text.split()) > 3:
+            return None
+        return text
+
+    def _identify_object(self, payload):
+        """One camera-grounded LLM call to name an object the on-board tiers
+        couldn't. The answer goes back on picarx/perception/label, training the
+        on-board memory (so this cloud call is paid at most once per look) and
+        recording a fact. Fail-soft: no key or no frame just gives up quietly."""
+        guess = (payload.get("guess") or "").strip().lower()
+        object_id = payload.get("object_id")
+        client = self._get_client()
+        if client is None:
+            return
+        frame_b64 = self._get_camera_frame()
+        if not frame_b64:
+            print("Companion: identify - no camera frame, giving up (last resort)")
+            return
+        try:
+            response = client.messages.create(
+                model=INTENT_MODEL,
+                max_tokens=IDENTIFY_MAX_TOKENS,
+                system=IDENTIFY_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/jpeg",
+                        "data": frame_b64}},
+                    {"type": "text", "text": "What object is this?"}]}],
+                timeout=INTENT_TIMEOUT,
+            )
+            raw = "".join(b.text for b in response.content
+                          if getattr(b, "type", None) == "text").strip()
+        except Exception as e:
+            print(f"Companion: identify call failed ({e})")
+            return
+        label = self._clean_identify_label(raw)
+        if not label:
+            print(f"Companion: identify unsure for {object_id} (model said '{raw}')")
+            return
+        print(f"Companion: identified {object_id} as '{label}' "
+              f"(detector had guessed '{guess}')")
+        self.bus.publish(PERCEPTION_LABEL_TOPIC, {
+            "correct_label": label, "guess": guess, "object_id": object_id,
+            "origin": "llm", "ts": time.time()})
+        # Tagged observation: the user hears the robot's own conclusion and
+        # can still correct it from the console (which retrains the memory).
+        self.bus.publish("picarx/audio/speak", {
+            "text": f"I think that's a {label}.", "ts": time.time(),
+            "kind": "observation", "label": label})
+
     # ---------- autobiographical memory readback ----------
 
     def _episode_query_date(self, text):
@@ -1050,6 +1138,8 @@ class Companion:
                     self._repair_intent(item)
                 elif kind == "learn":
                     self._learn_correction(*item)
+                elif kind == "identify":
+                    self._identify_object(item)
                 else:
                     self._handle_utterance(item)
             except Exception as e:
@@ -1065,6 +1155,7 @@ class Companion:
         self.bus.subscribe(VISION_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
+        self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
 
         for _ in range(WORKER_THREADS):
             threading.Thread(target=self._worker_loop, daemon=True).start()
