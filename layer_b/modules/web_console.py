@@ -59,12 +59,34 @@ VISION_STREAM_CONTROL = "picarx/vision/stream_control"
 VISION_FRAME_TOPIC = "picarx/vision/frame"
 CAMERA_IDLE_SEC = 5.0
 
+# ---- RC mode ----
+# Manual driving from the console. Commands are ORDINARY vetoable
+# intents on picarx/intent/move - the arbiter and safety daemon chain is
+# untouched - but at RC_PRIORITY they outrank every AI source (explore 5,
+# watch 6, follow 7, evade 8, coach 9), so the human preempts any queued
+# AI motion. picarx/rc/mode tells the AI side to stand down entirely
+# (field_agent pauses exploring/following and just observes).
+# Dead-man layering: intents carry a short TTL, the browser re-posts its
+# control state ~4x/s, a 10Hz publisher thread re-asserts + alternates
+# primitives, and RC_DEADMAN_SEC of client silence force-stops. A client
+# gone for RC_MODE_TIMEOUT_SEC exits RC mode altogether.
+RC_MODE_TOPIC = "picarx/rc/mode"
+RC_SOURCE = "rc"
+RC_PRIORITY = 10
+RC_SPEED = 25
+RC_TURN_ANGLE = 25
+RC_INTENT_TTL = 0.5
+RC_DEADMAN_SEC = 0.8
+RC_MODE_TIMEOUT_SEC = 60.0
+RC_TICK_SEC = 0.1
+
 
 class ConsoleState:
     """Latest-value cache + rolling event log, fed by MQTT callbacks."""
     def __init__(self):
         self.lock = threading.Lock()
         self.mic_enabled = True
+        self.speaker_enabled = True
         self.radio = {}
         self.location = {}
         self.goal = {}
@@ -146,6 +168,7 @@ class ConsoleState:
                            if o.get("label")}) if not objects.get("stale", True) else []
             return {
                 "mic_enabled": self.mic_enabled,
+                "speaker_enabled": self.speaker_enabled,
                 "radio": self.radio,
                 "location": self.location,
                 "goal": self.goal,
@@ -159,8 +182,144 @@ class ConsoleState:
             }
 
 
+def build_boxes(world):
+    """Camera-overlay payload from a world snapshot: the freshest tracked
+    objects (and confirmed face) in frame-pixel coordinates for the
+    client to scale onto the displayed JPEG. A recognized person's name
+    replaces the generic 'person'/'face' label."""
+    objects = (world.get("objects") or {})
+    person = (world.get("person") or {})
+    face = (world.get("face") or {})
+    person_name = person.get("name") if not person.get("stale", True) else None
+    boxes, frame_w, frame_h, named = [], None, None, False
+    if not objects.get("stale", True):
+        for o in objects.get("items", []):
+            if not all(k in o for k in ("x", "y", "w", "h")):
+                continue
+            frame_w = o.get("frame_width") or frame_w
+            frame_h = o.get("frame_height") or frame_h
+            label = o.get("label", "?")
+            if label == "person" and person_name and not named:
+                label, named = person_name, True
+            boxes.append({"x": o["x"], "y": o["y"], "w": o["w"], "h": o["h"],
+                          "label": label, "kind": "object",
+                          "confidence": round(float(o.get("confidence") or 0.0), 2)})
+    if (face.get("detected") and not face.get("stale", True)
+            and all(k in face for k in ("x", "y", "w", "h"))):
+        frame_w = frame_w or face.get("frame_width")
+        boxes.append({"x": face["x"], "y": face["y"], "w": face["w"], "h": face["h"],
+                      "label": person_name or "face", "kind": "face"})
+    return {"frame_w": frame_w or 320, "frame_h": frame_h or 240, "boxes": boxes}
+
+
+class RcController:
+    """RC drive state -> vetoable intents. update() is called from HTTP
+    handlers on every client post; step() runs on a 10Hz thread doing the
+    steer/drive primitive alternation (the arbiter holds ONE intent per
+    source), TTL keep-alive, dead-man stop, and mode timeout."""
+
+    def __init__(self, bus):
+        self.bus = bus
+        self.lock = threading.Lock()
+        self.enabled = False
+        self.f = 0                  # -1 back / 0 stop / +1 forward
+        self.t = 0                  # -1 left / 0 straight / +1 right
+        self.last_update = 0.0      # last client post (drive OR keepalive)
+        self._last_turn_sent = None
+        self._steered_last = False
+
+    def _publish(self, action):
+        self.bus.publish("picarx/intent/move", {
+            "source": RC_SOURCE, "priority": RC_PRIORITY,
+            "action": action, "ttl": RC_INTENT_TTL})
+
+    def _drive_action(self, f):
+        if f > 0:
+            return {"direction": "forward", "speed": RC_SPEED}
+        if f < 0:
+            return {"direction": "backward", "speed": RC_SPEED}
+        return {"direction": "stop"}
+
+    def set_mode(self, enabled, now=None):
+        now = now if now is not None else time.time()
+        with self.lock:
+            was, self.enabled = self.enabled, enabled
+            self.f = self.t = 0
+            self.last_update = now
+            self._last_turn_sent = None
+            self._steered_last = False
+        if was == enabled:
+            return
+        if not enabled:
+            # Leave the wheel clean: stop, straighten, drop our intent so
+            # the arbiter falls back to its default safe stop.
+            self._publish({"direction": "turn", "angle": 0})
+            self._publish({"direction": "stop"})
+            self.bus.publish("picarx/intent/cancel", {"source": RC_SOURCE})
+        self.bus.publish(RC_MODE_TOPIC, {"active": enabled, "ts": now})
+        print(f"Web console: RC mode {'ON - manual driving' if enabled else 'off'}")
+
+    def update(self, f, t, now=None):
+        """A client control post. Stop latency matters most, so a full
+        release publishes stop synchronously instead of waiting a tick."""
+        now = now if now is not None else time.time()
+        f = max(-1, min(1, int(f)))
+        t = max(-1, min(1, int(t)))
+        with self.lock:
+            if not self.enabled:
+                return
+            changed = (f, t) != (self.f, self.t)
+            self.f, self.t = f, t
+            self.last_update = now
+        if changed and f == 0:
+            self._publish({"direction": "stop"})
+            self._steered_last = False
+
+    def step(self, now=None):
+        """One 10Hz publisher pass. Returns the action published (for
+        tests), or None when idle."""
+        now = now if now is not None else time.time()
+        with self.lock:
+            if not self.enabled:
+                return None
+            if now - self.last_update > RC_MODE_TIMEOUT_SEC:
+                pass  # fall through to set_mode below, outside the lock
+            elif now - self.last_update > RC_DEADMAN_SEC and (self.f or self.t):
+                self.f = self.t = 0
+                self._publish({"direction": "stop"})
+                print("Web console: RC dead-man - client went quiet, stopping")
+                return {"direction": "stop"}
+            f, t, last_update = self.f, self.t, self.last_update
+        if now - last_update > RC_MODE_TIMEOUT_SEC:
+            print("Web console: RC client gone - leaving RC mode")
+            self.set_mode(False, now)
+            return None
+        desired_turn = t * RC_TURN_ANGLE
+        if desired_turn != self._last_turn_sent and not self._steered_last:
+            self._last_turn_sent = desired_turn
+            self._steered_last = True
+            action = {"direction": "turn", "angle": desired_turn}
+            self._publish(action)
+            return action
+        self._steered_last = False
+        if f == 0 and t == 0 and self._last_turn_sent in (0, None):
+            return None   # idle: stay quiet, the arbiter's default stop holds
+        action = self._drive_action(f)
+        self._publish(action)
+        return action
+
+    def loop(self):
+        while True:
+            time.sleep(RC_TICK_SEC)
+            try:
+                self.step()
+            except Exception as e:
+                print(f"Web console: RC step failed: {e}")
+
+
 STATE = ConsoleState()
 BUS = None  # set in main
+RC = None   # RcController, set in main
 # Read-only map access for the places list (location_graph owns writes);
 # fail-soft to "no places yet" like every other reader.
 SPATIAL = SpatialStore(readonly=True)
@@ -205,7 +364,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, b"<h1>PicarX console</h1><p>web_ui/console.html missing.</p>",
                            "text/html; charset=utf-8")
         elif self.path == "/state":
-            self._send(200, {**STATE.snapshot(), **_memory_snapshot()})
+            self._send(200, {**STATE.snapshot(), **_memory_snapshot(),
+                             "rc_enabled": RC.enabled if RC else False})
+        elif self.path == "/boxes":
+            with STATE.lock:
+                world = dict(STATE.world)
+            self._send(200, build_boxes(world))
         elif self.path == "/camera.jpg" or self.path.startswith("/camera.jpg?"):
             # Fetching a frame is itself the "someone is watching" signal:
             # start vision's stream on the first request, keep the
@@ -240,6 +404,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/mic":
             BUS.publish("picarx/audio/mic_control", {"enabled": bool(body.get("enabled", True))})
             self._send(200, {"ok": True})
+        elif self.path == "/speaker":
+            # audio_nodes gates TTS on this and re-runs the amp-enable
+            # command (robot_hat enable_speaker) on the off->on press.
+            BUS.publish("picarx/audio/speaker_control",
+                        {"enabled": bool(body.get("enabled", True))})
+            self._send(200, {"ok": True})
         elif self.path == "/feedback":
             # Check/X on a robot response: grade how the last utterance
             # was interpreted. Rides the same MQTT bus as everything else
@@ -263,6 +433,16 @@ class Handler(BaseHTTPRequestHandler):
                 BUS.publish("picarx/audio/heard",
                             {"text": correction, "source": "user_correction"})
                 STATE.add_log("you", correction)
+            self._send(200, {"ok": True})
+        elif self.path == "/rc":
+            RC.set_mode(bool(body.get("enabled", False)))
+            self._send(200, {"ok": True})
+        elif self.path == "/rc/drive":
+            try:
+                RC.update(body.get("f", 0), body.get("t", 0))
+            except (TypeError, ValueError):
+                self._send(400, {"error": "f and t must be -1, 0 or 1"})
+                return
             self._send(200, {"ok": True})
         elif self.path == "/camera":
             # Explicit toggle from the live-view switch. Turning it off
@@ -296,6 +476,10 @@ def on_heard(p):
 def on_mic_state(p):
     with STATE.lock:
         STATE.mic_enabled = bool(p.get("enabled", True))
+
+def on_speaker_state(p):
+    with STATE.lock:
+        STATE.speaker_enabled = bool(p.get("enabled", True))
 
 def on_radio_state(p):
     with STATE.lock:
@@ -339,11 +523,14 @@ def camera_watchdog():
 
 
 def main():
-    global BUS
+    global BUS, RC
     BUS = Bus()
+    RC = RcController(BUS)
+    threading.Thread(target=RC.loop, name="rc-publisher", daemon=True).start()
     BUS.subscribe("picarx/audio/speak", on_speak)
     BUS.subscribe("picarx/audio/heard", on_heard)
     BUS.subscribe("picarx/audio/mic_state", on_mic_state)
+    BUS.subscribe("picarx/audio/speaker_state", on_speaker_state)
     BUS.subscribe("picarx/tools/radio_state", on_radio_state)
     BUS.subscribe("picarx/state/world", on_world)
     BUS.subscribe("picarx/exploration/location_change", on_location)
