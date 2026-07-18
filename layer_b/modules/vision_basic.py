@@ -27,10 +27,19 @@ Published:
   picarx/vision/faces   - {"detected": bool, "x","y","w","h",
                            "frame_width", "frame_center_offset"}
                            (bbox fields only present if detected)
-  picarx/vision/objects - {"objects": [ {"id", "label", "confidence",
+  picarx/vision/objects - {"objects": [ {"id", "label", "alt_label",
+                           "label_source", "confidence",
                            "x","y","w","h","frame_width","frame_height",
                            "area_ratio","center_offset","first_seen",
                            "last_seen"}, ... ], "close_object": bool}
+                           alt_label is the runner-up class when the label
+                           vote is a genuine two-way tie (else None) - the
+                           "chair or speaker?" ambiguity signal. label_source
+                           is "detector" for the model's own label, or
+                           "memory" when an UNCERTAIN detection was relabeled
+                           from the on-board label memory (label_memory.py,
+                           taught by human/LLM corrections). See that module
+                           and curiosity.py for the recognition cascade.
                            area_ratio = bbox area / frame area, a cheap
                            stand-in for "how close/big this looks,"
                            since it needs no depth sensor - world_state
@@ -113,6 +122,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", str(THREAD_LIMIT))
 import sys
 sys.path.insert(0, "/home/picarx/layer_b")
 from broker_client import Bus
+import label_memory
 from picamera2 import Picamera2
 import base64
 import cv2
@@ -121,7 +131,11 @@ import time
 
 cv2.setNumThreads(THREAD_LIMIT)
 
-CAPTURE_SIZE = (640, 480)      # was 640x480 - biggest single lever, see notes above
+CAPTURE_SIZE = (640, 480)      # raised from 320x240 for finer detail; note the
+                               # detector still resizes to its fixed 300/320 input,
+                               # so this mainly sharpens face crops, the console
+                               # view, and label signatures - at ~4x the per-pixel
+                               # CPU on the face/motion path (watch the STT budget).
 
 DETECT_INTERVAL = 0.3          # base capture/face-check tick (was 0.2)
 OBJECT_DETECT_INTERVAL = 1.5   # candidate ticks for a fresh SSD pass (was 1.0)
@@ -157,6 +171,53 @@ OBJECT_CONFIDENCE_THRESHOLD = 0.5
 # least this fraction of the winner's votes, the classification is genuinely
 # contested and we publish the runner-up as alt_label so curiosity.py can ask.
 LABEL_CONTEST_RATIO = 0.6
+
+# ---- on-board label memory (the recognition tier between the detector and
+# the cloud LLM; see label_memory.py) ----
+# When a detection is UNCERTAIN - contested vote, or confidence below
+# LABEL_LOW_CONF - we consult the visual-signature memory before trusting the
+# detector's nearest-of-N guess. Human/LLM labels (picarx/perception/label,
+# carrying the object id) teach it: we look up the object's cached signature
+# and store signature -> label. The label the console/curiosity feedback
+# reaches us on is the SAME topic reflection.py writes as a fact, so one
+# correction both remembers the look AND records the fact.
+LABEL_TOPIC = "picarx/perception/label"
+LABEL_LOW_CONF = 0.6            # below this a single guess is "uncertain"
+SIG_CACHE_TTL = 60.0           # keep a track's signature this long after last seen,
+                               # so a label answered seconds later still finds it
+SIG_THUMB = (16, 16)           # grayscale shape thumbnail side of the signature
+
+
+def visual_signature(crop_rgb):
+    """A cheap, fixed-length visual fingerprint of an object crop: a small
+    normalized grayscale shape thumbnail concatenated with an HSV hue/sat
+    color histogram, the whole thing L2-normalized. Deterministic, ~320
+    floats, computed only on detection passes for a handful of objects, so
+    it adds little to the CPU budget this module guards. Approximate by
+    design - it disambiguates a small set of taught objects when the
+    detector is already unsure, not general re-identification. Returns a
+    plain list (JSON-serializable for label_memory), or None on a bad crop.
+
+    crop_rgb is an RGB uint8 array (picamera2 frames are RGB888)."""
+    try:
+        if crop_rgb is None or crop_rgb.size == 0:
+            return None
+        gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+        thumb = cv2.resize(gray, SIG_THUMB).astype("float32").flatten()
+        n = float(np.linalg.norm(thumb))
+        thumb = thumb / n if n else thumb
+        hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256]).flatten()
+        n = float(np.linalg.norm(hist))
+        hist = hist / n if n else hist
+        vec = np.concatenate([thumb * 0.5, hist.astype("float32") * 0.5])
+        n = float(np.linalg.norm(vec))
+        if n:
+            vec = vec / n
+        return [float(x) for x in vec]
+    except Exception as e:
+        print(f"vision: signature failed ({e})")
+        return None
 
 # Class-agnostic "something huge is right in front of the camera"
 # signal - see the close_object note in the module docstring.
@@ -561,8 +622,37 @@ def run():
         print(f"vision: low-power {'ON - throttling object detection' if low_power['active'] else 'off'}")
     bus.subscribe(LOW_POWER_TOPIC, on_low_power)
 
-    print(f"vision basic module running ({detector.name}), "
-          f"publishing to picarx/vision/faces and picarx/vision/objects")
+    # On-board label memory (recognition tier 2): visual signatures of tracked
+    # objects, cached by track id on each detection pass, plus the persistent
+    # signature->label store a human/LLM teaches. A label arriving on
+    # LABEL_TOPIC (from curiosity or the console, carrying the object id) is
+    # remembered against that object's cached look, so an uncertain detection
+    # that resembles it later gets the taught label before we ask again or
+    # phone the cloud. All fail-soft - any error here degrades to plain
+    # detector labels and never disturbs the real-time loop.
+    memory = label_memory.LabelMemory()
+    sig_cache = {}   # track id -> (signature, last_seen_ts)
+    def on_label(payload):
+        oid = payload.get("object_id")
+        correct = (payload.get("correct_label") or "").strip().lower()
+        if not oid or not correct:
+            return
+        entry = sig_cache.get(oid)
+        if entry is None:
+            print(f"vision: label '{correct}' for {oid} but its signature has aged out")
+            return
+        source = {"web": "user", "voice": "user", "llm": "llm",
+                  "coach": "coach"}.get(payload.get("origin"), "user")
+        try:
+            if memory.remember(entry[0], correct, source):
+                print(f"vision: learned '{correct}' by sight "
+                      f"(source {source}, {len(memory)} memories)")
+        except Exception as e:
+            print(f"vision: failed to remember '{correct}': {e}")
+    bus.subscribe(LABEL_TOPIC, on_label)
+
+    print(f"vision basic module running ({detector.name}, {len(memory)} label "
+          f"memories), publishing to picarx/vision/faces and picarx/vision/objects")
 
     face_streak = 0
     last_face_crop = 0.0
@@ -657,15 +747,42 @@ def run():
 
                 tracker.update(found, now)
 
+                # Refresh the visual signature of each confirmed track (only on
+                # detection passes, so it rides the same throttle the SSD does)
+                # and age out signatures for tracks long gone.
+                for tid, t in tracker.confirmed_tracks().items():
+                    x, y, w, h = t["bbox"]
+                    crop = frame[max(0, y):y + h, max(0, x):x + w]
+                    sig = visual_signature(crop)
+                    if sig is not None:
+                        sig_cache[tid] = (sig, now)
+                for tid in [k for k, (_, ts) in sig_cache.items()
+                            if now - ts > SIG_CACHE_TTL]:
+                    del sig_cache[tid]
+
         objects_payload = []
         for tid, t in tracker.confirmed_tracks().items():
             x, y, w, h = t["bbox"]
+            alt = contested_label(t.get("label_counts"))
+            # Recognition tiers 1->2: keep a confident detector label, but let
+            # the on-board memory relabel an UNCERTAIN one (see resolve_label).
+            # label_source tells consumers who decided: detector or memory.
+            sig_entry = sig_cache.get(tid)
+            try:
+                label, label_source, alt = label_memory.resolve_label(
+                    memory, sig_entry[0] if sig_entry else None,
+                    t["label"], t["confidence"], alt, LABEL_LOW_CONF)
+            except Exception as e:
+                print(f"vision: label resolve failed ({e})")
+                label, label_source = t["label"], "detector"
             objects_payload.append({
                 "id": tid,
-                "label": t["label"],
+                "label": label,
+                "label_source": label_source,   # "detector" | "memory"
                 # Runner-up label when the vote is genuinely split (else None),
                 # so downstream can ask a human to disambiguate this object.
-                "alt_label": contested_label(t.get("label_counts")),
+                # Cleared once memory resolves the object.
+                "alt_label": alt,
                 "confidence": t["confidence"],
                 "x": x, "y": y, "w": w, "h": h,
                 "frame_width": frame_w,
