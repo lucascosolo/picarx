@@ -121,7 +121,7 @@ import time
 
 cv2.setNumThreads(THREAD_LIMIT)
 
-CAPTURE_SIZE = (320, 240)      # was 640x480 - biggest single lever, see notes above
+CAPTURE_SIZE = (640, 480)      # was 640x480 - biggest single lever, see notes above
 
 DETECT_INTERVAL = 0.3          # base capture/face-check tick (was 0.2)
 OBJECT_DETECT_INTERVAL = 1.5   # candidate ticks for a fresh SSD pass (was 1.0)
