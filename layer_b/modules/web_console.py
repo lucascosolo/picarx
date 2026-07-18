@@ -70,6 +70,11 @@ CAMERA_IDLE_SEC = 5.0
 # control state ~4x/s, a 10Hz publisher thread re-asserts + alternates
 # primitives, and RC_DEADMAN_SEC of client silence force-stops. A client
 # gone for RC_MODE_TIMEOUT_SEC exits RC mode altogether.
+# Perception label feedback: the check/X on an identification line publishes
+# here, the SAME topic curiosity.py uses for spoken relabels, and reflection.py
+# turns it into a durable semantic fact (it is the sole semantic.db writer).
+LABEL_TOPIC = "picarx/perception/label"
+
 RC_MODE_TOPIC = "picarx/rc/mode"
 RC_SOURCE = "rc"
 RC_PRIORITY = 10
@@ -103,13 +108,18 @@ class ConsoleState:
         self.last_view_request = 0.0  # last time a browser fetched /camera.jpg
         self.stream_on = False        # whether we've told vision to encode frames
 
-    def add_log(self, kind, text):
+    def add_log(self, kind, text, obs=None):
         with self.lock:
             entry = {"t": time.strftime("%H:%M:%S"), "kind": kind, "text": text}
             if kind in ("you", "heard"):
                 self.last_user_text = text
             elif kind == "robot":
                 entry["re"] = self.last_user_text
+                # An identification/question the robot volunteered ("looks
+                # like a chair"): tag it so the console's check/X grade the
+                # ID, not the command interpretation (see /label).
+                if obs:
+                    entry["obs"] = obs
             self.log.appendleft(entry)
 
     def mark_feedback(self, response_text, verdict):
@@ -434,6 +444,27 @@ class Handler(BaseHTTPRequestHandler):
                             {"text": correction, "source": "user_correction"})
                 STATE.add_log("you", correction)
             self._send(200, {"ok": True})
+        elif self.path == "/label":
+            # Check/X on an identification line: grade what the robot saw,
+            # not how it read a command. A correcting (or confirming) label
+            # rides picarx/perception/label -> reflection.py writes it to the
+            # semantic store, exactly like a spoken relabel via curiosity.py.
+            correct = (body.get("label") or "").strip().lower()
+            if not correct:
+                self._send(400, {"error": "empty label"})
+                return
+            guess = (body.get("guess") or "").strip().lower()
+            verdict = "correct" if correct == guess else "incorrect"
+            BUS.publish(LABEL_TOPIC, {
+                "correct_label": correct, "guess": guess,
+                "object_id": body.get("object_id"), "origin": "web",
+                "ts": time.time()})
+            response = (body.get("response") or "").strip()
+            if response:
+                STATE.mark_feedback(response, verdict)
+            if verdict == "incorrect":
+                STATE.add_log("you", f"that's a {correct}")
+            self._send(200, {"ok": True})
         elif self.path == "/rc":
             RC.set_mode(bool(body.get("enabled", False)))
             self._send(200, {"ok": True})
@@ -459,8 +490,17 @@ class Handler(BaseHTTPRequestHandler):
 # ---------- MQTT feeds ----------
 
 def on_speak(p):
-    if p.get("text"):
-        STATE.add_log("robot", p["text"])
+    if not p.get("text"):
+        return
+    # Modules tag identification/uncertainty remarks with kind=observation
+    # /question (+ the label they went with); carry that onto the log line
+    # so the console can offer an ID-correction affordance instead of the
+    # command-interpretation feedback (see the console's renderLog / /label).
+    obs = None
+    if p.get("kind") in ("observation", "question"):
+        obs = {"kind": p["kind"], "label": p.get("label"),
+               "subject": p.get("subject")}
+    STATE.add_log("robot", p["text"], obs=obs)
 
 def on_heard(p):
     text = p.get("text")

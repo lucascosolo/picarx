@@ -351,6 +351,21 @@ async function refreshBoxes() {
 // ---- intent feedback (check / X on robot responses) ----
 let logEntries = [];
 document.getElementById('log').addEventListener('click', async ev => {
+  // Identification lines ("looks like a chair"): ✓/✗ grade what the robot
+  // SAW and relabel it, feeding the semantic store - not command intent.
+  const obsBtn = ev.target.closest('button[data-obs]');
+  if (obsBtn) {
+    const e = logEntries[+obsBtn.dataset.idx];
+    const guess = (e.obs && e.obs.label) || '';
+    let label = guess;
+    if (obsBtn.dataset.obs === 'no') {
+      label = (prompt('What is it actually?') || '').trim();
+      if (!label) return;
+    }
+    await post('/label', {label, guess, response: e.text});
+    poll();
+    return;
+  }
   const btn = ev.target.closest('button[data-fb]');
   if (!btn) return;
   const e = logEntries[+btn.dataset.idx];
@@ -372,10 +387,16 @@ function renderLog(entries) {
   document.getElementById('log').innerHTML = entries.map((e, i) => {
     let fb = '';
     if (e.kind === 'robot') {
-      fb = e.fb
-        ? `<span class="fb ${e.fb}">${e.fb === 'correct' ? '✓' : '✗'}</span>`
-        : `<button class="fbbtn ok" data-fb="correct" data-idx="${i}" title="understood me">✓</button>` +
-          `<button class="fbbtn bad" data-fb="incorrect" data-idx="${i}" title="misunderstood me">✗</button>`;
+      if (e.fb) {
+        fb = `<span class="fb ${e.fb}">${e.fb === 'correct' ? '✓' : '✗'}</span>`;
+      } else if (e.obs) {
+        // Identification line: grade the ID (right thing / wrong - relabel).
+        fb = `<button class="fbbtn ok" data-obs="yes" data-idx="${i}" title="right - that's what it is">✓</button>` +
+             `<button class="fbbtn bad" data-obs="no" data-idx="${i}" title="wrong - tell me what it is">✗</button>`;
+      } else {
+        fb = `<button class="fbbtn ok" data-fb="correct" data-idx="${i}" title="understood me">✓</button>` +
+             `<button class="fbbtn bad" data-fb="incorrect" data-idx="${i}" title="misunderstood me">✗</button>`;
+      }
     }
     return `<div class="${e.kind}">${e.t} ${e.kind==='robot'?'🤖':'🗣'} ${esc(e.text)}${fb}</div>`;
   }).join('');

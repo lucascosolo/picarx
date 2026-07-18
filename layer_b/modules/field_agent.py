@@ -871,7 +871,7 @@ class FieldAgent:
 
     # ---------- outbound: speech ----------
 
-    def announce(self, text, force=False):
+    def announce(self, text, force=False, kind=None, label=None, subject=None):
         now = time.time()
         if not force and (now - self.last_announcement_at) < MIN_ANNOUNCEMENT_GAP:
             print(f"(suppressed, too soon after last remark): {text}")
@@ -881,7 +881,14 @@ class FieldAgent:
         # ts lets audio_nodes drop announcements that sat in the playback
         # queue too long - narrating a decision from 20 seconds ago while
         # already doing something else is worse than staying quiet.
-        self.bus.publish("picarx/audio/speak", {"text": text, "ts": now})
+        # kind/label tag identification remarks so the web console can offer
+        # an ID-correction affordance (see web_console.on_speak).
+        msg = {"text": text, "ts": now}
+        if kind:
+            msg["kind"] = kind
+            msg["label"] = label
+            msg["subject"] = subject
+        self.bus.publish("picarx/audio/speak", msg)
 
     # ---------- inbound: world state ----------
 
@@ -890,9 +897,10 @@ class FieldAgent:
         with self.lock:
             self.latest_world = payload
             face = payload.get("face", {})
-            detected = bool(face.get("detected")) and not face.get("stale", True)
-            face_became_detected = detected and not self.face_was_detected
-            self.face_was_detected = detected
+            # Tracked for other readers of self.face_was_detected; no longer
+            # announced (see the note where novel objects are handled below).
+            self.face_was_detected = (
+                bool(face.get("detected")) and not face.get("stale", True))
 
             objects = payload.get("objects", {})
             if not objects.get("stale", True):
@@ -902,8 +910,10 @@ class FieldAgent:
                         self.known_object_labels.add(label)
                         novel.append(obj)
 
-        if face_became_detected:
-            self.announce("I see a face.")
+        # A bare face detection used to be announced ("I see a face.") on
+        # every re-detection after it went stale - pure speaker noise. The
+        # meaningful case, recognizing WHO it is, is still greeted in
+        # on_person; an anonymous face is now noted silently.
         if novel:
             with self.lock:
                 self.pending_novel_objects.extend(novel)
@@ -1126,7 +1136,10 @@ class FieldAgent:
             return
         self.last_greeted_person = name
         self.last_greeted_at = now
-        self.announce(f"Hello, {name}! Good to see you.")
+        # A greeting is a face identification too: tag it so a misrecognition
+        # ("Hello, Sam" at the wrong person) can be corrected from the console.
+        self.announce(f"Hello, {name}! Good to see you.",
+                      kind="observation", label="person", subject=name)
 
     # ---------- inbound: coach ----------
 
@@ -1726,7 +1739,8 @@ class FieldAgent:
 
     def _on_novel_object(self, obj):
         label = obj.get("label", "something")
-        self.announce(f"I see something new - looks like a {label}.")
+        self.announce(f"I see something new - looks like a {label}.",
+                      kind="observation", label=label)
         # Only consult the coach about how to react to a new object while
         # we're actually exploring - a novelty maneuver is pointless (and
         # a wasted LLM/bandit call) when parked and awaiting commands.
