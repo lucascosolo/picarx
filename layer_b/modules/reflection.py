@@ -178,6 +178,43 @@ class Reflection:
         with self.lock:
             self.last_activity = time.time()
 
+    # ---------- human-labeled sightings (curiosity.py / web console) ----------
+
+    def on_label(self, payload):
+        """A person told the robot what an ambiguous sighting actually is
+        (picarx/perception/label). Unlike LLM reflection, this is written
+        IMMEDIATELY at high confidence - a human identification is ground
+        truth and shouldn't wait for the next idle window. Reflection stays
+        the sole writer to semantic.db, so the write lands here; the sqlite
+        connection is opened check_same_thread=False and is internally
+        serialized, so writing from this callback thread alongside the main
+        loop's writes is safe. Fail-soft: a bad payload is just ignored."""
+        correct = (payload.get("correct_label") or "").strip().lower()
+        if not correct:
+            return
+        guess = (payload.get("guess") or "").strip().lower()
+        origin = payload.get("origin", "a person")
+        try:
+            confirmed = not guess or guess == correct
+            self.store.upsert_fact(
+                correct,
+                (f"a person confirmed I identify this correctly as a {correct}"
+                 if confirmed else
+                 f"a person identified this as a {correct}, not the {guess} I guessed"),
+                confidence=0.9, source="human_label")
+            # A miss is itself a durable fact about my own perception: the
+            # detector's habit of confusing these two is worth remembering.
+            if not confirmed:
+                self.store.upsert_fact(
+                    "vision",
+                    f"my detector sometimes mislabels a {correct} as a {guess}",
+                    confidence=0.8, source="human_label")
+            print(f"Reflection: human label ({origin}) '{correct}'"
+                  f"{'' if confirmed else f' (I had guessed {guess})'} stored "
+                  f"({self.store.fact_count()} facts known)")
+        except Exception as e:
+            print(f"Reflection: failed to store human label: {e}")
+
     # ---------- events.db digest ----------
 
     def _fetch_new_events(self, since_id):
@@ -628,6 +665,7 @@ class Reflection:
         self.bus.subscribe("picarx/intent/move", self.on_activity)
         self.bus.subscribe("picarx/coach/query", self.on_activity)
         self.bus.subscribe("picarx/audio/heard", self.on_activity)
+        self.bus.subscribe("picarx/perception/label", self.on_label)
 
         print(f"Reflection active ({self.store.fact_count()} facts known), "
               f"reflecting when idle {IDLE_AFTER_SEC:.0f}s+, analyzing when idle "
