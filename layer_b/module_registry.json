@@ -16,6 +16,7 @@
   {"name": "goal_manager", "version": "0.1", "entrypoint": "goal_manager.py", "enabled": true},
   {"name": "tools_registry", "version": "0.1", "entrypoint": "tools_registry.py", "enabled": true},
   {"name": "radio", "version": "0.1", "entrypoint": "radio.py", "enabled": true},
+  {"name": "curiosity", "version": "0.1", "entrypoint": "curiosity.py", "enabled": true},
   {"name": "reminder_daemon", "version": "0.1", "entrypoint": "tools/reminder_daemon.py", "enabled": true},
   {"name": "follow_daemon", "version": "0.1", "entrypoint": "tools/follow_daemon.py", "enabled": true},
   {"name": "bluetooth_daemon", "version": "0.1", "entrypoint": "tools/bluetooth_daemon.py", "enabled": true},

@@ -150,6 +150,14 @@ OBJECT_MAX_DISAPPEARED_SEC = 3.0   # how long to keep a track alive with no matc
 OBJECT_MATCH_MAX_DIST = 120        # pixels; centroid match distance cap
 OBJECT_CONFIDENCE_THRESHOLD = 0.5
 
+# A track's label is the majority vote over its per-frame classifications
+# (see CentroidTracker.label_counts) - that stabilizes the reported label
+# but HIDES a real two-way ambiguity, exactly the "is that a chair or a
+# speaker?" case worth asking a human about. If the runner-up label has at
+# least this fraction of the winner's votes, the classification is genuinely
+# contested and we publish the runner-up as alt_label so curiosity.py can ask.
+LABEL_CONTEST_RATIO = 0.6
+
 # Class-agnostic "something huge is right in front of the camera"
 # signal - see the close_object note in the module docstring.
 #
@@ -412,6 +420,22 @@ def _make_detector():
     return CaffeSsdDetector()
 
 
+def contested_label(label_counts):
+    """The runner-up label when a track's classification is a genuine two-way
+    tie (the winner isn't dominant, a specific rival is close behind), else
+    None. This is the ambiguity signal curiosity.py turns into "is that a X
+    or a Y?" - pure/hardware-free so it's unit-testable off the robot.
+
+    label_counts: {label: votes} accumulated over the track's lifetime."""
+    if not label_counts or len(label_counts) < 2:
+        return None
+    ranked = sorted(label_counts.items(), key=lambda kv: kv[1], reverse=True)
+    (top_label, top_n), (alt_label, alt_n) = ranked[0], ranked[1]
+    if top_n > 0 and alt_label != top_label and alt_n >= LABEL_CONTEST_RATIO * top_n:
+        return alt_label
+    return None
+
+
 class CentroidTracker:
     """
     Minimal multi-object tracker: matches new detections to existing
@@ -639,6 +663,9 @@ def run():
             objects_payload.append({
                 "id": tid,
                 "label": t["label"],
+                # Runner-up label when the vote is genuinely split (else None),
+                # so downstream can ask a human to disambiguate this object.
+                "alt_label": contested_label(t.get("label_counts")),
                 "confidence": t["confidence"],
                 "x": x, "y": y, "w": w, "h": h,
                 "frame_width": frame_w,
