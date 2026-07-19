@@ -46,78 +46,137 @@ battery_state = {"voltage": None, "critical": False, "low": False}
 
 hardware_lock = threading.Lock()
 
+# ---- MotionSmoother tuning ----
+# Ramp RATES are per-second (not per-tick), so motion is time-consistent
+# even when the control loop is jittered by hardware_lock contention with
+# the cliff/ultrasonic reads (the old fixed per-tick steps silently
+# under-accelerated whenever a tick ran late). These match the previous
+# effective rates: the old speed_step 2.0 and angle_step 5.0 at the 50Hz
+# tick were 100 units/s and 250 deg/s.
+SPEED_RAMP_PER_SEC = 100.0
+ANGLE_RAMP_PER_SEC = 250.0
+MOTION_TICK_SEC = 0.02          # 50Hz nominal
+# A tick that ran late (lock contention, a cliff-veto sample burst) must
+# not translate its whole elapsed time into one big ramp jump - clamp the
+# per-tick advance so a stall just resumes the normal rate, never lurches.
+MOTION_MAX_DT = 0.05
+# Servo writes below this change are skipped: they're sub-degree jitter
+# that only makes the steering servo buzz and steals the hardware lock.
+ANGLE_APPLY_EPSILON = 0.5
+
+
+def ramp_toward(current, target, rate, dt):
+    """Move `current` toward `target` by at most rate*dt (a linear rate
+    limit). Pure/hardware-free so the motion ramp is unit-testable off the
+    robot; lands exactly on the target once within one step."""
+    max_step = rate * dt
+    if current < target:
+        return min(current + max_step, target)
+    if current > target:
+        return max(current - max_step, target)
+    return current
+
+
 class MotionSmoother(threading.Thread):
     """
     Background thread that smoothly ramps motor speeds and servo angles
-    to prevent hardware stress and wheel slippage.
+    to prevent hardware stress and wheel slippage. Ramp rates are in
+    real time (see SPEED_RAMP_PER_SEC / ANGLE_RAMP_PER_SEC) and only the
+    values that actually change are written to hardware, so a steady
+    cruise isn't re-sending the same command 50 times a second and
+    fighting the safety sensor reads for the hardware lock.
     """
     def __init__(self, hardware):
         super().__init__()
         self.px = hardware
         self.daemon = True
-        
-        self.target_speed = 0
-        self.current_speed = 0
-        
-        self.target_angle = 0
-        self.current_angle = 0
-        
-        # Tuning variables for how fast the robot accelerates
-        self.speed_step = 2.0
-        self.angle_step = 5.0
-        
+
+        self.target_speed = 0.0
+        self.current_speed = 0.0
+
+        self.target_angle = 0.0
+        self.current_angle = 0.0
+
+        self.speed_rate = SPEED_RAMP_PER_SEC
+        self.angle_rate = ANGLE_RAMP_PER_SEC
+
         self.lock = threading.Lock()
         self.running = True
+
+        # Last values actually pushed to hardware, so redundant writes are
+        # skipped (None = nothing written yet / force the next write).
+        self._applied_speed = None
+        self._applied_angle = None
 
     def update_targets(self, speed=None, angle=None):
         with self.lock:
             if speed is not None:
                 # On a direction REVERSAL, snap through zero instead of
-                # ramping down first: at speed_step 2.0/20ms, going from
-                # forward-25 to backward-30 spent ~0.55s of a ~1s escape
-                # step just decelerating - eroding commanded maneuvers to
-                # almost no actual displacement (a big part of "announces
-                # an escape but barely moves"). Ramping is kept within a
-                # direction; only the sign flip is immediate.
+                # ramping down first: going from forward-25 to backward-30
+                # otherwise spent a big fraction of a ~1s escape step just
+                # decelerating - eroding commanded maneuvers to almost no
+                # actual displacement (a big part of "announces an escape
+                # but barely moves"). Ramping is kept within a direction;
+                # only the sign flip is immediate.
                 if speed * self.current_speed < 0:
-                    self.current_speed = 0
-                self.target_speed = speed
+                    self.current_speed = 0.0
+                self.target_speed = float(speed)
             if angle is not None:
-                self.target_angle = angle
+                self.target_angle = float(angle)
 
     def emergency_stop(self):
         """Bypasses smoothing for immediate safety halts."""
         with self.lock:
-            self.target_speed = 0
-            self.current_speed = 0
-            self.px.stop()
+            self.target_speed = 0.0
+            self.current_speed = 0.0
+            with hardware_lock:
+                self.px.stop()
+            self._applied_speed = 0.0
+
+    def _apply(self, speed, angle):
+        """Push speed/angle to hardware, skipping writes that wouldn't
+        change anything (the motor/servo hold their last command). Keeping
+        the hardware lock idle between real changes leaves it free for the
+        safety daemon's cliff/ultrasonic reads."""
+        with hardware_lock:
+            if self._applied_speed is None or speed != self._applied_speed:
+                if speed > 0:
+                    self.px.forward(speed)
+                elif speed < 0:
+                    self.px.backward(abs(speed))
+                else:
+                    self.px.stop()
+                self._applied_speed = speed
+            # Write the servo on a meaningful change, but always land
+            # exactly on a freshly-reached target (so the last sub-epsilon
+            # step isn't dropped and the wheel settles a hair off-line).
+            reached_target = (angle == self.target_angle
+                              and angle != self._applied_angle)
+            if (self._applied_angle is None
+                    or abs(angle - self._applied_angle) >= ANGLE_APPLY_EPSILON
+                    or reached_target):
+                self.px.set_dir_servo_angle(angle)
+                self._applied_angle = angle
+
+    def _tick(self, dt):
+        """One ramp+apply step for elapsed time dt. Separated from run()
+        so the motion logic is unit-testable without the thread."""
+        with self.lock:
+            self.current_speed = ramp_toward(
+                self.current_speed, self.target_speed, self.speed_rate, dt)
+            self.current_angle = ramp_toward(
+                self.current_angle, self.target_angle, self.angle_rate, dt)
+            speed, angle = self.current_speed, self.current_angle
+        self._apply(speed, angle)
 
     def run(self):
+        last = time.time()
         while self.running:
-            with self.lock:
-                # Smooth the speed
-                if self.current_speed < self.target_speed:
-                    self.current_speed = min(self.current_speed + self.speed_step, self.target_speed)
-                elif self.current_speed > self.target_speed:
-                    self.current_speed = max(self.current_speed - self.speed_step, self.target_speed)
-
-                # Smooth the steering angle
-                if self.current_angle < self.target_angle:
-                    self.current_angle = min(self.current_angle + self.angle_step, self.target_angle)
-                elif self.current_angle > self.target_angle:
-                    self.current_angle = max(self.current_angle - self.angle_step, self.target_angle)
-
-                # Apply states to hardware
-                with hardware_lock:
-                    if self.current_speed > 0:
-                        self.px.forward(self.current_speed)
-                    elif self.current_speed < 0:
-                        self.px.backward(abs(self.current_speed))
-                    else:
-                        self.px.stop()
-                    self.px.set_dir_servo_angle(self.current_angle)
-                
-            time.sleep(0.02)  # Run at 50Hz for buttery smooth adjustments
+            time.sleep(MOTION_TICK_SEC)
+            now = time.time()
+            dt = min(now - last, MOTION_MAX_DT)
+            last = now
+            self._tick(dt)
 
 
 # Initialize the global motion controller
