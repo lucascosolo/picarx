@@ -215,6 +215,33 @@ class Reflection:
         except Exception as e:
             print(f"Reflection: failed to store human label: {e}")
 
+    # ---------- notes-to-self (expressions.py) ----------
+
+    def on_note(self, payload):
+        """A module asked to remember something durable (picarx/memory/note).
+        Written straight through, since reflection is the sole writer to
+        semantic.db and a note is already a decided fact, not something to
+        infer. The store dedups on (subject, fact), so a repeated note just
+        reinforces (seen_count++) rather than piling up. Fail-soft: a bad
+        payload is ignored. Confidence is clamped modest - a note is a passing
+        observation, not ground truth like a human label."""
+        subject = (payload.get("subject") or "").strip()
+        fact = (payload.get("fact") or "").strip()
+        if not subject or not fact:
+            return
+        try:
+            confidence = float(payload.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        confidence = max(0.1, min(0.7, confidence))
+        source = (payload.get("source") or "note").strip()[:40] or "note"
+        try:
+            self.store.upsert_fact(subject, fact, confidence=confidence, source=source)
+            print(f"Reflection: note ({source}) [{subject}] '{fact}' stored "
+                  f"({self.store.fact_count()} facts known)")
+        except Exception as e:
+            print(f"Reflection: failed to store note: {e}")
+
     # ---------- events.db digest ----------
 
     def _fetch_new_events(self, since_id):
@@ -666,6 +693,7 @@ class Reflection:
         self.bus.subscribe("picarx/coach/query", self.on_activity)
         self.bus.subscribe("picarx/audio/heard", self.on_activity)
         self.bus.subscribe("picarx/perception/label", self.on_label)
+        self.bus.subscribe("picarx/memory/note", self.on_note)
 
         print(f"Reflection active ({self.store.fact_count()} facts known), "
               f"reflecting when idle {IDLE_AFTER_SEC:.0f}s+, analyzing when idle "
