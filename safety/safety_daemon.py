@@ -12,6 +12,7 @@ import getpass
 import time
 import json
 import threading
+import importlib
 
 # Fix for os.getlogin() failing under systemd (no controling TTY)
 os.getlogin = getpass.getuser
@@ -183,10 +184,50 @@ class MotionSmoother(threading.Thread):
 motion = MotionSmoother(px)
 
 
+def _manual_battery_voltage():
+    """Hand-rolled divider read. 12-bit full-scale is 4095 (not 4096), Vref is
+    3.3V, and the Robot HAT A4 pin sits behind a ~3x divider. Kept only as a
+    fallback for library versions that don't ship a battery reader."""
+    return battery_adc.read() / 4095 * 3.3 * 3
+
+
+def _resolve_battery_reader():
+    """Prefer SunFounder's own calibrated battery reader over the hand-rolled
+    divider math.
+
+    The old formula (raw/4096*3.3*3) under-read the pack - enough to trip a
+    false 'battery critical' (and an emergency stop) on a near-full battery
+    whose Robot HAT charge LEDs were all still lit. The library ships the
+    correct scaling for whatever HAT revision is actually installed, so defer
+    to it and only fall back to the manual formula if it isn't available (older
+    robot_hat), so the daemon still runs everywhere."""
+    # 1) SunFounder utils helper - the canonical get_battery_voltage().
+    for mod_name in ("robot_hat.utils", "robot_hat"):
+        try:
+            fn = getattr(importlib.import_module(mod_name), "get_battery_voltage", None)
+        except Exception:
+            fn = None
+        if callable(fn):
+            print(f"Safety daemon: battery voltage via {mod_name}.get_battery_voltage()")
+            return fn
+    # 2) Picarx instance method, if this version exposes one (reuses the HAT we
+    #    already own - no second ADC object).
+    fn = getattr(px, "get_battery_voltage", None)
+    if callable(fn):
+        print("Safety daemon: battery voltage via Picarx.get_battery_voltage()")
+        return fn
+    # 3) Manual divider fallback.
+    print("Safety daemon: SunFounder battery reader unavailable; using manual ADC formula")
+    return _manual_battery_voltage
+
+
+_battery_reader = _resolve_battery_reader()
+
+
 def read_battery_voltage():
-    raw = battery_adc.read()
-    voltage = raw / 4096 * 3.3 * 3
-    return voltage
+    """Battery pack voltage in volts. See _resolve_battery_reader for why this
+    prefers the library's reader over hand-rolled divider math."""
+    return _battery_reader()
 
 def check_battery():
     try:
