@@ -1,0 +1,110 @@
+/* Shared styles for every PicarX console page (served at /app.css). */
+:root { --bg:#14171c; --card:#1d2229; --fg:#e8eaed; --dim:#9aa3ad;
+        --accent:#4fa3ff; --ok:#39c26d; --warn:#e0a03c; --off:#d05555;
+        --line:#262d36; --field:#10141a; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:15px/1.45 system-ui, sans-serif; padding:0 12px 24px;
+       max-width:680px; margin-inline:auto; }
+
+/* ---- top bar + nav ---- */
+header { position:sticky; top:0; background:var(--bg); padding:10px 0 6px;
+         z-index:5; border-bottom:1px solid var(--line); margin-bottom:12px; }
+.brand { font-size:1.05rem; font-weight:600; display:flex;
+         justify-content:space-between; align-items:baseline; }
+#conn { font-size:.72rem; color:var(--dim); font-weight:400; }
+#conn.ok { color:var(--ok); } #conn.bad { color:var(--off); }
+#h-batt { font-size:.75rem; color:var(--dim); }
+#h-batt.low { color:var(--off); font-weight:700; }
+nav { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+nav a { color:var(--dim); text-decoration:none; font-size:.82rem;
+        padding:5px 10px; border-radius:7px; background:#20262e; white-space:nowrap; }
+nav a.active { background:var(--accent); color:#08131f; font-weight:600; }
+
+/* ---- cards + generic controls ---- */
+.card { background:var(--card); border-radius:10px; padding:12px; margin-bottom:12px; }
+.card h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.06em;
+           color:var(--dim); margin:0 0 8px; }
+.grid { display:flex; flex-wrap:wrap; gap:8px; }
+button { background:#2a323d; color:var(--fg); border:0; border-radius:8px;
+         padding:10px 14px; font-size:.95rem; cursor:pointer; }
+button:active { background:var(--accent); }
+button.danger { background:#54333a; }
+button.primary { background:var(--accent); color:#08131f; font-weight:600; }
+.row { display:flex; gap:8px; margin-top:8px; }
+input[type=text], input[type=number], select { flex:1; min-width:0;
+         background:var(--field); color:var(--fg); border:1px solid #333b46;
+         border-radius:8px; padding:10px; font-size:.95rem; }
+.hint { color:var(--dim); font-size:.8rem; margin-top:6px; }
+.toggle { font-weight:600; }
+.toggle.on  { background:var(--ok); color:#08130c; }
+.toggle.off { background:var(--off); color:#180808; }
+
+/* ---- camera + bounding boxes ---- */
+#cam-wrap { position:relative; margin-top:10px; background:#000; border-radius:8px;
+            overflow:hidden; aspect-ratio:4/3; display:flex; align-items:center;
+            justify-content:center; }
+#cam { width:100%; height:100%; object-fit:contain; display:none; }
+#cam-msg { color:var(--dim); font-size:.85rem; }
+#boxes { position:absolute; inset:0; pointer-events:none; }
+.bbox { position:absolute; border:2px solid var(--accent); border-radius:3px; }
+.bbox.face { border-color:var(--ok); }
+.bbox span { position:absolute; top:-1.35em; left:-2px; background:var(--accent);
+             color:#08131f; font:600 11px/1.3 system-ui; padding:0 4px;
+             border-radius:3px; white-space:nowrap; }
+.bbox.face span { background:var(--ok); color:#08130c; }
+
+/* ---- RC pad ---- */
+#rc-toggle.on { background:var(--warn); color:#1c1204; }
+#rc-pad { display:none; margin-top:10px; }
+#rc-pad.show { display:grid; grid-template-columns:repeat(3, 76px);
+               gap:6px; justify-content:center; user-select:none; }
+.rc-btn { padding:16px 0; font-size:1.2rem; text-align:center; touch-action:none; }
+.rc-btn.stop { background:var(--off); color:#180808; font-weight:700; }
+.rc-btn.held { background:var(--accent); }
+
+/* ---- status list ---- */
+.stat { display:flex; justify-content:space-between; padding:2px 0;
+        border-bottom:1px solid var(--line); font-size:.9rem; }
+.stat:last-child { border-bottom:0; }
+.stat span:first-child { color:var(--dim); }
+
+/* ---- conversation log + feedback ---- */
+#log { font:12.5px/1.5 ui-monospace, monospace; max-height:300px; overflow-y:auto; }
+#log div { padding:1px 0; }
+#log .robot { color:var(--accent); }
+#log .you, #log .heard { color:var(--ok); }
+.fbbtn { padding:0 7px; font-size:.8rem; border-radius:6px; margin-left:4px;
+         background:#2a323d; line-height:1.5; }
+.fbbtn.ok:hover { background:var(--ok); color:#08130c; }
+.fbbtn.bad:hover { background:var(--off); color:#180808; }
+.fb { margin-left:6px; font-weight:700; }
+.fb.correct { color:var(--ok); } .fb.incorrect { color:var(--off); }
+
+/* ---- training: object rows + facts ---- */
+.obj { display:flex; align-items:center; gap:8px; padding:6px 0;
+       border-bottom:1px solid var(--line); flex-wrap:wrap; }
+.obj:last-child { border-bottom:0; }
+.obj .lbl { font-weight:600; }
+.obj .conf { color:var(--dim); font-size:.8rem; }
+.obj .alt { color:var(--warn); font-size:.8rem; }
+.facts { max-height:320px; overflow-y:auto; }
+.fact { padding:5px 0; border-bottom:1px solid var(--line); font-size:.9rem; }
+.fact:last-child { border-bottom:0; }
+.fact .subj { color:var(--accent); font-weight:600; }
+.fact .meta { color:var(--dim); font-size:.75rem; }
+
+/* ---- config knobs ---- */
+.cfg-sec { margin-bottom:10px; }
+.cfg-sec > h3 { font-size:.85rem; margin:8px 0 4px; color:var(--fg);
+                text-transform:capitalize; }
+.knob { display:grid; grid-template-columns:1fr auto; gap:6px 10px;
+        align-items:center; padding:6px 0; border-bottom:1px solid var(--line); }
+.knob:last-child { border-bottom:0; }
+.knob .kname { font-size:.9rem; font-family:ui-monospace, monospace; }
+.knob .khelp { grid-column:1 / -1; color:var(--dim); font-size:.75rem;
+               margin-top:-2px; }
+.knob input, .knob select { max-width:180px; }
+.knob input[type=checkbox] { width:22px; height:22px; }
+#cfg-note { color:var(--warn); font-size:.82rem; }
+#cfg-status { margin-left:8px; font-size:.85rem; }

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX · Dashboard</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="stat"><span>Battery</span><span id="s-batt">–</span></div>
+  <div class="stat"><span>Obstacle distance</span><span id="s-dist">–</span></div>
+  <div class="stat"><span>Location</span><span id="s-loc">–</span></div>
+  <div class="stat"><span>Mission</span><span id="s-goal">–</span></div>
+  <div class="stat"><span>Sees</span><span id="s-sees">–</span></div>
+  <div class="stat"><span>Talking to</span><span id="s-person">–</span></div>
+  <div class="stat"><span>Following</span><span id="s-follow">–</span></div>
+  <div class="stat"><span>Radio</span><span id="s-radio">–</span></div>
+</div>
+
+<div class="card">
+  <h2>Quick commands</h2>
+  <div class="grid">
+    <button onclick="PX.say('explore')">Explore</button>
+    <button class="danger" onclick="PX.say('stop')">STOP</button>
+    <button onclick="PX.say('status')">Status</button>
+    <button onclick="PX.say('what do you notice')">Objects</button>
+    <button onclick="PX.say('map')">Map</button>
+    <button onclick="PX.say('why did you do that')">Why?</button>
+    <button onclick="PX.say('history')">History</button>
+    <button onclick="PX.say('battery')">Battery</button>
+    <button onclick="PX.say('who do you see')">Who's there?</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Say anything (as if heard by the mic)</h2>
+  <div class="row">
+    <input type="text" id="free" placeholder="robot, how are you feeling?">
+    <button class="primary" onclick="freeSay()">Send</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <div class="hint">✓ / ✗ a robot line to teach it whether it understood you -
+    ✗ asks what you actually wanted</div>
+  <div id="log"></div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+function freeSay() {
+  const el = document.getElementById('free');
+  if (el.value.trim()) { PX.say(el.value.trim()); el.value = ''; setTimeout(PX.poll, 150); }
+}
+document.getElementById('free').addEventListener('keydown', e => { if (e.key === 'Enter') freeSay(); });
+
+PX.onPoll(s => {
+  const set = (id, v) => document.getElementById(id).textContent = v;
+  set('s-batt', s.battery_v ? s.battery_v.toFixed(2) + ' V' + (s.battery_low ? ' (LOW)' : '') : '–');
+  set('s-dist', s.distance_cm != null ? s.distance_cm.toFixed(0) + ' cm' : '–');
+  set('s-loc', (s.location && s.location.label) || 'unknown');
+  set('s-goal', (s.goal && s.goal.label) || 'none');
+  set('s-sees', (s.sees && s.sees.length) ? s.sees.join(', ') : 'nothing recognized');
+  set('s-person', s.person || '–');
+  set('s-follow', s.follow ? 'YES' : 'no');
+  set('s-radio', s.radio && s.radio.playing
+    ? (s.radio.station + (s.radio.dial ? ' (' + s.radio.dial + ')' : '')) : 'off');
+  PX.renderLog('log', s.log);
+});
+PX.bindLog('log');
+PX.startPolling(2000);
+</script>
+</body>
+</html>

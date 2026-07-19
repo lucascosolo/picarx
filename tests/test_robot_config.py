@@ -90,6 +90,46 @@ class RobotConfigTest(unittest.TestCase):
         self._write({})
         self.assertFalse(robot_config.get_bool("x", "flag", False))
 
+    # ---- whole-file edit/save (web console Config page) ----
+
+    def test_merge_and_save_writes_and_reloads(self):
+        self._write({"audio": {"gain": 12.0, "espeak_speed": 130}})
+        robot_config.merge_and_save({"audio": {"gain": 8.0}})
+        self.assertEqual(robot_config.get("audio", "gain", 12.0), 8.0)
+        # A round-trip re-read from disk sees it too (not just the cache).
+        robot_config.reload()
+        self.assertEqual(robot_config.get("audio", "gain", 12.0), 8.0)
+
+    def test_merge_preserves_untouched_keys_and_readme(self):
+        self._write({"_readme": ["note"], "audio": {"gain": 12.0, "espeak_speed": 130},
+                     "radio": {"tts_settle_sec": 2.0}})
+        robot_config.merge_and_save({"audio": {"gain": 5.0}})
+        with open(self.path) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["_readme"], ["note"])          # docs kept
+        self.assertEqual(saved["audio"]["espeak_speed"], 130)  # sibling kept
+        self.assertEqual(saved["radio"]["tts_settle_sec"], 2.0)  # section kept
+        self.assertEqual(saved["audio"]["gain"], 5.0)
+
+    def test_merge_can_add_a_new_section(self):
+        self._write({"audio": {"gain": 12.0}})
+        robot_config.merge_and_save({"steering": {"cruise_speed": 30}})
+        self.assertEqual(robot_config.get("steering", "cruise_speed", 25), 30)
+
+    def test_merge_rejects_editing_readme(self):
+        self._write({"_readme": ["note"]})
+        with self.assertRaises(ValueError):
+            robot_config.merge_and_save({"_readme": ["hacked"]})
+
+    def test_merge_rejects_non_scalar_value(self):
+        self._write({"audio": {"gain": 12.0}})
+        with self.assertRaises(ValueError):
+            robot_config.merge_and_save({"audio": {"gain": {"nested": 1}}})
+
+    def test_merge_rejects_bad_top_shape(self):
+        with self.assertRaises(ValueError):
+            robot_config.merge_and_save({"audio": 5})
+
     # ---- the shipped file ----
 
     def test_shipped_config_parses_and_matches_key_defaults(self):

@@ -4,27 +4,47 @@
 Web Console (Layer B) - phone/laptop control panel for testing without
 shouting across a loud room.
 
-One design rule keeps this honest: the console does NOT get its own
-command paths. Every button and text box submits a phrase to POST /say,
-which is published on picarx/audio/heard - byte-for-byte what the
-microphone would have produced. field_agent, tools_registry and
-companion react exactly as they would to voice, so anything you test
-here is tested for voice too. The only non-voice control is the mic
-kill-switch (picarx/audio/mic_control), which by definition can't be a
-voice command (a disabled mic can't hear you re-enable it).
+The features outgrew one screen, so the UI is split into pages that share a
+top nav, a common stylesheet (web_ui/app.css) and helper script (web_ui/app.js):
 
-Endpoints (all JSON):
-  GET  /        the single-page console (web_ui/console.html)
-  GET  /state   latest mic/radio/world/location/goal + speak/heard log
-  POST /say     {"text": "..."}    -> picarx/audio/heard
-  POST /mic     {"enabled": bool}  -> picarx/audio/mic_control
+  /          Dashboard   - status overview, quick commands, say-anything, log
+  /drive     Drive & Cam - live camera + bounding boxes + manual RC driving
+  /training  Training    - label the object in view, ask about objects/history
+  /people    People      - face enrolment, following, places & navigation
+  /audio     Audio+Radio - mic/speaker kill-switches, internet radio
+  /config    Config      - every config.json knob, editable in the browser
 
-Serves plain HTTP on the LAN with no authentication - anyone on your
-network can drive the robot. That's the right trade-off for a hobby
-robot on a home network; do not port-forward it to the internet.
+One design rule keeps most of this honest: the console does NOT get its own
+command paths. Almost every button and text box submits a phrase to POST /say,
+which is published on picarx/audio/heard - byte-for-byte what the microphone
+would have produced. field_agent, tools_registry and companion react exactly
+as they would to voice, so anything tested here is tested for voice too. The
+few non-voice controls exist because they can't BE voice commands: the mic
+kill-switch (a disabled mic can't hear "mic on"), RC driving, camera streaming,
+perception relabels, and editing the config file.
 
-Stdlib only (ThreadingHTTPServer); ~zero idle cost. Fail-soft: if the
-port is taken the module logs and idles rather than crash-looping.
+The live camera is demand-gated: vision_basic only encodes frames while a
+browser is actually fetching /camera.jpg (with an idle watchdog), so the camera
+costs nothing unless someone is on the Drive page watching it.
+
+HTTP endpoints (JSON unless noted):
+  GET  /,/drive,/training,/people,/audio,/config   the pages (HTML)
+  GET  /app.css /app.js                            shared static assets
+  GET  /state         status cache + speak/heard log + places/people
+  GET  /boxes         camera-overlay boxes for the current frame
+  GET  /objects       objects currently tracked in view (id/label/confidence)
+  GET  /camera.jpg    latest JPEG frame (also arms the stream)
+  GET  /facts[?q=]    recent (or searched) semantic-memory facts
+  GET  /config/data   the full config tree + per-knob help + env note
+  POST /say /mic /speaker /feedback /label /rc /rc/drive /camera   (as before)
+  POST /config/save   {"config": {section: {key: value}}} -> config.json
+
+Serves plain HTTP on the LAN with no authentication - anyone on your network
+can drive the robot (and now edit its config). That's the right trade-off for a
+hobby robot on a home network; do not port-forward it to the internet.
+
+Stdlib only (ThreadingHTTPServer); ~zero idle cost. Fail-soft: if the port is
+taken the module logs and idles rather than crash-looping.
 """
 import os
 import getpass
@@ -36,18 +56,37 @@ sys.path.insert(0, "/home/picarx/layer_b/modules")
 from broker_client import Bus
 import robot_config
 from spatial_store import SpatialStore
+from semantic_store import SemanticStore
 import person_memory
 
 import base64
 import json
+import os.path
 import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(robot_config.get("web_console", "port", 8088, env="WEB_CONSOLE_PORT"))
-HTML_PATH = "/home/picarx/layer_b/web_ui/console.html"
+WEB_UI_DIR = "/home/picarx/layer_b/web_ui"
 LOG_LINES = 40
+
+# Page routes -> HTML file. Method disambiguates from the POST API endpoints
+# (GET /config is the page; POST /config is the camera toggle), so page paths
+# and action paths can safely overlap.
+PAGES = {
+    "/": "dashboard.html",
+    "/drive": "drive.html",
+    "/training": "training.html",
+    "/people": "people.html",
+    "/audio": "audio.html",
+    "/config": "config.html",
+}
+# Shared static assets, whitelisted (never serve an arbitrary path from disk).
+ASSETS = {
+    "/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+}
 
 # Live camera view. vision_basic.py owns the camera and only encodes
 # frames while we ask it to (picarx/vision/stream_control), so the view
@@ -330,9 +369,11 @@ class RcController:
 STATE = ConsoleState()
 BUS = None  # set in main
 RC = None   # RcController, set in main
-# Read-only map access for the places list (location_graph owns writes);
-# fail-soft to "no places yet" like every other reader.
+# Read-only store access. location_graph owns spatial.db and reflection owns
+# semantic.db; the console only ever reads them, fail-soft to empty like every
+# other reader.
 SPATIAL = SpatialStore(readonly=True)
+SEMANTIC = SemanticStore(readonly=True)
 
 
 def _memory_snapshot():
@@ -343,6 +384,75 @@ def _memory_snapshot():
     except Exception:
         places = []
     return {"places": places[:20], "people": person_memory.known_people()}
+
+
+def objects_snapshot(world):
+    """The objects currently tracked IN VIEW, for the Training page to relabel.
+    Only fresh detections (stale frames give nothing to point at), one entry
+    per confirmed track with its id so a correction can train that exact
+    object via /label."""
+    objects = (world or {}).get("objects") or {}
+    if objects.get("stale", True):
+        return []
+    out = []
+    for o in objects.get("items", []):
+        if not o.get("id") or not o.get("label"):
+            continue
+        out.append({
+            "id": o["id"],
+            "label": o["label"],
+            "confidence": round(float(o.get("confidence") or 0.0), 2),
+            "alt_label": o.get("alt_label"),
+            "area_ratio": round(float(o.get("area_ratio") or 0.0), 3),
+        })
+    return out
+
+
+def facts_snapshot(query=None, limit=25):
+    """Recent (or searched) semantic-memory facts for the Training page's
+    'ask about its objects / history' view. Read-only, fail-soft to []."""
+    try:
+        q = (query or "").strip()
+        rows = SEMANTIC.search_facts(q, limit=limit) if q \
+            else SEMANTIC.recent_facts(limit=limit)
+        facts = [{"subject": r["subject"], "fact": r["fact"],
+                  "confidence": round(float(r["confidence"]), 2),
+                  "seen_count": r["seen_count"]} for r in rows]
+        count = SEMANTIC.fact_count()
+    except Exception:
+        facts, count = [], 0
+    return {"facts": facts, "count": count}
+
+
+def _config_help():
+    """Parse config.json's `_readme` lines of the form 'section.key: text'
+    into a {'section.key': 'text'} help map for inline tooltips. Lines that
+    aren't knob docs (the general notes at the top) are ignored."""
+    help_map = {}
+    for line in (robot_config.all_config().get("_readme") or []):
+        if not isinstance(line, str) or ":" not in line:
+            continue
+        head, _, desc = line.partition(":")
+        head = head.strip()
+        # A knob doc looks like 'audio.espeak_voice'; a general note doesn't.
+        if head.count(".") == 1 and " " not in head and desc.strip():
+            help_map[head] = desc.strip()
+    return help_map
+
+
+def config_data():
+    """The editable config tree (every section/knob except the `_readme`
+    block) plus per-knob help and a plain note about how edits apply."""
+    cfg = robot_config.all_config()
+    sections = {k: v for k, v in cfg.items()
+                if k != "_readme" and isinstance(v, dict)}
+    return {
+        "config": sections,
+        "help": _config_help(),
+        "note": ("Saved to config.json. Environment variables still override "
+                 "these at runtime, and most modules read config at startup - "
+                 "so a change takes effect the next time that module restarts."),
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -365,14 +475,22 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return None
 
+    def _serve_file(self, filename, ctype):
+        try:
+            with open(os.path.join(WEB_UI_DIR, filename), "rb") as f:
+                self._send(200, f.read(), ctype)
+        except OSError:
+            self._send(200, f"<h1>PicarX console</h1><p>{filename} missing.</p>".encode(),
+                       "text/html; charset=utf-8")
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            try:
-                with open(HTML_PATH, "rb") as f:
-                    self._send(200, f.read(), "text/html; charset=utf-8")
-            except OSError:
-                self._send(200, b"<h1>PicarX console</h1><p>web_ui/console.html missing.</p>",
-                           "text/html; charset=utf-8")
+        path = self.path.split("?", 1)[0]
+        if path == "/index.html":
+            path = "/"
+        if path in PAGES:
+            self._serve_file(PAGES[path], "text/html; charset=utf-8")
+        elif path in ASSETS:
+            self._serve_file(*ASSETS[path])
         elif self.path == "/state":
             self._send(200, {**STATE.snapshot(), **_memory_snapshot(),
                              "rc_enabled": RC.enabled if RC else False})
@@ -380,6 +498,16 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 world = dict(STATE.world)
             self._send(200, build_boxes(world))
+        elif self.path == "/objects":
+            with STATE.lock:
+                world = dict(STATE.world)
+            self._send(200, {"objects": objects_snapshot(world)})
+        elif path == "/facts":
+            from urllib.parse import parse_qs, urlparse
+            q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0]
+            self._send(200, facts_snapshot(q))
+        elif self.path == "/config/data":
+            self._send(200, config_data())
         elif self.path == "/camera.jpg" or self.path.startswith("/camera.jpg?"):
             # Fetching a frame is itself the "someone is watching" signal:
             # start vision's stream on the first request, keep the
@@ -482,6 +610,25 @@ class Handler(BaseHTTPRequestHandler):
             enabled = bool(body.get("enabled", False))
             if STATE.set_stream(enabled):
                 BUS.publish(VISION_STREAM_CONTROL, {"enabled": enabled})
+            self._send(200, {"ok": True})
+        elif self.path == "/config/save":
+            # Persist edited knobs to config.json (merged, so untouched keys and
+            # the _readme survive). Announce the change for any future live
+            # re-readers; today most modules pick it up on their next restart.
+            edits = body.get("config")
+            if not isinstance(edits, dict):
+                self._send(400, {"error": "config must be an object"})
+                return
+            try:
+                robot_config.merge_and_save(edits)
+            except ValueError as e:
+                self._send(400, {"error": str(e)})
+                return
+            except OSError as e:
+                self._send(500, {"error": f"could not write config: {e}"})
+                return
+            BUS.publish("picarx/config/reload", {"ts": time.time()})
+            print("Web console: config.json updated from the browser")
             self._send(200, {"ok": True})
         else:
             self._send(404, {"error": "not found"})

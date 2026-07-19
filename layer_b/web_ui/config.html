@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX · Config</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>Configuration</h2>
+  <div class="hint" id="cfg-note">loading…</div>
+  <div class="row" style="margin-top:10px">
+    <button class="primary" onclick="saveConfig()">Save changes</button>
+    <button onclick="loadConfig()">Revert</button>
+    <span id="cfg-status"></span>
+  </div>
+</div>
+
+<div id="cfg-body"></div>
+
+<script src="/app.js"></script>
+<script>
+let ORIG = {};   // section -> key -> original value (for change detection)
+
+function inputFor(section, key, value, help) {
+  const id = `cfg-${section}-${key}`;
+  const t = typeof value;
+  let field;
+  if (t === 'boolean') {
+    field = `<input type="checkbox" id="${id}" data-type="bool" ${value ? 'checked' : ''}>`;
+  } else if (t === 'number') {
+    field = `<input type="number" step="any" id="${id}" data-type="number" value="${value}">`;
+  } else if (value === null) {
+    field = `<input type="text" id="${id}" data-type="null" value="" placeholder="(uses default)">`;
+  } else {
+    field = `<input type="text" id="${id}" data-type="string" value="${PX.esc(String(value))}">`;
+  }
+  const helpHtml = help ? `<div class="khelp">${PX.esc(help)}</div>` : '';
+  return `<div class="knob"><span class="kname">${PX.esc(key)}</span>${field}${helpHtml}</div>`;
+}
+
+async function loadConfig() {
+  const body = document.getElementById('cfg-body');
+  try {
+    const d = await PX.get('/config/data');
+    document.getElementById('cfg-note').textContent = d.note || '';
+    ORIG = d.config || {};
+    const sections = Object.keys(ORIG).sort();
+    body.innerHTML = sections.map(sec => {
+      const knobs = Object.keys(ORIG[sec]).map(key =>
+        inputFor(sec, key, ORIG[sec][key], (d.help || {})[`${sec}.${key}`])).join('');
+      return `<div class="card cfg-sec"><h3>${PX.esc(sec)}</h3>${knobs}</div>`;
+    }).join('');
+    document.getElementById('cfg-status').textContent = '';
+  } catch (e) {
+    body.innerHTML = '<div class="card hint">could not load config</div>';
+  }
+}
+
+function readField(section, key) {
+  const el = document.getElementById(`cfg-${section}-${key}`);
+  const t = el.dataset.type;
+  if (t === 'bool') return el.checked;
+  if (t === 'number') { const n = parseFloat(el.value); return isNaN(n) ? null : n; }
+  if (t === 'null') { const v = el.value.trim(); return v === '' ? null : v; }
+  return el.value;
+}
+
+async function saveConfig() {
+  const edits = {};
+  for (const sec of Object.keys(ORIG)) {
+    for (const key of Object.keys(ORIG[sec])) {
+      const val = readField(sec, key);
+      if (val === null && ORIG[sec][key] === null) continue;   // unchanged unpinned
+      if (val !== ORIG[sec][key]) (edits[sec] = edits[sec] || {})[key] = val;
+    }
+  }
+  const status = document.getElementById('cfg-status');
+  if (!Object.keys(edits).length) { status.textContent = 'no changes'; return; }
+  status.textContent = 'saving…';
+  const r = await PX.post('/config/save', {config: edits});
+  if (r && r.ok) { status.textContent = 'saved ✓'; loadConfig(); }
+  else { status.textContent = (r && r.error) ? 'error: ' + r.error : 'save failed'; }
+}
+
+PX.startPolling(2000);
+loadConfig();
+</script>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX · People &amp; Places</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>People &amp; following</h2>
+  <div class="grid">
+    <button onclick="PX.say('robot, follow me')">Follow me</button>
+    <button onclick="PX.say('stop following')">Stop following</button>
+    <button onclick="PX.say('who am i')">Who am I?</button>
+    <button onclick="PX.say('who do you see')">Who's there?</button>
+  </div>
+  <div class="row">
+    <input type="text" id="enroll" placeholder="first name">
+    <button onclick="sayWith('enroll', 'remember me, i am ')">Learn my face</button>
+  </div>
+  <div class="hint">face the robot's camera while it learns · say
+    "forget &lt;name&gt;" to remove someone</div>
+  <div class="hint" id="people-known">no faces learned yet</div>
+</div>
+
+<div class="card">
+  <h2>Places &amp; navigation</h2>
+  <div class="row">
+    <input type="text" id="goto" list="places-list" placeholder="place e.g. kitchen">
+    <button onclick="sayWith('goto', 'go to the ')">Go to</button>
+    <button onclick="sayWith('goto', &quot;what's in the &quot;)">What's in…</button>
+  </div>
+  <div class="row">
+    <input type="text" id="placename" placeholder="name for the current spot">
+    <button onclick="sayWith('placename', 'call this place the ')">Name this place</button>
+  </div>
+  <div class="grid">
+    <button onclick="PX.say('map')">Map</button>
+    <button onclick="PX.say('where are you')">Where are you?</button>
+    <button onclick="PX.say('explore')">Explore</button>
+  </div>
+  <datalist id="places-list"></datalist>
+  <div class="hint" id="places-known">no places mapped yet</div>
+</div>
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="stat"><span>Location</span><span id="s-loc">–</span></div>
+  <div class="stat"><span>Mission</span><span id="s-goal">–</span></div>
+  <div class="stat"><span>Talking to</span><span id="s-person">–</span></div>
+  <div class="stat"><span>Following</span><span id="s-follow">–</span></div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+function sayWith(inputId, prefix) {
+  const el = document.getElementById(inputId);
+  if (el.value.trim()) { PX.say(prefix + el.value.trim()); el.value=''; setTimeout(PX.poll, 150); }
+}
+PX.onPoll(s => {
+  document.getElementById('s-loc').textContent = (s.location && s.location.label) || 'unknown';
+  document.getElementById('s-goal').textContent = (s.goal && s.goal.label) || 'none';
+  document.getElementById('s-person').textContent = s.person || '–';
+  document.getElementById('s-follow').textContent = s.follow ? 'YES' : 'no';
+  document.getElementById('places-list').innerHTML =
+    (s.places || []).map(p => `<option value="${PX.esc(p)}">`).join('');
+  document.getElementById('places-known').textContent =
+    (s.places && s.places.length) ? 'known places: ' + s.places.join(', ') : 'no places mapped yet';
+  document.getElementById('people-known').textContent =
+    (s.people && s.people.length) ? 'recognizes: ' + s.people.join(', ') : 'no faces learned yet';
+});
+PX.startPolling(2000);
+</script>
+</body>
+</html>

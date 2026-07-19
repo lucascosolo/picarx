@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX · Audio &amp; Radio</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>Audio</h2>
+  <button id="mic" class="toggle on" onclick="toggleMic()">MIC ON</button>
+  <button id="spk" class="toggle on" onclick="toggleSpeaker()">SPEAKER ON</button>
+  <div class="hint">mic off in loud rooms so noise can't fire commands · speaker
+    off silences the voice (re-enabling re-runs the amp enable)</div>
+</div>
+
+<div class="card">
+  <h2>Radio</h2>
+  <div class="grid">
+    <button onclick="PX.say('play radio')">Play</button>
+    <button onclick="PX.say('stop radio')">Stop</button>
+    <button onclick="PX.say('next station')">Next</button>
+    <button onclick="PX.say(&quot;what's playing&quot;)">Now playing</button>
+    <button onclick="PX.say('list stations')">Saved list</button>
+  </div>
+  <div class="row">
+    <input type="text" id="dial" placeholder="dial e.g. 98.7" inputmode="decimal">
+    <button onclick="tune()">Tune</button>
+  </div>
+  <div class="row">
+    <input type="text" id="q" placeholder="search e.g. soft rock">
+    <button onclick="find()">Find</button>
+  </div>
+  <div class="stat" style="margin-top:8px"><span>Now playing</span><span id="s-radio">–</span></div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+let micOn = true, speakerOn = true;
+function toggleMic() { PX.post('/mic', {enabled: !micOn}).then(() => setTimeout(PX.poll, 150)); }
+function toggleSpeaker() { PX.post('/speaker', {enabled: !speakerOn}).then(() => setTimeout(PX.poll, 150)); }
+function tune() { const el = document.getElementById('dial');
+  if (el.value.trim()) PX.say('tune to ' + el.value.trim()); }
+function find() { const el = document.getElementById('q');
+  if (el.value.trim()) { PX.say('radio find ' + el.value.trim()); el.value=''; } }
+
+PX.onPoll(s => {
+  micOn = s.mic_enabled;
+  const mic = document.getElementById('mic');
+  mic.textContent = micOn ? 'MIC ON' : 'MIC OFF';
+  mic.className = 'toggle ' + (micOn ? 'on' : 'off');
+  speakerOn = s.speaker_enabled !== false;
+  const spk = document.getElementById('spk');
+  spk.textContent = speakerOn ? 'SPEAKER ON' : 'SPEAKER OFF';
+  spk.className = 'toggle ' + (speakerOn ? 'on' : 'off');
+  document.getElementById('s-radio').textContent = s.radio && s.radio.playing
+    ? (s.radio.station + (s.radio.dial ? ' (' + s.radio.dial + ')' : '')) : 'off';
+});
+PX.startPolling(2000);
+</script>
+</body>
+</html>

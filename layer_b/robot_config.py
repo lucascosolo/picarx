@@ -35,6 +35,7 @@ need real parsing, so booleans get a dedicated helper.
 The file path itself can be overridden with LAYER_B_CONFIG (mainly for
 tests and unusual layouts).
 """
+import copy
 import json
 import os
 
@@ -105,3 +106,44 @@ def get_bool(section, key, default, env=None):
         if v is not None:
             return bool(v)
     return bool(default)
+
+
+# ---------- whole-file access (for the web console's Config page) ----------
+
+def all_config():
+    """The full parsed config.json as a deep COPY (so callers can't mutate the
+    cache), or {} if the file is missing/corrupt. Includes the `_readme` block."""
+    return copy.deepcopy(_load())
+
+
+def merge_and_save(edits):
+    """Apply `edits` (a {section: {key: value}} dict) onto the current
+    config.json and write it back atomically, preserving every key the edits
+    don't mention - including `_readme` and any sections the editor never
+    showed. Returns the saved config. Raises ValueError on a malformed `edits`
+    shape and OSError on a write failure; the caller (web console) reports
+    either back to the browser rather than crashing.
+
+    Env vars still override these values at runtime (see get()), and most
+    modules read config only at startup, so a saved change lands when the
+    module next restarts - the console says as much."""
+    if not isinstance(edits, dict):
+        raise ValueError("config edits must be an object")
+    merged = copy.deepcopy(_load())
+    for section, keys in edits.items():
+        if section == "_readme" or not isinstance(keys, dict):
+            raise ValueError(f"section {section!r} must map to an object of knobs")
+        dest = merged.setdefault(section, {})
+        if not isinstance(dest, dict):
+            raise ValueError(f"section {section!r} is not a knob group")
+        for key, value in keys.items():
+            if isinstance(value, (dict, list)):
+                raise ValueError(f"{section}.{key} must be a scalar value")
+            dest[key] = value
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(merged, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)   # atomic: a reader never sees a half file
+    reload()
+    return merged

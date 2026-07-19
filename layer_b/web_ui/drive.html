@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX · Drive & Camera</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>Camera</h2>
+  <button id="cam-toggle" class="toggle off" onclick="toggleLive()">LIVE OFF</button>
+  <button id="rc-toggle" class="toggle off" onclick="toggleRc()">RC OFF</button>
+  <span class="hint" style="margin-left:8px">RC = you drive (AI pauses, safety stays on)</span>
+  <div id="cam-wrap">
+    <img id="cam" alt="camera">
+    <div id="boxes"></div>
+    <span id="cam-msg">live view off</span>
+  </div>
+  <div id="rc-pad">
+    <span></span>
+    <button class="rc-btn" data-rc="f:1">▲</button>
+    <span></span>
+    <button class="rc-btn" data-rc="t:-1">◀</button>
+    <button class="rc-btn stop" data-rc="stop">STOP</button>
+    <button class="rc-btn" data-rc="t:1">▶</button>
+    <span></span>
+    <button class="rc-btn" data-rc="f:-1">▼</button>
+    <span></span>
+  </div>
+  <div class="hint" id="rc-hint" style="display:none">
+    W/S or ▲/▼ drive · A/D or ◀/▶ steer · space or STOP halts ·
+    releasing keys stops within a moment (dead-man)</div>
+  <div class="hint">The camera only streams while this page is open and LIVE is
+    on - close the tab and the robot stops encoding frames.</div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+// ---- live camera view ----
+let liveOn = false, camTimer = null;
+const CAM_INTERVAL_MS = 400;   // ~2.5 fps refresh; vision caps the source rate
+
+function refreshCam() {
+  document.getElementById('cam').src = '/camera.jpg?t=' + Date.now();
+  refreshBoxes();
+}
+function setLive(on) {
+  liveOn = on;
+  const btn = document.getElementById('cam-toggle');
+  const img = document.getElementById('cam');
+  const msg = document.getElementById('cam-msg');
+  btn.textContent = on ? 'LIVE ON' : 'LIVE OFF';
+  btn.className = 'toggle ' + (on ? 'on' : 'off');
+  if (on) {
+    msg.textContent = 'starting camera…';
+    PX.post('/camera', {enabled: true});
+    refreshCam();
+    camTimer = setInterval(refreshCam, CAM_INTERVAL_MS);
+  } else {
+    clearInterval(camTimer); camTimer = null;
+    PX.post('/camera', {enabled: false});
+    img.style.display = 'none';
+    document.getElementById('boxes').innerHTML = '';
+    msg.textContent = 'live view off';
+  }
+}
+function toggleLive() { setLive(!liveOn); }
+
+document.getElementById('cam').addEventListener('load', () => {
+  if (liveOn) { document.getElementById('cam').style.display = 'block';
+                document.getElementById('cam-msg').textContent = ''; }
+});
+// Stop encoding when the tab is closed/hidden (watchdog also covers this).
+window.addEventListener('pagehide', () => {
+  if (liveOn) navigator.sendBeacon('/camera',
+    new Blob([JSON.stringify({enabled: false})], {type: 'application/json'}));
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && liveOn) { PX.post('/camera', {enabled: false}); }
+});
+
+async function refreshBoxes() {
+  const wrap = document.getElementById('boxes');
+  if (!liveOn) { wrap.innerHTML = ''; return; }
+  try {
+    const b = await PX.get('/boxes');
+    const fw = b.frame_w || 320, fh = b.frame_h || 240;
+    wrap.innerHTML = (b.boxes || []).map(o => {
+      const conf = o.confidence ? ` ${(o.confidence * 100).toFixed(0)}%` : '';
+      return `<div class="bbox ${o.kind}" style="left:${100 * o.x / fw}%;` +
+             `top:${100 * o.y / fh}%;width:${100 * o.w / fw}%;` +
+             `height:${100 * o.h / fh}%"><span>${PX.esc(o.label)}${conf}</span></div>`;
+    }).join('');
+  } catch (e) {}
+}
+
+// ---- RC mode (manual driving) ----
+let rcOn = false, rcCtrl = {f: 0, t: 0}, rcTimer = null;
+
+function setRcUi(on) {
+  rcOn = on;
+  const btn = document.getElementById('rc-toggle');
+  btn.textContent = on ? 'RC ON' : 'RC OFF';
+  btn.className = 'toggle ' + (on ? 'on' : 'off');
+  document.getElementById('rc-pad').className = on ? 'show' : '';
+  document.getElementById('rc-hint').style.display = on ? 'block' : 'none';
+}
+function toggleRc() {
+  const on = !rcOn;
+  setRcUi(on);
+  rcCtrl = {f: 0, t: 0};
+  PX.post('/rc', {enabled: on});
+  clearInterval(rcTimer); rcTimer = null;
+  if (on) rcTimer = setInterval(sendRc, 250);
+}
+function sendRc() { if (rcOn) PX.post('/rc/drive', rcCtrl); }
+function rcSet(axis, value) {
+  if (!rcOn || rcCtrl[axis] === value) return;
+  rcCtrl[axis] = value;
+  sendRc();
+}
+function rcStop() { if (rcOn) { rcCtrl = {f: 0, t: 0}; sendRc(); } }
+
+const RC_KEYS = {w: ['f', 1], s: ['f', -1], a: ['t', -1], d: ['t', 1],
+                 arrowup: ['f', 1], arrowdown: ['f', -1],
+                 arrowleft: ['t', -1], arrowright: ['t', 1]};
+document.addEventListener('keydown', ev => {
+  if (!rcOn || ev.repeat) return;
+  if (/INPUT|TEXTAREA/.test(ev.target.tagName)) return;
+  const key = ev.key.toLowerCase();
+  if (key === ' ') { rcStop(); ev.preventDefault(); return; }
+  const bind = RC_KEYS[key];
+  if (bind) { rcSet(bind[0], bind[1]); ev.preventDefault(); }
+});
+document.addEventListener('keyup', ev => {
+  if (!rcOn) return;
+  const bind = RC_KEYS[ev.key.toLowerCase()];
+  if (bind && rcCtrl[bind[0]] === bind[1]) rcSet(bind[0], 0);
+});
+document.querySelectorAll('.rc-btn').forEach(btn => {
+  const spec = btn.dataset.rc;
+  const press = ev => {
+    ev.preventDefault();
+    btn.classList.add('held');
+    if (spec === 'stop') { rcStop(); return; }
+    const [axis, value] = spec.split(':');
+    rcSet(axis, parseInt(value, 10));
+  };
+  const release = () => {
+    btn.classList.remove('held');
+    if (spec === 'stop') return;
+    const [axis, value] = spec.split(':');
+    if (rcCtrl[axis] === parseInt(value, 10)) rcSet(axis, 0);
+  };
+  btn.addEventListener('pointerdown', press);
+  btn.addEventListener('pointerup', release);
+  btn.addEventListener('pointercancel', release);
+  btn.addEventListener('pointerleave', release);
+});
+
+// Server can auto-exit RC (client timeout); reconcile the button from /state.
+PX.onPoll(s => {
+  if (s.rc_enabled !== rcOn) {
+    setRcUi(s.rc_enabled);
+    clearInterval(rcTimer); rcTimer = null;
+    if (s.rc_enabled) rcTimer = setInterval(sendRc, 250);
+  }
+});
+PX.startPolling(2000);
+// This page IS the camera view - start streaming on arrival.
+setLive(true);
+</script>
+</body>
+</html>

@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PicarX · Training</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>What am I looking at?</h2>
+  <div class="hint">Objects the camera is tracking right now. Type the real name
+    and Teach to correct the label - it's written straight to memory. Open the
+    <a href="/drive">Drive &amp; Cam</a> page to see them.</div>
+  <div id="objects"><div class="hint">no objects in view</div></div>
+  <div class="row">
+    <button onclick="PX.say('what do you notice')">Ask what it sees</button>
+    <button onclick="refreshObjects()">Refresh</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Ask about its objects &amp; history</h2>
+  <div class="grid">
+    <button onclick="PX.say('what have you learned')">What have you learned?</button>
+    <button onclick="PX.say('history')">History</button>
+    <button onclick="PX.say('why did you do that')">Why did you do that?</button>
+    <button onclick="PX.say('what do you notice')">What do you notice?</button>
+  </div>
+  <div class="row">
+    <input type="text" id="whereis" placeholder="object e.g. bottle">
+    <button onclick="whereIs()">Where is…</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Memory <span id="fact-count" class="hint" style="text-transform:none"></span></h2>
+  <div class="row">
+    <input type="text" id="factq" placeholder="search memory e.g. chair, kitchen">
+    <button onclick="loadFacts()">Search</button>
+    <button onclick="document.getElementById('factq').value=''; loadFacts()">Recent</button>
+  </div>
+  <div class="facts" id="facts"><div class="hint">loading…</div></div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <div class="hint">✓ / ✗ an identification line to confirm or relabel what the
+    robot saw - the correction trains its memory.</div>
+  <div id="log"></div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+async function refreshObjects() {
+  const wrap = document.getElementById('objects');
+  try {
+    const d = await PX.get('/objects');
+    const objs = d.objects || [];
+    if (!objs.length) { wrap.innerHTML = '<div class="hint">no objects in view</div>'; return; }
+    wrap.innerHTML = objs.map((o, i) => {
+      const alt = o.alt_label ? `<span class="alt">or ${PX.esc(o.alt_label)}?</span>` : '';
+      return `<div class="obj" data-id="${PX.esc(o.id)}" data-label="${PX.esc(o.label)}">
+          <span class="lbl">${PX.esc(o.label)}</span>
+          <span class="conf">${(o.confidence * 100).toFixed(0)}%</span> ${alt}
+          <input type="text" id="lbl-${i}" placeholder="actually a…" style="flex:1">
+          <button onclick="teach(${i})">Teach</button>
+        </div>`;
+    }).join('');
+  } catch (e) { wrap.innerHTML = '<div class="hint">could not read objects</div>'; }
+}
+async function teach(i) {
+  const row = document.querySelectorAll('.obj')[i];
+  const input = document.getElementById('lbl-' + i);
+  const label = input.value.trim();
+  if (!label) return;
+  await PX.post('/label', {label, guess: row.dataset.label, object_id: row.dataset.id});
+  input.value = '';
+  setTimeout(() => { refreshObjects(); loadFacts(); PX.poll(); }, 200);
+}
+function whereIs() {
+  const el = document.getElementById('whereis');
+  if (el.value.trim()) { PX.say('where is the ' + el.value.trim()); el.value=''; setTimeout(PX.poll, 150); }
+}
+async function loadFacts() {
+  const q = document.getElementById('factq').value.trim();
+  const wrap = document.getElementById('facts');
+  try {
+    const d = await PX.get('/facts' + (q ? '?q=' + encodeURIComponent(q) : ''));
+    document.getElementById('fact-count').textContent =
+      d.count != null ? `(${d.count} known)` : '';
+    if (!d.facts || !d.facts.length) { wrap.innerHTML = '<div class="hint">nothing yet</div>'; return; }
+    wrap.innerHTML = d.facts.map(f =>
+      `<div class="fact"><span class="subj">${PX.esc(f.subject)}</span> — ${PX.esc(f.fact)}
+        <div class="meta">confidence ${(f.confidence * 100).toFixed(0)}% · seen ${f.seen_count}×</div></div>`
+    ).join('');
+  } catch (e) { wrap.innerHTML = '<div class="hint">could not read memory</div>'; }
+}
+document.getElementById('factq').addEventListener('keydown', e => { if (e.key === 'Enter') loadFacts(); });
+
+PX.onPoll(s => PX.renderLog('log', s.log));
+PX.bindLog('log');
+PX.startPolling(2000);
+refreshObjects();
+loadFacts();
+setInterval(refreshObjects, 3000);   // keep the in-view list live
+</script>
+</body>
+</html>
