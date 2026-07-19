@@ -40,9 +40,16 @@ flowchart LR
     LLM["Claude (Anthropic)"]
   end
 
-  HW --> PER --> WS --> COG & INT
-  COG & INT -->|intents| ARB --> SD --> HW
-  COG & INT -.->|only when needed| LLM
+  HW --> PER
+  PER --> WS
+  WS --> COG
+  WS --> INT
+  COG -->|intents| ARB
+  INT -->|intents| ARB
+  ARB --> SD
+  SD --> HW
+  COG -.->|only when needed| LLM
+  INT -.->|only when needed| LLM
 ```
 
 - **Layer A — reflexes (`safety/safety_daemon.py`).** The sole owner of the
