@@ -404,6 +404,8 @@ def objects_snapshot(world):
             "confidence": round(float(o.get("confidence") or 0.0), 2),
             "alt_label": o.get("alt_label"),
             "area_ratio": round(float(o.get("area_ratio") or 0.0), 3),
+            # Only part of the object is in frame (a border cuts it off).
+            "truncated": bool(o.get("truncated")),
         })
     return out
 

@@ -111,6 +111,14 @@ STALE_AFTER = {
     "person": 10.0,
 }
 
+# Face-based identity only refreshes while a roughly frontal face is visible
+# (Haar + LBPH). But the SSD still tracks the BODY when the head turns away or
+# is partly occluded, so once we've recognized someone we hold their name for
+# this long as long as a person stays visibly in frame - turning your head
+# doesn't make the robot forget who it's looking at. Bounded, and any fresh
+# face recognition immediately refreshes or replaces it.
+PERSON_HOLD_SEC = 45.0
+
 # An object counts as "approaching" once its bounding-box area grows
 # this fraction of the frame per second while sitting within the
 # center portion of the frame - a depth-sensor-free stand-in for
@@ -264,6 +272,25 @@ class WorldState:
             return True
         return (time.time() - updated_at) > STALE_AFTER[key]
 
+    @staticmethod
+    def _person_freshness(person, person_visible, now):
+        """(stale, held) for the recognized identity. Normally it goes stale
+        after STALE_AFTER['person']; but while a person is still visibly
+        tracked in frame we HOLD the last known name up to PERSON_HOLD_SEC, so
+        a face turning away or being partly occluded doesn't drop the identity.
+        `held` marks a name that's being retained past its normal freshness
+        (still shown, but no longer just-confirmed). Pure/testable."""
+        updated = person.get("updated_at")
+        if updated is None:
+            return True, False
+        age = now - updated
+        if age <= STALE_AFTER["person"]:
+            return False, False
+        if (person.get("name") is not None and person_visible
+                and age <= PERSON_HOLD_SEC):
+            return False, True
+        return True, False
+
     def build_snapshot(self):
         with self.lock:
             face = dict(self.state["face"])
@@ -279,6 +306,14 @@ class WorldState:
             heard = dict(self.state["last_heard"])
             last_action = dict(self.state["last_action"])
 
+        # Hold a recognized identity while a person is still visibly tracked,
+        # even after their face stops refreshing it (looked away / occluded).
+        objects_stale = self._is_stale(objects_updated_at, "objects")
+        person_visible = not objects_stale and any(
+            o.get("label") == "person" for o in objects.values())
+        person_stale, person_held = self._person_freshness(
+            person, person_visible, time.time())
+
         return {
             "timestamp": time.time(),
             "face": {
@@ -287,7 +322,8 @@ class WorldState:
             },
             "person": {
                 **person,
-                "stale": self._is_stale(person.get("updated_at"), "person"),
+                "stale": person_stale,
+                "held": person_held,
             },
             "distance_cm": distance_cm,
             "distance_stale": self._is_stale(distance_updated_at, "distance"),

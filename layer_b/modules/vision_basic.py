@@ -30,8 +30,12 @@ Published:
   picarx/vision/objects - {"objects": [ {"id", "label", "alt_label",
                            "label_source", "confidence",
                            "x","y","w","h","frame_width","frame_height",
-                           "area_ratio","center_offset","first_seen",
+                           "area_ratio","center_offset","truncated",
+                           "truncated_edges","first_seen",
                            "last_seen"}, ... ], "close_object": bool}
+                           truncated is True when a frame border cuts the
+                           object off (we're seeing only PART of it);
+                           truncated_edges lists which sides.
                            alt_label is the runner-up class when the label
                            vote is a genuine two-way tie (else None) - the
                            "chair or speaker?" ambiguity signal. label_source
@@ -502,6 +506,30 @@ def contested_label(label_counts):
     return None
 
 
+EDGE_TRUNCATION_MARGIN = 3   # px: a box within this of a frame border is
+                             # treated as cut off there (see edge_truncation).
+
+
+def edge_truncation(x, y, w, h, frame_w, frame_h, margin=EDGE_TRUNCATION_MARGIN):
+    """Which frame borders a detection box is cut off by - a list drawn from
+    'left'/'right'/'top'/'bottom', empty when the object sits fully in view.
+
+    A box flush against (or past) a border is almost certainly only PART of the
+    object; the rest continues off-frame. That lets downstream honestly treat a
+    partial view as the whole thing ("the bottom of a person is still a
+    person") and, later, look that way to see more. Pure and hardware-free."""
+    edges = []
+    if x <= margin:
+        edges.append("left")
+    if y <= margin:
+        edges.append("top")
+    if x + w >= frame_w - margin:
+        edges.append("right")
+    if y + h >= frame_h - margin:
+        edges.append("bottom")
+    return edges
+
+
 class CentroidTracker:
     """
     Minimal multi-object tracker: matches new detections to existing
@@ -805,6 +833,9 @@ def run():
                     except Exception as e:
                         print(f"vision: label resolve failed ({e})")
                         label, label_source = t["label"], "detector"
+                    # Which frame borders (if any) cut this object off - i.e.
+                    # we're only seeing PART of it, the rest is out of view.
+                    trunc_edges = edge_truncation(x, y, w, h, frame_w, frame_h)
                     objects_payload.append({
                         "id": tid,
                         "label": label,
@@ -819,6 +850,10 @@ def run():
                         "frame_height": frame_h,
                         "area_ratio": (w * h) / float(frame_w * frame_h),
                         "center_offset": (x + w // 2) - (frame_w // 2),
+                        # True when only part of the object is in frame (a
+                        # border cuts it off); trunc_edges says which sides.
+                        "truncated": bool(trunc_edges),
+                        "truncated_edges": trunc_edges,
                         "first_seen": t["first_seen"],
                         "last_seen": t["last_seen"],
                     })

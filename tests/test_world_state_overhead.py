@@ -54,5 +54,68 @@ class OverheadApproachTest(unittest.TestCase):
         self.assertIsNone(self.w._overhead_prev)
 
 
+class PersonFreshnessTest(unittest.TestCase):
+    """A recognized identity is held while the person stays visibly in frame,
+    even after their face turns away and stops refreshing the name."""
+    NOW = 10000.0
+
+    def _fresh(self, age, visible, name="Sam"):
+        person = {"name": name, "updated_at": self.NOW - age}
+        return ws.WorldState._person_freshness(person, visible, self.NOW)
+
+    def test_recent_identity_is_fresh(self):
+        self.assertEqual(self._fresh(5, True), (False, False))   # not stale, not held
+
+    def test_no_identity_yet_is_stale(self):
+        self.assertEqual(
+            ws.WorldState._person_freshness({"name": None, "updated_at": None},
+                                            True, self.NOW), (True, False))
+
+    def test_aged_but_visible_is_held(self):
+        # 20s since the last face read, but a person is still in frame.
+        self.assertEqual(self._fresh(20, True), (False, True))   # held
+
+    def test_aged_and_gone_is_stale(self):
+        # No person visible -> they actually left; drop the identity.
+        self.assertEqual(self._fresh(20, False), (True, False))
+
+    def test_hold_expires_after_window(self):
+        self.assertEqual(self._fresh(ws.PERSON_HOLD_SEC + 5, True), (True, False))
+
+    def test_no_name_is_never_held(self):
+        self.assertEqual(self._fresh(20, True, name=None), (True, False))
+
+
+class PersonHoldIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        self.w = ws.WorldState()
+
+    def _person(self):
+        return self.w.build_snapshot()["person"]
+
+    def _age_identity(self, seconds):
+        with self.w.lock:
+            self.w.state["person"]["updated_at"] -= seconds
+
+    def test_name_held_while_person_object_in_view(self):
+        self.w.on_person({"name": "Sam", "confidence": 0.9})
+        self.w.on_objects({"objects": [{"id": "object_1", "label": "person",
+                                        "area_ratio": 0.3, "center_offset": 0}]})
+        self._age_identity(20)   # face stopped refreshing 20s ago
+        p = self._person()
+        self.assertEqual(p["name"], "Sam")
+        self.assertFalse(p["stale"])   # held, not forgotten
+        self.assertTrue(p["held"])
+
+    def test_name_dropped_when_person_leaves(self):
+        self.w.on_person({"name": "Sam", "confidence": 0.9})
+        self.w.on_objects({"objects": [{"id": "object_1", "label": "chair",
+                                        "area_ratio": 0.2, "center_offset": 0}]})
+        self._age_identity(20)   # aged out, and no person is in view
+        p = self._person()
+        self.assertTrue(p["stale"])
+        self.assertFalse(p["held"])
+
+
 if __name__ == "__main__":
     unittest.main()

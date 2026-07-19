@@ -61,9 +61,10 @@ async function refreshObjects() {
     if (!objs.length) { wrap.innerHTML = '<div class="hint">no objects in view</div>'; return; }
     wrap.innerHTML = objs.map((o, i) => {
       const alt = o.alt_label ? `<span class="alt">or ${PX.esc(o.alt_label)}?</span>` : '';
+      const part = o.truncated ? `<span class="alt" title="only part of it is in frame">· partial</span>` : '';
       return `<div class="obj" data-id="${PX.esc(o.id)}" data-label="${PX.esc(o.label)}">
           <span class="lbl">${PX.esc(o.label)}</span>
-          <span class="conf">${(o.confidence * 100).toFixed(0)}%</span> ${alt}
+          <span class="conf">${(o.confidence * 100).toFixed(0)}%</span> ${alt} ${part}
           <input type="text" id="lbl-${i}" placeholder="actually a…" style="flex:1">
           <button onclick="teach(${i})">Teach</button>
         </div>`;

@@ -43,6 +43,15 @@ class ObjectsSnapshotTest(unittest.TestCase):
     def test_missing_objects_is_safe(self):
         self.assertEqual(web_console.objects_snapshot({}), [])
 
+    def test_truncated_flag_passes_through(self):
+        world = self._world([
+            {"id": "o1", "label": "person", "confidence": 0.8, "truncated": True},
+            {"id": "o2", "label": "mug", "confidence": 0.9},
+        ])
+        objs = web_console.objects_snapshot(world)
+        self.assertTrue(objs[0]["truncated"])
+        self.assertFalse(objs[1]["truncated"])
+
 
 class FactsSnapshotTest(unittest.TestCase):
     def setUp(self):
