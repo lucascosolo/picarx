@@ -68,6 +68,22 @@ def cosine(a, b):
     return dot / (na * nb)
 
 
+def _cosine_qn(a, b, nb):
+    """cosine(a, b) with the query norm nb precomputed by the caller.
+
+    match() compares one query against up to MAX_ENTRIES stored sigs; nb is
+    identical across that loop, so hoisting it out of cosine() drops ~1/3 of
+    the per-comparison work. The stored-entry norm na still has to be computed
+    per entry - merged entries aren't unit-length."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
 class LabelMemory:
     def __init__(self, path=DEFAULT_PATH, match_threshold=MATCH_THRESHOLD):
         self.path = path
@@ -140,10 +156,14 @@ class LabelMemory:
         sig = [float(x) for x in (sig or [])]
         if not sig:
             return None
+        # Query norm is loop-invariant across all entries - compute it once.
+        # (The query is L2-normalized at creation, so in practice this is ~1.0,
+        # but we don't assume that here.)
+        nb = math.sqrt(sum(y * y for y in sig))
         best = None
         with self.lock:
             for e in self.entries:
-                score = cosine(e["sig"], sig)
+                score = _cosine_qn(e["sig"], sig, nb)
                 if score >= self.match_threshold and (best is None or score > best[1]):
                     best = (e["label"], score, e["source"])
         return best
