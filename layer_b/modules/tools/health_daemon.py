@@ -161,6 +161,8 @@ class HealthDaemon:
         self.battery_critical = False
         self.battery_low = False          # battery-driven component (hysteresis)
         self.low_power = False            # combined published state
+        self.low_power_critical = False   # published critical sub-level (drives
+                                          # vision's face-throttle 1s->2s step)
         self.manual_latch = False         # LLM/manual low-power request
         self.use_adc = robot_config.get_bool("health", "battery_adc", False,
                                              env="HEALTH_BATTERY_ADC")
@@ -253,11 +255,25 @@ class HealthDaemon:
             manual = self.manual_latch
         self.battery_low = self._battery_low_now(voltage)
         active = self.battery_low or manual
-        if active == self.low_power:
+        with self.lock:
+            # Critical is only meaningful while we're actually curtailing; it's
+            # the safety daemon's own sub-threshold flag, surfaced so vision can
+            # step its face throttle 1s->2s.
+            critical = bool(self.battery_critical) and active
+        prev_active, prev_critical = self.low_power, self.low_power_critical
+        # Republish on a critical-level change too, not only on the active edge,
+        # so the deeper throttle actually reaches consumers within low power.
+        if active == prev_active and critical == prev_critical:
             return
         self.low_power = active
+        self.low_power_critical = critical
         reason = ("battery" if self.battery_low else "requested") if active else "recovered"
-        self.bus.publish(LOW_POWER_TOPIC, {"active": active, "reason": reason, "ts": now})
+        self.bus.publish(LOW_POWER_TOPIC, {"active": active, "critical": critical,
+                                           "reason": reason, "ts": now})
+        # Speak only on the active edge - a critical-only change is a silent
+        # deeper throttle, not a new announcement.
+        if active == prev_active:
+            return
         if active:
             print(f"Health daemon: ENTERING low power ({reason}, {voltage}V)")
             self.bus.publish(SPEAK_TOPIC, {

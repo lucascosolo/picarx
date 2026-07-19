@@ -141,9 +141,14 @@ DETECT_INTERVAL = 0.3          # base capture/face-check tick (was 0.2)
 OBJECT_DETECT_INTERVAL = 1.5   # candidate ticks for a fresh SSD pass (was 1.0)
 # Homeostatic self-preservation: when health_daemon signals low battery on
 # picarx/health/low_power, the expensive SSD/YOLO forward pass is throttled
-# way back (the cheap Haar face pass keeps running) to conserve power.
+# way back to conserve power. The Haar face pass - actually the single most
+# expensive per-tick op - is also backed off (gently, so faces are still
+# picked up reasonably promptly): to 1s in low power, and 2s once the battery
+# is critical. At full power it runs every DETECT_INTERVAL tick as before.
 LOW_POWER_TOPIC = "picarx/health/low_power"
 LOW_POWER_OBJECT_DETECT_INTERVAL = 15.0
+LOW_POWER_FACE_DETECT_INTERVAL = 1.0
+CRITICAL_FACE_DETECT_INTERVAL = 2.0
 
 FACE_CONFIRM_FRAMES = 3        # consecutive frames before reporting a face
 
@@ -616,10 +621,14 @@ def run():
 
     # Low-power curtailment (same mutable-dict-from-callback pattern as the
     # stream flag above): while active, the heavy SSD pass runs far less often.
-    low_power = {"active": False}
+    low_power = {"active": False, "critical": False}
     def on_low_power(payload):
         low_power["active"] = bool(payload.get("active", False))
-        print(f"vision: low-power {'ON - throttling object detection' if low_power['active'] else 'off'}")
+        low_power["critical"] = bool(payload.get("critical", False))
+        state = ("CRITICAL - throttling object + face detection" if low_power["critical"]
+                 else "ON - throttling object + face detection" if low_power["active"]
+                 else "off")
+        print(f"vision: low-power {state}")
     bus.subscribe(LOW_POWER_TOPIC, on_low_power)
 
     # On-board label memory (recognition tier 2): visual signatures of tracked
@@ -656,6 +665,7 @@ def run():
 
     face_streak = 0
     last_face_crop = 0.0
+    last_face_detect = 0.0
     last_object_detect = 0.0
     last_forced_detect = 0.0
     last_motion_thumb = None
@@ -672,45 +682,55 @@ def run():
         frame = picam2.capture_array()
         frame_h, frame_w = frame.shape[:2]
 
-        # ---------- face detection (debounced) ----------
+        # ---------- face detection (debounced; throttled in low power) ----------
+        # gray is computed every tick regardless - the object-detection motion
+        # check and the face crops both reuse it - but the expensive Haar pass
+        # itself backs off to 1s/2s while conserving power (see the FACE_DETECT
+        # interval constants).
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.2, minNeighbors=6,
-            minSize=(int(frame_w * 0.08), int(frame_h * 0.08)),
-        )
+        face_now = time.time()
+        face_interval = (CRITICAL_FACE_DETECT_INTERVAL if low_power["critical"]
+                         else LOW_POWER_FACE_DETECT_INTERVAL if low_power["active"]
+                         else 0.0)
+        if face_now - last_face_detect >= face_interval:
+            last_face_detect = face_now
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.2, minNeighbors=6,
+                minSize=(int(frame_w * 0.08), int(frame_h * 0.08)),
+            )
 
-        if len(faces) > 0:
-            face_streak += 1
-        else:
-            face_streak = 0
+            if len(faces) > 0:
+                face_streak += 1
+            else:
+                face_streak = 0
 
-        if face_streak >= FACE_CONFIRM_FRAMES:
-            x, y, w, h = max(faces.tolist(), key=lambda f: f[2])
-            bus.publish("picarx/vision/faces", {
-                "detected": True,
-                "x": x, "y": y, "w": w, "h": h,
-                "frame_width": frame_w,
-                "frame_center_offset": (x + w // 2) - (frame_w // 2),
-            })
-            # Face crop for person_memory (throttled - see FACE_CROP_*).
-            crop_now = time.time()
-            if crop_now - last_face_crop >= FACE_CROP_INTERVAL:
-                last_face_crop = crop_now
-                mx, my = int(w * FACE_CROP_MARGIN), int(h * FACE_CROP_MARGIN)
-                x1, y1 = max(0, x - mx), max(0, y - my)
-                x2, y2 = min(frame_w, x + w + mx), min(frame_h, y + h + my)
-                if x2 > x1 and y2 > y1:
-                    crop = cv2.resize(gray[y1:y2, x1:x2], FACE_CROP_SIZE)
-                    ok, buf = cv2.imencode(
-                        ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    if ok:
-                        bus.publish(FACE_CROP_TOPIC, {
-                            "jpeg": base64.b64encode(buf.tobytes()).decode("ascii"),
-                            "w": FACE_CROP_SIZE[0], "h": FACE_CROP_SIZE[1],
-                            "ts": crop_now,
-                        })
-        else:
-            bus.publish("picarx/vision/faces", {"detected": False})
+            if face_streak >= FACE_CONFIRM_FRAMES:
+                x, y, w, h = max(faces.tolist(), key=lambda f: f[2])
+                bus.publish("picarx/vision/faces", {
+                    "detected": True,
+                    "x": x, "y": y, "w": w, "h": h,
+                    "frame_width": frame_w,
+                    "frame_center_offset": (x + w // 2) - (frame_w // 2),
+                })
+                # Face crop for person_memory (throttled - see FACE_CROP_*).
+                crop_now = time.time()
+                if crop_now - last_face_crop >= FACE_CROP_INTERVAL:
+                    last_face_crop = crop_now
+                    mx, my = int(w * FACE_CROP_MARGIN), int(h * FACE_CROP_MARGIN)
+                    x1, y1 = max(0, x - mx), max(0, y - my)
+                    x2, y2 = min(frame_w, x + w + mx), min(frame_h, y + h + my)
+                    if x2 > x1 and y2 > y1:
+                        crop = cv2.resize(gray[y1:y2, x1:x2], FACE_CROP_SIZE)
+                        ok, buf = cv2.imencode(
+                            ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                        if ok:
+                            bus.publish(FACE_CROP_TOPIC, {
+                                "jpeg": base64.b64encode(buf.tobytes()).decode("ascii"),
+                                "w": FACE_CROP_SIZE[0], "h": FACE_CROP_SIZE[1],
+                                "ts": crop_now,
+                            })
+            else:
+                bus.publish("picarx/vision/faces", {"detected": False})
 
         # ---------- object detection (motion-gated + throttled) ----------
         now = time.time()
