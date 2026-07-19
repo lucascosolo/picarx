@@ -189,6 +189,57 @@ class PickIdleActsTest(unittest.TestCase):
         self.assertIn(("curious_tilt", "speak"), seen)
 
 
+class SubjectOffsetTest(unittest.TestCase):
+    def test_person_located_by_fresh_face(self):
+        w = _world(face={"detected": True, "frame_center_offset": 90,
+                         "frame_width": 640, "stale": False})
+        self.assertEqual(expressions._subject_offset(w, ("person", "Sam")), (90, 640))
+
+    def test_person_falls_back_to_person_object(self):
+        # No usable face, but a "person"-labelled object box is present.
+        w = _world(face={"detected": False, "stale": True},
+                   objects={"items": [{"label": "person", "center_offset": -50,
+                                       "frame_width": 640}],
+                            "close_object": False, "stale": False})
+        self.assertEqual(expressions._subject_offset(w, ("person", "Sam")), (-50, 640))
+
+    def test_object_located_by_label(self):
+        w = _world(objects={"items": [{"label": "guitar", "center_offset": 120,
+                                       "frame_width": 640}],
+                            "close_object": False, "stale": False})
+        self.assertEqual(expressions._subject_offset(w, ("object", "guitar")), (120, 640))
+
+    def test_lost_when_stale_or_absent(self):
+        gone = _world(objects={"items": [], "close_object": False, "stale": False})
+        self.assertIsNone(expressions._subject_offset(gone, ("object", "guitar")))
+        stale = _world(objects={"items": [{"label": "guitar", "center_offset": 10,
+                                           "frame_width": 640}],
+                                "close_object": False, "stale": True})
+        self.assertIsNone(expressions._subject_offset(stale, ("object", "guitar")))
+        self.assertIsNone(expressions._subject_offset(None, ("person", "Sam")))
+
+
+class AimPanTest(unittest.TestCase):
+    def test_pans_toward_the_subject(self):
+        # Subject well to the right -> pan increases (turns the head right).
+        self.assertGreater(expressions._aim_pan(0, 300, 640), 0)
+        # Subject to the left -> pan decreases.
+        self.assertLess(expressions._aim_pan(0, -300, 640), 0)
+
+    def test_deadband_holds_a_centred_subject(self):
+        self.assertEqual(expressions._aim_pan(25, 5, 640), 25)   # ~1.5% off centre
+
+    def test_step_is_capped(self):
+        # A subject at the frame edge still moves the head at most one capped step.
+        self.assertEqual(expressions._aim_pan(0, 320, 640), expressions.GAZE_MAX_STEP_DEG)
+
+    def test_pan_is_clamped_to_soft_limit(self):
+        self.assertLessEqual(expressions._aim_pan(60, 320, 640), expressions.GAZE_PAN_LIMIT)
+
+    def test_missing_frame_width_holds(self):
+        self.assertEqual(expressions._aim_pan(30, 300, None), 30)
+
+
 class DispatchTest(unittest.TestCase):
     def setUp(self):
         self.e = expressions.Expressions()   # FakeBus via harness
@@ -225,6 +276,45 @@ class DispatchTest(unittest.TestCase):
                           "tilt": expressions.CURIOUS_TILT})
         self.assertEqual(looks[-1]["action"]["pan"], 0)  # recentred
         self.assertEqual(looks[-1]["action"]["tilt"], 0)
+
+    def test_curious_tilt_holds_and_follows_identified_subject(self):
+        # A tracked object in view: cock, then follow it, then release to centre.
+        self.e.latest_world = _world(
+            objects={"items": [{"label": "guitar", "center_offset": 260,
+                                "frame_width": 640}],
+                     "close_object": False, "stale": False})
+        self.e._dispatch(
+            [{"tool": "curious_tilt", "pan_dir": 1, "track": ("object", "guitar")}],
+            1000.0, {})
+        actions = [m["action"] for m in self.e.bus.of(expressions.LOOK_TOPIC)]
+        self.assertEqual(actions[0], {"direction": "look",
+                                      "pan": expressions.CURIOUS_PAN,
+                                      "tilt": expressions.CURIOUS_TILT})   # the cock
+        # It tracks the subject: at least one aimed, level look toward it (right).
+        self.assertTrue(any(a["tilt"] == expressions.GAZE_TILT and a["pan"] > 0
+                            for a in actions[1:-1]))
+        self.assertEqual(actions[-1], {"direction": "look", "pan": 0, "tilt": 0})
+        self.assertGreater(len(actions), 2)                                # not just cock+recentre
+
+    def test_gaze_releases_when_subject_is_lost(self):
+        # Track requested but nothing matching is in view -> cock then recentre.
+        self.e.latest_world = _world()
+        self.e._dispatch(
+            [{"tool": "curious_tilt", "pan_dir": 1, "track": ("object", "guitar")}],
+            1000.0, {})
+        actions = [m["action"] for m in self.e.bus.of(expressions.LOOK_TOPIC)]
+        self.assertEqual(actions[0]["tilt"], expressions.CURIOUS_TILT)      # cock
+        self.assertEqual(actions[-1], {"direction": "look", "pan": 0, "tilt": 0})
+        self.assertEqual(len(actions), 2)                                  # no tracking looks
+
+    def test_gaze_yields_to_a_human_taking_over(self):
+        self.e.rc_active = True
+        self.e.latest_world = _world(
+            objects={"items": [{"label": "guitar", "center_offset": 260,
+                                "frame_width": 640}],
+                     "close_object": False, "stale": False})
+        self.e._hold_gaze(expressions.CURIOUS_PAN, ("object", "guitar"))
+        self.assertEqual(self.e.bus.of(expressions.LOOK_TOPIC), [])         # never grabbed the head
 
     def test_head_gesture_defers_to_another_module(self):
         # Someone else moved the head moments ago: skip head acts, still speak.

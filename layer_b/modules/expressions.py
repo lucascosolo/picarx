@@ -16,7 +16,10 @@ because they share ONE speaker and ONE camera head with the whole system:
 
   - speak         -> picarx/audio/speak   (plain, untagged speech)
   - look around   -> picarx/intent/look   (a short pan sweep, recentres)
-  - curious tilt  -> picarx/intent/look   (a head cock toward something new)
+  - curious tilt  -> picarx/intent/look   (a head cock toward something new;
+                                           for an IDENTIFIED subject it then
+                                           holds and follows it briefly instead
+                                           of snapping straight back to centre)
   - remember      -> picarx/memory/note   (reflection persists it as a fact)
 
 Two ways an expression fires:
@@ -86,7 +89,25 @@ LOOK_SWEEP_PANS = (-45, 0, 45, 0)   # a gentle look-around, ending centred
 LOOK_STEP_SEC = 0.6                 # dwell between sweep positions
 CURIOUS_PAN = 25                    # how far to cock the head toward a subject
 CURIOUS_TILT = 20                   # ...and up, the attentive "huh?" angle
-CURIOUS_HOLD_SEC = 2.0              # hold the cock before recentring
+CURIOUS_HOLD_SEC = 2.0              # hold the expressive cock before settling into a gaze
+
+# --- Gaze hold (keep watching an identified subject) ---
+# After the cock, an IDENTIFIED subject (a greeted person, a confidently
+# labelled object) is FOLLOWED for a short window rather than dropped by an
+# instant recentre - a hard snap to centre routinely threw the thing back out
+# of the narrow frame and lost track of it. The hold re-aims the head from each
+# fresh world snapshot so it tracks the subject as either of them moves, but it
+# is strictly bounded and deferential: it releases (recentres) the instant the
+# subject is lost, after GAZE_HOLD_STEPS re-aims, or if another module takes the
+# head / the robot moves / a human takes the wheel. A startled glance at a close
+# blob, or an idle look at nothing, still just recentres as before.
+GAZE_HOLD_STEPS = 10               # max re-aims before releasing the head
+GAZE_STEP_SEC = 0.5                # dwell between gaze re-aims
+GAZE_TILT = 0                      # look level at the subject while following (pan-only tracking)
+GAZE_DEADBAND_FRAC = 0.12          # don't twitch the head for a near-centred subject
+GAZE_PAN_GAIN_DEG = 28.0           # deg of pan per unit of normalised offset (~camera half-FOV)
+GAZE_MAX_STEP_DEG = 18             # cap one re-aim so the head eases rather than snaps
+GAZE_PAN_LIMIT = 65                # soft pan bound (the safety daemon clamps again at +-80)
 
 # Ambient musings: generic, non-factual, never claim anything about the world
 # (so they can't mislead or pollute memory). One is picked at random.
@@ -173,6 +194,48 @@ def _pan_dir(offset):
     return 0
 
 
+def _subject_offset(world, track):
+    """Where the tracked subject sits in the current frame, as
+    (center_offset_px, frame_width), or None if it can't be located right now
+    (gone, stale, or no position reported yet - the caller treats that as
+    "lost" and releases the head).
+
+    `track` is ("person", name) or ("object", label). A person is located by
+    the face box when the camera has a fresh one, falling back to a detected
+    "person"-labelled object; an object is located by its label."""
+    world = world or {}
+    kind, _key = track
+    if kind == "person":
+        face = world.get("face") or {}
+        if face.get("detected") and not face.get("stale") \
+                and face.get("frame_center_offset") is not None:
+            return face["frame_center_offset"], face.get("frame_width")
+        kind, _key = "object", "person"   # fall back to a person-shaped detection
+    if kind == "object":
+        objects = world.get("objects") or {}
+        if objects.get("stale"):
+            return None
+        for obj in objects.get("items") or []:
+            if obj.get("label") == _key and obj.get("center_offset") is not None:
+                return obj["center_offset"], obj.get("frame_width")
+    return None
+
+
+def _aim_pan(current_pan, offset_px, frame_width):
+    """Head pan (deg) that re-centres a subject currently `offset_px` right(+)/
+    left(-) of frame centre. Proportional with a dead-band (so a centred subject
+    doesn't jitter the head) and a per-step cap (so the head eases toward it
+    rather than snapping); clamped to a soft range - the safety daemon clamps
+    again to the servo's physical limits."""
+    if not frame_width:
+        return current_pan                       # no scale -> hold rather than guess
+    frac = offset_px / (frame_width / 2.0)        # -1 (left edge) .. +1 (right edge)
+    if abs(frac) < GAZE_DEADBAND_FRAC:
+        return current_pan
+    delta = max(-GAZE_MAX_STEP_DEG, min(GAZE_MAX_STEP_DEG, frac * GAZE_PAN_GAIN_DEG))
+    return int(max(-GAZE_PAN_LIMIT, min(GAZE_PAN_LIMIT, current_pan + delta)))
+
+
 def _first_novel_object(items, reacted_objects, now):
     """The first confident, UNAMBIGUOUS object whose label we haven't reacted
     to recently. Ambiguous sightings (alt_label set) are deliberately skipped -
@@ -214,7 +277,8 @@ def choose_context_acts(world, now, reacted_objects, greeted_people, rng):
         if last is None or (now - last) >= PERSON_GREET_TTL:
             face = world.get("face") or {}
             pan_dir = _pan_dir(face.get("frame_center_offset")) if not face.get("stale") else 0
-            acts.append({"tool": "curious_tilt", "pan_dir": pan_dir})
+            acts.append({"tool": "curious_tilt", "pan_dir": pan_dir,
+                         "track": ("person", name)})
             acts.append({"tool": "speak", "text": rng.choice(GREETINGS).format(name=name)})
             if last is None:   # first greeting this session -> worth keeping
                 acts.append({"tool": "remember", "subject": name,
@@ -234,7 +298,8 @@ def choose_context_acts(world, now, reacted_objects, greeted_people, rng):
         if obj is not None:
             label = obj["label"]
             acts.append({"tool": "curious_tilt",
-                         "pan_dir": _pan_dir(obj.get("center_offset"))})
+                         "pan_dir": _pan_dir(obj.get("center_offset")),
+                         "track": ("object", label)})
             acts.append({"tool": "speak",
                          "text": rng.choice(OBJECT_REMARKS).format(label=label)})
             acts.append({"tool": "remember", "subject": label,
@@ -369,7 +434,7 @@ class Expressions:
                 if tool == "look_around":
                     self._look_around()
                 else:
-                    self._curious_tilt(act.get("pan_dir", 0))
+                    self._curious_tilt(act.get("pan_dir", 0), act.get("track"))
 
     def _speak(self, text):
         self.bus.publish(SPEAK_TOPIC, {"text": text, "ts": time.time()})
@@ -390,19 +455,51 @@ class Expressions:
     def _look_around(self):
         self._spawn(lambda: self._sweep_worker(LOOK_SWEEP_PANS, SCAN_TILT))
 
-    def _curious_tilt(self, pan_dir):
+    def _curious_tilt(self, pan_dir, track=None):
         pan = CURIOUS_PAN * pan_dir
-        self._spawn(lambda: self._curious_worker(pan, CURIOUS_TILT))
+        self._spawn(lambda: self._curious_worker(pan, CURIOUS_TILT, track))
 
     def _sweep_worker(self, pans, tilt):
         for pan in pans:
             self._publish_look(pan, tilt)
             self._sleep(LOOK_STEP_SEC)
 
-    def _curious_worker(self, pan, tilt):
-        self._publish_look(pan, tilt)
+    def _curious_worker(self, pan, tilt, track=None):
+        self._publish_look(pan, tilt)       # the expressive "huh?" cock
         self._sleep(CURIOUS_HOLD_SEC)
-        self._publish_look(0, 0)   # always recentre the head
+        if track is not None:
+            self._hold_gaze(pan, track)     # then keep watching an identified subject
+        self._publish_look(0, 0)            # release: always recentre when done
+
+    def _hold_gaze(self, pan, track):
+        """Follow an identified subject for a bounded window after the cock, so a
+        hard recentre doesn't throw it out of the narrow frame. Re-aims from each
+        fresh world snapshot; stops the moment the subject is lost, another module
+        takes the head, or the robot starts moving / a human takes over. The
+        caller always recentres afterwards."""
+        for _ in range(GAZE_HOLD_STEPS):
+            if self._gaze_interrupted():
+                return
+            loc = _subject_offset(self._world_snapshot(), track)
+            if loc is None:
+                return                       # lost it -> stop holding
+            pan = _aim_pan(pan, loc[0], loc[1])
+            self._publish_look(pan, GAZE_TILT)
+            self._sleep(GAZE_STEP_SEC)
+
+    def _world_snapshot(self):
+        with self.lock:
+            return self.latest_world
+
+    def _gaze_interrupted(self):
+        """True if the gaze must yield the head right now: a human took the
+        wheel, another module moved the head, or the robot began driving."""
+        now = time.time()
+        with self.lock:
+            rc = self.rc_active
+            foreign = (now - self.last_foreign_look_at) < FOREIGN_LOOK_QUIET_SEC
+            world = self.latest_world
+        return rc or foreign or _is_moving(world, now)
 
     # ---------- main loop ----------
 
