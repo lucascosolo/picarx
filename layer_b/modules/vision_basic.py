@@ -665,6 +665,8 @@ def run():
     overhead_object = None # persists between ticks; last confirmed head-height mass geometry
     overhead_streak = 0    # consecutive SSD passes with an overhead-looking mass
     scene_motion = None    # last motion-thumb mean abs diff (for stuck detection downstream)
+    objects_payload = []   # rebuilt only on SSD passes (see below); cached and
+                           # republished on the intervening throttled ticks
 
     while True:
         frame = picam2.capture_array()
@@ -760,38 +762,47 @@ def run():
                             if now - ts > SIG_CACHE_TTL]:
                     del sig_cache[tid]
 
-        objects_payload = []
-        for tid, t in tracker.confirmed_tracks().items():
-            x, y, w, h = t["bbox"]
-            alt = contested_label(t.get("label_counts"))
-            # Recognition tiers 1->2: keep a confident detector label, but let
-            # the on-board memory relabel an UNCERTAIN one (see resolve_label).
-            # label_source tells consumers who decided: detector or memory.
-            sig_entry = sig_cache.get(tid)
-            try:
-                label, label_source, alt = label_memory.resolve_label(
-                    memory, sig_entry[0] if sig_entry else None,
-                    t["label"], t["confidence"], alt, LABEL_LOW_CONF)
-            except Exception as e:
-                print(f"vision: label resolve failed ({e})")
-                label, label_source = t["label"], "detector"
-            objects_payload.append({
-                "id": tid,
-                "label": label,
-                "label_source": label_source,   # "detector" | "memory"
-                # Runner-up label when the vote is genuinely split (else None),
-                # so downstream can ask a human to disambiguate this object.
-                # Cleared once memory resolves the object.
-                "alt_label": alt,
-                "confidence": t["confidence"],
-                "x": x, "y": y, "w": w, "h": h,
-                "frame_width": frame_w,
-                "frame_height": frame_h,
-                "area_ratio": (w * h) / float(frame_w * frame_h),
-                "center_offset": (x + w // 2) - (frame_w // 2),
-                "first_seen": t["first_seen"],
-                "last_seen": t["last_seen"],
-            })
+                # Rebuild the objects payload only here, on the SSD pass, when
+                # the tracker state actually changed. confirmed_tracks() is a
+                # pure filtered view - it never ages tracks on its own - so the
+                # confirmed set is identical between passes and the payload can
+                # be safely cached and republished on the intervening 0.3s
+                # ticks. This keeps the costly resolve_label/cosine match off
+                # the ~5 idle ticks per detection update.
+                objects_payload = []
+                for tid, t in tracker.confirmed_tracks().items():
+                    x, y, w, h = t["bbox"]
+                    alt = contested_label(t.get("label_counts"))
+                    # Recognition tiers 1->2: keep a confident detector label,
+                    # but let the on-board memory relabel an UNCERTAIN one (see
+                    # resolve_label). label_source tells consumers who decided:
+                    # detector or memory.
+                    sig_entry = sig_cache.get(tid)
+                    try:
+                        label, label_source, alt = label_memory.resolve_label(
+                            memory, sig_entry[0] if sig_entry else None,
+                            t["label"], t["confidence"], alt, LABEL_LOW_CONF)
+                    except Exception as e:
+                        print(f"vision: label resolve failed ({e})")
+                        label, label_source = t["label"], "detector"
+                    objects_payload.append({
+                        "id": tid,
+                        "label": label,
+                        "label_source": label_source,   # "detector" | "memory"
+                        # Runner-up label when the vote is genuinely split (else
+                        # None), so downstream can ask a human to disambiguate
+                        # this object. Cleared once memory resolves the object.
+                        "alt_label": alt,
+                        "confidence": t["confidence"],
+                        "x": x, "y": y, "w": w, "h": h,
+                        "frame_width": frame_w,
+                        "frame_height": frame_h,
+                        "area_ratio": (w * h) / float(frame_w * frame_h),
+                        "center_offset": (x + w // 2) - (frame_w // 2),
+                        "first_seen": t["first_seen"],
+                        "last_seen": t["last_seen"],
+                    })
+
         bus.publish("picarx/vision/objects", {
             "objects": objects_payload,
             "close_object": close_object,

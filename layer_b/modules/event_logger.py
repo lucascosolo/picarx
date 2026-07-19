@@ -85,10 +85,16 @@ class EventLogger:
         # timer run on different threads than __init__. All access is
         # serialized through self.db_lock, so this is safe.
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        # WAL + synchronous=NORMAL collapses the per-commit fsync cost on the
+        # movement hot path (action/result republishes up to ~10x/sec), cutting
+        # SD wear with no durability loss that matters for a telemetry log.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
 
         self.latest_world_state = None
         self.last_battery_critical = False
+        self._last_action_sig = None
 
     def _init_schema(self):
         with self.db_lock:
@@ -124,6 +130,17 @@ class EventLogger:
         self.log_event("picarx/audio/heard", payload)
 
     def on_action_result(self, payload):
+        # The arbiter re-sends the winning action every tick, so during steady
+        # cruising this fires ~10x/sec with an identical (action, status). Skip
+        # the duplicates: log only transitions and every veto. Downstream
+        # consumers (pattern_miner, reflection) want the transitions, not a
+        # sampled full history.
+        result = payload.get("result") or {}
+        status = result.get("status")
+        sig = (payload.get("action"), status)
+        if status != "vetoed" and sig == self._last_action_sig:
+            return
+        self._last_action_sig = sig
         self.log_event("picarx/action/result", payload)
 
     def on_coach_episode(self, payload):
