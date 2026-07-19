@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/tools_registry.py
+# layer_b/modules/tools_registry.py
 """
 Tools Registry (Layer B) - the pluggable, non-safety-critical ability
 layer.
@@ -27,7 +27,7 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import speech_match
 

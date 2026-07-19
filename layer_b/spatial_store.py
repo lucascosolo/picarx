@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/spatial_store.py
+# layer_b/spatial_store.py
 """
 Topological spatial memory - the robot's map of WHERE things happen,
 as opposed to WHAT it has learned (semantic.db) or the raw event
@@ -30,7 +30,9 @@ import os
 import sqlite3
 import time
 
-DB_DIR = "/home/picarx/layer_b/data"
+import robot_config
+
+DB_DIR = robot_config.data_path()
 DB_PATH = f"{DB_DIR}/spatial.db"
 
 # Two fingerprints at least this similar are the same place.

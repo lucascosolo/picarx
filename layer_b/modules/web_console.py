@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/web_console.py
+# layer_b/modules/web_console.py
 """
 Web Console (Layer B) - phone/laptop control panel for testing without
 shouting across a loud room.
@@ -51,8 +51,8 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
-sys.path.insert(0, "/home/picarx/layer_b/modules")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from broker_client import Bus
 import robot_config
 from spatial_store import SpatialStore
@@ -68,7 +68,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(robot_config.get("web_console", "port", 8088, env="WEB_CONSOLE_PORT"))
-WEB_UI_DIR = "/home/picarx/layer_b/web_ui"
+WEB_UI_DIR = robot_config.base_path("web_ui")
 LOG_LINES = 40
 
 # Page routes -> HTML file. Method disambiguates from the POST API endpoints

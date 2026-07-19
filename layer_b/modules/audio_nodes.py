@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/audio_nodes.py
+# layer_b/modules/audio_nodes.py
 """
 CPU footprint (Pi 4, running alongside vision_basic.py's SSD detector)
 -----------------------------------------------------------------------
@@ -66,7 +66,7 @@ os.environ.setdefault("OMP_NUM_THREADS", str(THREAD_LIMIT))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(THREAD_LIMIT))
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 import speech_match
@@ -130,7 +130,8 @@ except ImportError:
 # and the whole pipeline here are model-agnostic; only this path changes.
 MODEL_PATH = str(robot_config.get(
     "audio", "vosk_model_path",
-    "/home/picarx/layer_b/modules/models/model-en-lgraph", env="VOSK_MODEL_PATH"))
+    robot_config.base_path("modules", "models", "model-en-lgraph"),
+    env="VOSK_MODEL_PATH"))
 
 CHUNK_BYTES = 4000              # ~125ms per chunk at 16kHz/16-bit/mono
 

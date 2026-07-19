@@ -170,7 +170,14 @@ class KnobRegistryTest(unittest.TestCase):
     def test_registry_defaults_match_shipped_defaults(self):
         cfg = self._shipped()
         for k in robot_config.KNOBS:
-            self.assertEqual(cfg[k["section"]][k["key"]], k["default"],
+            shipped = cfg[k["section"]][k["key"]]
+            # A null in the shipped file means "fall through to the built-in
+            # default" (get() treats JSON null as unset) - used for path knobs
+            # whose default is derived from the install location and so can't be
+            # written as a fixed string here. Still an honest listing.
+            if shipped is None:
+                continue
+            self.assertEqual(shipped, k["default"],
                              f"{k['section']}.{k['key']} default disagrees")
 
     def test_every_env_knob_in_source_is_registered(self):

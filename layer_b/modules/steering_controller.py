@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/steering_controller.py
+# layer_b/modules/steering_controller.py
 """
 Ackermann-aware smooth steering controller (pure math, no I/O).
 
@@ -77,10 +77,11 @@ the constants of the discrete law it replaces, so behaviour degrades
 gracefully to familiar territory if the tuning is off.
 """
 import math
+import os
 import sys
 import time
 
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import robot_config
 
 

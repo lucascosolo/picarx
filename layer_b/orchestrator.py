@@ -6,8 +6,10 @@ import time
 import signal
 import sys
 
-REGISTRY_PATH = "/home/picarx/layer_b/module_registry.json"
-MODULES_DIR = "/home/picarx/layer_b/modules"
+import robot_config
+
+REGISTRY_PATH = robot_config.base_path("module_registry.json")
+MODULES_DIR = robot_config.base_path("modules")
 
 running_processes = {}
 # name -> mtime of its entrypoint file at the time it was (re)started

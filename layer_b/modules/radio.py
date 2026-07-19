@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/radio.py
+# layer_b/modules/radio.py
 """
 Radio (Layer B tool) - internet radio streaming through the existing
 speaker.
@@ -29,7 +29,7 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 from radio_browser import RadioBrowser
@@ -42,7 +42,7 @@ import tempfile
 import threading
 import time
 
-STATIONS_PATH = "/home/picarx/layer_b/data/radio_stations.json"
+STATIONS_PATH = robot_config.data_path("radio_stations.json")
 
 # Hardware honesty: there is no FM tuner on this robot, so a "dial"
 # (e.g. "98.7") is NOT a radio frequency being received - it's a label

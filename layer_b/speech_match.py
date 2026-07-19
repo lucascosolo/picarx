@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/speech_match.py
+# layer_b/speech_match.py
 """
 Shared voice-command normalization - the tolerance layer between what
 Vosk heard and what the rule tables expect.

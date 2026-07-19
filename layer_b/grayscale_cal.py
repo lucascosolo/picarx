@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/tools/grayscale_calibration.py
+# layer_b/tools/grayscale_calibration.py
 """
 Standalone grayscale sensor diagnostic.
 

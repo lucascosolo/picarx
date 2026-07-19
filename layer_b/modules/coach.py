@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/coach.py
+# layer_b/modules/coach.py
 """
 LLM Coach (Layer B) - advises the onboard AI on novel situations and
 fail states, and remembers what actually worked.
@@ -75,7 +75,7 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 from semantic_store import SemanticStore
@@ -88,7 +88,7 @@ import time
 import threading
 import queue
 
-DATA_DIR = "/home/picarx/layer_b/data"
+DATA_DIR = robot_config.data_path()
 COACH_POLICY_PATH = f"{DATA_DIR}/coach_policy.json"
 
 MIN_ARMS_BEFORE_EXPLOIT = 2   # always ask the LLM until a situation has this many tried arms

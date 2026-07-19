@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/event_logger.py
+# layer_b/modules/event_logger.py
 """
 Episodic Event Logger (Layer B).
 
@@ -61,15 +61,16 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 
 import sqlite3
 import json
 import time
 import threading
 
-DB_DIR = "/home/picarx/layer_b/data"
+DB_DIR = robot_config.data_path()
 DB_PATH = f"{DB_DIR}/events.db"
 
 SNAPSHOT_INTERVAL = 15.0  # seconds between routine world-state log rows

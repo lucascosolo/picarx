@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/module_loader.py
+# layer_b/module_loader.py
 """
 Dynamic module loader. New capabilities are added by dropping a file
 in modules/ and adding an entry to module_registry.json - no core
@@ -10,8 +10,10 @@ import json
 import importlib.util
 import os
 
-REGISTRY_PATH = "/home/picarx/layer_b/module_registry.json"
-MODULES_DIR = "/home/picarx/layer_b/modules"
+import robot_config
+
+REGISTRY_PATH = robot_config.base_path("module_registry.json")
+MODULES_DIR = robot_config.base_path("modules")
 
 def load_registry():
   with open(REGISTRY_PATH) as f:

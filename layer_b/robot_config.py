@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/robot_config.py
+# layer_b/robot_config.py
 """
 Central tunables for Layer B: one JSON file, every knob visible.
 
@@ -43,6 +43,26 @@ CONFIG_PATH = os.environ.get(
     "LAYER_B_CONFIG",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
 
+# The directory THIS file lives in is the Layer B install root (the layer_b/
+# tree), wherever the repo happens to be checked out. Everything derives its
+# paths from here instead of hard-coding an absolute location, so the whole
+# tree can be relocated just by moving it. Set LAYER_B_HOME to override (for a
+# symlinked install, or code and data deliberately split apart).
+BASE_DIR = os.environ.get("LAYER_B_HOME") or os.path.dirname(
+    os.path.abspath(__file__))
+
+
+def base_path(*parts):
+    """Absolute path to something inside the Layer B tree, wherever it lives:
+    base_path('modules', 'models') -> <install root>/modules/models."""
+    return os.path.join(BASE_DIR, *parts)
+
+
+def data_path(*parts):
+    """Absolute path inside the on-robot data dir (layer_b/data/, gitignored)."""
+    return os.path.join(BASE_DIR, "data", *parts)
+
+
 _cache = None
 
 
@@ -73,7 +93,7 @@ KNOBS = [
      "default": "robot_hat enable_speaker", "env": "SPEAKER_ENABLE_CMD",
      "desc": "Shell command run to power the speaker amp before speaking."},
     {"section": "audio", "key": "vosk_model_path", "type": "str",
-     "default": "/home/picarx/layer_b/modules/models/model-en-lgraph",
+     "default": base_path("modules", "models", "model-en-lgraph"),
      "env": "VOSK_MODEL_PATH", "desc": "Path to the Vosk speech-to-text model."},
     {"section": "audio", "key": "debug_levels", "type": "bool",
      "default": False, "env": "AUDIO_DEBUG_LEVELS",
@@ -149,10 +169,10 @@ KNOBS = [
              "(leave off normally - it contends on the I2C bus)."},
     # ---- embeddings (embedding_util.py) ----
     {"section": "embeddings", "key": "model_path", "type": "str",
-     "default": "/home/picarx/layer_b/data/models/minilm/model.onnx",
+     "default": data_path("models", "minilm", "model.onnx"),
      "env": "EMBED_MODEL_PATH", "desc": "Path to the MiniLM ONNX embedding model."},
     {"section": "embeddings", "key": "tokenizer_path", "type": "str",
-     "default": "/home/picarx/layer_b/data/models/minilm/tokenizer.json",
+     "default": data_path("models", "minilm", "tokenizer.json"),
      "env": "EMBED_TOKENIZER_PATH", "desc": "Path to the embedding model's tokenizer."},
     # ---- kinematics (steering_controller.py) - file-only ----
     {"section": "kinematics", "key": "wheelbase_mm", "type": "int",

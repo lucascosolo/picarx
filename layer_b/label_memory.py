@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/label_memory.py
+# layer_b/label_memory.py
 """
 On-board visual label memory - the middle tier of object recognition,
 between the fixed-vocabulary detector and the cloud LLM.
@@ -37,7 +37,9 @@ import os
 import threading
 import time
 
-DEFAULT_PATH = "/home/picarx/layer_b/data/label_memory.json"
+import robot_config
+
+DEFAULT_PATH = robot_config.data_path("label_memory.json")
 
 # Cosine similarity a candidate signature must reach to adopt a remembered
 # label. High on purpose: a wrong confident relabel is worse than falling

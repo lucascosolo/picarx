@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/person_memory.py
+# layer_b/modules/person_memory.py
 """
 Person memory (Layer B) - learning WHO people are, so the robot can tell
 two people apart and greet them by name.
@@ -49,8 +49,9 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 
 import base64
 import json
@@ -58,7 +59,7 @@ import re
 import threading
 import time
 
-PEOPLE_DIR = "/home/picarx/layer_b/data/people"
+PEOPLE_DIR = robot_config.data_path("people")
 PEOPLE_JSON = f"{PEOPLE_DIR}/people.json"
 
 FACE_CROP_TOPIC = "picarx/vision/face_crop"

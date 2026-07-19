@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/vision_basic.py
+# layer_b/modules/vision_basic.py
 """
 Vision module (Layer B) - publishes face detection and tracked/labeled
 object data to MQTT.
@@ -124,8 +124,9 @@ os.environ.setdefault("OMP_NUM_THREADS", str(THREAD_LIMIT))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(THREAD_LIMIT))
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 import label_memory
 from picamera2 import Picamera2
 import base64
@@ -322,7 +323,7 @@ STREAM_FRAME_TOPIC = "picarx/vision/frame"
 STREAM_MIN_INTERVAL = 0.2       # cap publish rate (~5 fps ceiling; loop tick bounds it lower)
 STREAM_JPEG_QUALITY = 60        # small over MQTT/base64; a debug view doesn't need more
 
-MODEL_DIR = "/home/picarx/layer_b/modules/models/mobilenet_ssd"
+MODEL_DIR = robot_config.base_path("modules", "models", "mobilenet_ssd")
 SSD_PROTOTXT = f"{MODEL_DIR}/deploy.prototxt"
 SSD_WEIGHTS = f"{MODEL_DIR}/mobilenet_iter_73000.caffemodel"
 SSD_INPUT_SIZE = (300, 300)
@@ -349,7 +350,7 @@ VOC_CLASSES = [
 # motion gate + FORCE_DETECT_INTERVAL already keep passes rare, and the
 # per-pass budget is the right place to spend for 4x the vocabulary.
 # Fail-soft: files missing or cv2 too old -> the VOC model runs as before.
-YOLO_DIR = "/home/picarx/layer_b/modules/models/yolov4-tiny"
+YOLO_DIR = robot_config.base_path("modules", "models", "yolov4-tiny")
 YOLO_CFG = f"{YOLO_DIR}/yolov4-tiny.cfg"
 YOLO_WEIGHTS = f"{YOLO_DIR}/yolov4-tiny.weights"
 YOLO_NAMES = f"{YOLO_DIR}/coco.names"
@@ -633,7 +634,7 @@ def run():
     time.sleep(1)
 
     face_cascade = cv2.CascadeClassifier(
-        "/home/picarx/layer_b/modules/cascades/cascades.xml"
+        robot_config.base_path("modules", "cascades", "cascades.xml")
     )
     detector = _make_detector()
     tracker = CentroidTracker()

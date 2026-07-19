@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/goal_manager.py
+# layer_b/modules/goal_manager.py
 """
 Goal Manager (Layer B) - gives exploration a direction without ever
 touching the wheels.
@@ -31,8 +31,9 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 from spatial_store import SpatialStore
 
 import json
@@ -40,7 +41,7 @@ import time
 import threading
 import uuid
 
-STATE_PATH = "/home/picarx/layer_b/data/goal_state.json"
+STATE_PATH = robot_config.data_path("goal_state.json")
 GOAL_DEADLINE_SEC = 300.0     # give up on a subgoal after this long
 MAX_GOAL_FAILURES = 3         # abandoned this often -> marked unreachable
 CHECK_INTERVAL = 15.0

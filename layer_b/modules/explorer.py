@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/explorer.py
+# layer_b/modules/explorer.py
 """
 Curiosity Explorer (Layer B) - scores how well the robot understands
 each place it knows about, and tells the rest of the system where its
@@ -29,8 +29,9 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 from spatial_store import SpatialStore
 
 import json
@@ -38,7 +39,7 @@ import time
 import threading
 
 UPDATE_INTERVAL = 60.0
-MAP_JSON_PATH = "/home/picarx/layer_b/data/uncertainty_map.json"
+MAP_JSON_PATH = robot_config.data_path("uncertainty_map.json")
 PUBLISH_DELTA = 0.05      # min score movement (any location) worth republishing
 
 STALE_FULL_HOURS = 6.0    # not visited for this long -> full staleness

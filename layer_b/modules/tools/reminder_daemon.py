@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/tools/reminder_daemon.py
+# layer_b/modules/tools/reminder_daemon.py
 """
 Reminder daemon (Layer B tool) - time-aware reminders.
 
@@ -26,8 +26,9 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from broker_client import Bus
+import robot_config
 
 import json
 import threading
@@ -39,7 +40,7 @@ SET_TOPIC = "picarx/tools/reminder/set"
 STATE_TOPIC = "picarx/tools/reminder/state"
 SPEAK_TOPIC = "picarx/audio/speak"
 
-DATA_DIR = "/home/picarx/layer_b/data"
+DATA_DIR = robot_config.data_path()
 REMINDERS_PATH = f"{DATA_DIR}/reminders.json"
 
 MAX_PENDING = 50            # ignore new sets past this, so a runaway can't pile up timers

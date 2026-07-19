@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/semantic_store.py
+# layer_b/semantic_store.py
 """
 Semantic memory store - durable facts the robot has learned about its
 world ("the corner with the tvmonitor causes repeated vetoes", "a
@@ -33,7 +33,9 @@ import os
 import sqlite3
 import time
 
-DB_DIR = "/home/picarx/layer_b/data"
+import robot_config
+
+DB_DIR = robot_config.data_path()
 DB_PATH = f"{DB_DIR}/semantic.db"
 
 # Passive time-decay, applied at READ time only (never written back):

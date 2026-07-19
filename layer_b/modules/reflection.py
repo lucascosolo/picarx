@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/reflection.py
+# layer_b/modules/reflection.py
 """
 Idle reflection (Layer B) - turns the day's raw episodic events into a
 few durable semantic facts, using ONE batched LLM call per reflection
@@ -37,7 +37,7 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 from semantic_store import SemanticStore
@@ -49,10 +49,10 @@ import sqlite3
 import time
 import threading
 
-EVENTS_DB_PATH = "/home/picarx/layer_b/data/events.db"
+EVENTS_DB_PATH = robot_config.data_path("events.db")
 # Coach's learned bandit policy (arm win/loss records). Read-only here -
 # coach.py is its sole writer; we only aggregate it into a self-model.
-COACH_POLICY_PATH = "/home/picarx/layer_b/data/coach_policy.json"
+COACH_POLICY_PATH = robot_config.data_path("coach_policy.json")
 
 # Self-model thresholds: how much evidence before a tendency is worth
 # stating in the first person. Kept conservative so the robot doesn't

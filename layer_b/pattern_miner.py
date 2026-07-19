@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/pattern_miner.py
+# layer_b/pattern_miner.py
 """
 Temporal pattern mining over events.db - pure Python, no LLM call.
 
@@ -129,6 +129,7 @@ def mine_patterns(events_db_path):
 if __name__ == "__main__":
     # Inspect what the miner currently sees, without writing anything.
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "/home/picarx/layer_b/data/events.db"
+    import robot_config
+    path = sys.argv[1] if len(sys.argv) > 1 else robot_config.data_path("events.db")
     for p in mine_patterns(path):
         print(f"[{p['confidence']:.2f} x{p['frequency']}] {p['condition']} -> {p['outcome']}")

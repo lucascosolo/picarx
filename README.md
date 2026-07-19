@@ -192,8 +192,10 @@ ultrasonic range finder, and grayscale line/cliff sensors. Vision uses
 `picamera2` + OpenCV; speech uses Vosk (STT) and eSpeak/MBROLA (TTS). Internet
 radio needs `mpv` (optional).
 
-> The deployed code uses absolute `/home/picarx/...` paths — it expects to live
-> there on the Pi. For development and tests it runs from anywhere (see below).
+> The code resolves its own paths relative to the `layer_b/` directory it lives
+> in, so the tree can be checked out or deployed anywhere — no fixed install
+> location. Set `LAYER_B_HOME` to override the root (e.g. a symlinked install, or
+> code and data deliberately split apart).
 
 ---
 

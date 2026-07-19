@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/radio_browser.py
+# layer_b/radio_browser.py
 """
 Minimal client for the free radio-browser.info station directory,
 following their API guidelines (https://api.radio-browser.info):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/embedding_util.py
+# layer_b/embedding_util.py
 """
 Optional text-embedding helper for semantic situation matching in
 coach.py.
@@ -29,10 +29,12 @@ import robot_config
 
 EMBED_MODEL_PATH = str(robot_config.get(
     "embeddings", "model_path",
-    "/home/picarx/layer_b/data/models/minilm/model.onnx", env="EMBED_MODEL_PATH"))
+    robot_config.data_path("models", "minilm", "model.onnx"),
+    env="EMBED_MODEL_PATH"))
 EMBED_TOKENIZER_PATH = str(robot_config.get(
     "embeddings", "tokenizer_path",
-    "/home/picarx/layer_b/data/models/minilm/tokenizer.json", env="EMBED_TOKENIZER_PATH"))
+    robot_config.data_path("models", "minilm", "tokenizer.json"),
+    env="EMBED_TOKENIZER_PATH"))
 
 
 class Embedder:

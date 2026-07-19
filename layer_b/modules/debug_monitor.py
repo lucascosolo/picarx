@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/debug_monitor.py
+# layer_b/modules/debug_monitor.py
 """
 Debug Monitor (Layer B) - always-on resource/telemetry logger.
 
@@ -52,10 +52,11 @@ import subprocess
 import threading
 from collections import deque
 
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 
-DATA_DIR = "/home/picarx/layer_b/data"
+DATA_DIR = robot_config.data_path()
 LOG_PATH = f"{DATA_DIR}/resource_log.jsonl"
 MAX_LOG_BYTES = 5 * 1024 * 1024   # self-truncate past this size, keep the newer half
 

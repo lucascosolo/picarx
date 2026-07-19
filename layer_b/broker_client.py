@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/broker_client.py
+# layer_b/broker_client.py
 """Shared MQTT bus wrapper used by Layer B modules."""
 import paho.mqtt.client as mqtt
 import json

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/safety/safety_daemon.py
+# safety/safety_daemon.py
 """
 Hardcoded physical safety layer for PicarX.
 

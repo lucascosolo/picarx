@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/companion.py
+# layer_b/modules/companion.py
 """
 Companion (Layer B) - natural conversation fallback.
 
@@ -62,7 +62,7 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 from semantic_store import SemanticStore
@@ -81,7 +81,7 @@ WORKER_THREADS = 2
 REPLY_TIMEOUT = 8.0
 REPLY_MAX_TOKENS = 150
 
-DATA_DIR = "/home/picarx/layer_b/data"
+DATA_DIR = robot_config.data_path()
 COMPANION_MEMORY_PATH = f"{DATA_DIR}/companion_memory.json"
 MEMORY_STALE_GAP = 1800      # seconds of silence before a gap is worth mentioning to the model
 

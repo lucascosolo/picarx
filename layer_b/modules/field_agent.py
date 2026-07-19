@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# /home/picarx/layer_b/modules/field_agent.py
+# layer_b/modules/field_agent.py
 """
 Field Agent (Layer B) - integration test harness / onboard brain.
 
@@ -97,8 +97,9 @@ import getpass
 os.getlogin = getpass.getuser
 
 import sys
-sys.path.insert(0, "/home/picarx/layer_b")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+import robot_config
 from spatial_store import SpatialStore
 import person_memory
 import speech_match
@@ -125,7 +126,7 @@ SOURCE_NAME = "field_agent"
 
 # Must match event_logger.py's DB_PATH - this module only ever opens
 # it read-only and never writes.
-DB_PATH = "/home/picarx/layer_b/data/events.db"
+DB_PATH = robot_config.data_path("events.db")
 
 EXPLORE_PRIORITY = 5
 EXPLORE_TICK_HZ = 5
