@@ -104,9 +104,13 @@ class Curiosity:
 
     # ---------- speaking ----------
 
-    def _say(self, text, kind="observation", label=None):
-        self.bus.publish(SPEAK_TOPIC, {"text": text, "ts": time.time(),
-                                       "kind": kind, "label": label})
+    def _say(self, text, kind=None, label=None, object_id=None):
+        msg = {"text": text, "ts": time.time()}
+        if kind:                       # tag a relabelable claim; plain speech otherwise
+            msg["kind"] = kind
+            if label is not None:
+                msg["objects"] = [{"label": label, "id": object_id}]
+        self.bus.publish(SPEAK_TOPIC, msg)
 
     # ---------- uncertainty detection ----------
 
@@ -177,7 +181,7 @@ class Curiosity:
                             "options": options, "until": now + ANSWER_WINDOW_SEC}
             self.last_ask_at = now
         print(f"Curiosity: asking about {target['id']} - '{text}'")
-        self._say(text, kind="question", label=guess)
+        self._say(text, kind="question", label=guess, object_id=target["id"])
 
     # ---------- answer capture ----------
 

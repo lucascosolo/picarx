@@ -498,7 +498,10 @@ def on_speak(p):
     # command-interpretation feedback (see the console's renderLog / /label).
     obs = None
     if p.get("kind") in ("observation", "question"):
-        obs = {"kind": p["kind"], "label": p.get("label"),
+        items = p.get("objects")
+        if not items and p.get("label"):
+            items = [{"label": p["label"], "id": None}]
+        obs = {"kind": p["kind"], "items": items or [],
                "subject": p.get("subject")}
     STATE.add_log("robot", p["text"], obs=obs)
 

@@ -15,6 +15,7 @@ import harness  # noqa: E402
 import vision_basic  # noqa: E402
 import curiosity  # noqa: E402
 import companion  # noqa: E402
+import field_agent  # noqa: E402
 import reflection  # noqa: E402
 import web_console  # noqa: E402
 from semantic_store import SemanticStore  # noqa: E402
@@ -276,6 +277,31 @@ class CompanionIdentifyTest(unittest.TestCase):
         self.assertIsNone(c.bus.last("picarx/perception/label"))
 
 
+class FieldAgentAnnounceTaggingTest(unittest.TestCase):
+    def setUp(self):
+        self.fa = field_agent.FieldAgent()
+
+    def test_single_object_claim_is_tagged_with_id(self):
+        # The reported bug: a mid-evasion "a sofa is closing in" must carry the
+        # object so its X asks WHAT it is (and can retrain memory by id).
+        self.fa.announce("A sofa is closing in, backing away.",
+                         kind="observation", label="sofa", object_id="object_2")
+        msg = self.fa.bus.last("picarx/audio/speak")
+        self.assertEqual(msg["kind"], "observation")
+        self.assertEqual(msg["objects"], [{"label": "sofa", "id": "object_2"}])
+
+    def test_multi_object_claim_lists_each(self):
+        self.fa.announce("I see 2: a chair, a bottle.", force=True,
+                         kind="observation",
+                         objects=[{"label": "chair", "id": "object_1"},
+                                  {"label": "bottle", "id": "object_2"}])
+        self.assertEqual(len(self.fa.bus.last("picarx/audio/speak")["objects"]), 2)
+
+    def test_plain_announcement_carries_no_object_tag(self):
+        self.fa.announce("Stopping.", force=True)
+        self.assertNotIn("objects", self.fa.bus.last("picarx/audio/speak"))
+
+
 class ConsoleObservationFeedbackTest(unittest.TestCase):
     def setUp(self):
         self.state = web_console.ConsoleState()
@@ -284,12 +310,13 @@ class ConsoleObservationFeedbackTest(unittest.TestCase):
         prev = web_console.STATE
         web_console.STATE = self.state
         try:
-            web_console.on_speak({"text": "looks like a chair",
-                                  "kind": "observation", "label": "chair"})
+            web_console.on_speak({"text": "looks like a chair", "kind": "observation",
+                                  "objects": [{"label": "chair", "id": "object_3"}]})
         finally:
             web_console.STATE = prev
         entry = self.state.log[0]
-        self.assertEqual(entry["obs"]["label"], "chair")
+        self.assertEqual(entry["obs"]["items"][0]["label"], "chair")
+        self.assertEqual(entry["obs"]["items"][0]["id"], "object_3")
         self.assertEqual(entry["obs"]["kind"], "observation")
 
     def test_plain_robot_line_has_no_obs_tag(self):

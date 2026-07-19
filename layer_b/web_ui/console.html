@@ -356,13 +356,21 @@ document.getElementById('log').addEventListener('click', async ev => {
   const obsBtn = ev.target.closest('button[data-obs]');
   if (obsBtn) {
     const e = logEntries[+obsBtn.dataset.idx];
-    const guess = (e.obs && e.obs.label) || '';
+    const items = (e.obs && e.obs.items) || [];
+    // Which object is this about? One -> that one. Several -> ask which.
+    let item = items[0] || {label: e.obs && e.obs.subject || '', id: null};
+    if (obsBtn.dataset.obs === 'no' && items.length > 1) {
+      const which = (prompt('Which did I get wrong? ' +
+        items.map(o => o.label).join(', ')) || '').trim().toLowerCase();
+      item = items.find(o => (o.label || '').toLowerCase() === which) || item;
+    }
+    const guess = item.label || '';
     let label = guess;
     if (obsBtn.dataset.obs === 'no') {
       label = (prompt('What is it actually?') || '').trim();
       if (!label) return;
     }
-    await post('/label', {label, guess, response: e.text});
+    await post('/label', {label, guess, object_id: item.id, response: e.text});
     poll();
     return;
   }
@@ -389,7 +397,7 @@ function renderLog(entries) {
     if (e.kind === 'robot') {
       if (e.fb) {
         fb = `<span class="fb ${e.fb}">${e.fb === 'correct' ? '✓' : '✗'}</span>`;
-      } else if (e.obs) {
+      } else if (e.obs && ((e.obs.items && e.obs.items.length) || e.obs.subject)) {
         // Identification line: grade the ID (right thing / wrong - relabel).
         fb = `<button class="fbbtn ok" data-obs="yes" data-idx="${i}" title="right - that's what it is">✓</button>` +
              `<button class="fbbtn bad" data-obs="no" data-idx="${i}" title="wrong - tell me what it is">✗</button>`;

@@ -376,7 +376,8 @@ def _vision_obstacle(snapshot):
             best = obj
     if best is None:
         return None
-    return {"label": best.get("label", "something"), "area_ratio": best.get("area_ratio", 0),
+    return {"label": best.get("label", "something"), "id": best.get("id"),
+            "area_ratio": best.get("area_ratio", 0),
             "overhead": False, "approaching": True,
             # Which side the object sits on, so the escape can swing AWAY
             # from it instead of picking a side blind (see evade_away_hint).
@@ -871,7 +872,8 @@ class FieldAgent:
 
     # ---------- outbound: speech ----------
 
-    def announce(self, text, force=False, kind=None, label=None, subject=None):
+    def announce(self, text, force=False, kind=None, label=None, subject=None,
+                 object_id=None, objects=None):
         now = time.time()
         if not force and (now - self.last_announcement_at) < MIN_ANNOUNCEMENT_GAP:
             print(f"(suppressed, too soon after last remark): {text}")
@@ -881,13 +883,19 @@ class FieldAgent:
         # ts lets audio_nodes drop announcements that sat in the playback
         # queue too long - narrating a decision from 20 seconds ago while
         # already doing something else is worse than staying quiet.
-        # kind/label tag identification remarks so the web console can offer
-        # an ID-correction affordance (see web_console.on_speak).
+        # kind + the named object(s) tag identification remarks so the web
+        # console offers an ID-correction affordance per object (relabel ->
+        # trains the on-board memory by id), not the command-interpretation
+        # feedback. objects is a list of {label, id}; a single label/object_id
+        # is the common one-object case. See web_console.on_speak.
         msg = {"text": text, "ts": now}
         if kind:
             msg["kind"] = kind
-            msg["label"] = label
             msg["subject"] = subject
+            if objects is not None:
+                msg["objects"] = objects
+            elif label is not None:
+                msg["objects"] = [{"label": label, "id": object_id}]
         self.bus.publish("picarx/audio/speak", msg)
 
     # ---------- inbound: world state ----------
@@ -1483,7 +1491,11 @@ class FieldAgent:
         # robot usually finds one of these, when it actually knows.
         for label, place in list(known_places.items())[:2]:
             speech += f". I usually see a {label} at {place}"
-        self.announce(speech + ".", force=True)
+        # Every named object gets its own relabel target (the console asks
+        # which one is wrong, then what it is).
+        named = [{"label": o.get("label", "something"), "id": o.get("id")}
+                 for o in items]
+        self.announce(speech + ".", force=True, kind="observation", objects=named)
 
     def report_map(self):
         """Spoken summary of the spatial map: where am I, how much of
@@ -1740,7 +1752,7 @@ class FieldAgent:
     def _on_novel_object(self, obj):
         label = obj.get("label", "something")
         self.announce(f"I see something new - looks like a {label}.",
-                      kind="observation", label=label)
+                      kind="observation", label=label, object_id=obj.get("id"))
         # Only consult the coach about how to react to a new object while
         # we're actually exploring - a novelty maneuver is pointless (and
         # a wasted LLM/bandit call) when parked and awaiting commands.
@@ -2183,7 +2195,11 @@ class FieldAgent:
         if self.scan_is_startup:
             seen = sorted({label for s in self.scan_sightings for label in s["labels"]})
             if seen:
-                self.announce(f"I looked around and I can see: {', '.join(seen)}. Off I go.", force=True)
+                # No track ids from a head-scan sighting, so a relabel here
+                # teaches the fact but not the visual memory (no id to key on).
+                self.announce(f"I looked around and I can see: {', '.join(seen)}. Off I go.",
+                              force=True, kind="observation",
+                              objects=[{"label": lbl, "id": None} for lbl in seen])
             else:
                 self.announce("I looked around but didn't recognize anything. Exploring anyway.", force=True)
 
@@ -2356,7 +2372,12 @@ class FieldAgent:
                 if label == "something":
                     self.announce("Something's right in front of me, backing away.")
                 else:
-                    self.announce(f"A {label} is closing in, backing away.")
+                    # An identity claim mid-evasion ("a sofa is closing in") is
+                    # exactly what gets a foot mislabeled - tag it so its X asks
+                    # WHAT it is, not what I did wrong.
+                    self.announce(f"A {label} is closing in, backing away.",
+                                  kind="observation", label=label,
+                                  object_id=vision_obstacle.get("id"))
                 # If we saw which side it's on, escape AWAY from that side
                 # (same sign convention as _escape_angle_from_scan) instead
                 # of leaving it to scan memory or a coin flip. Only trust a

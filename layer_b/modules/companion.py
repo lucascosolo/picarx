@@ -923,11 +923,13 @@ class Companion:
         self.bus.publish(PERCEPTION_LABEL_TOPIC, {
             "correct_label": label, "guess": guess, "object_id": object_id,
             "origin": "llm", "ts": time.time()})
-        # Tagged observation: the user hears the robot's own conclusion and
-        # can still correct it from the console (which retrains the memory).
+        # Tagged observation carrying the object id: the user hears the robot's
+        # own conclusion and can correct it from the console, which retrains
+        # the on-board memory by that id.
         self.bus.publish("picarx/audio/speak", {
             "text": f"I think that's a {label}.", "ts": time.time(),
-            "kind": "observation", "label": label})
+            "kind": "observation",
+            "objects": [{"label": label, "id": object_id}]})
 
     # ---------- autobiographical memory readback ----------
 
