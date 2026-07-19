@@ -424,31 +424,29 @@ def facts_snapshot(query=None, limit=25):
     return {"facts": facts, "count": count}
 
 
-def _config_help():
-    """Parse config.json's `_readme` lines of the form 'section.key: text'
-    into a {'section.key': 'text'} help map for inline tooltips. Lines that
-    aren't knob docs (the general notes at the top) are ignored."""
-    help_map = {}
-    for line in (robot_config.all_config().get("_readme") or []):
-        if not isinstance(line, str) or ":" not in line:
-            continue
-        head, _, desc = line.partition(":")
-        head = head.strip()
-        # A knob doc looks like 'audio.espeak_voice'; a general note doesn't.
-        if head.count(".") == 1 and " " not in head and desc.strip():
-            help_map[head] = desc.strip()
-    return help_map
-
-
 def config_data():
-    """The editable config tree (every section/knob except the `_readme`
-    block) plus per-knob help and a plain note about how edits apply."""
+    """Every tunable for the Config page, built from the knob REGISTRY (the
+    single source of truth) so the page is exhaustive by construction. Each
+    knob carries its type, help, default, the file value being edited, and -
+    when set - the environment variable currently shadowing it, so a stale
+    export can't silently defeat an edit here."""
     cfg = robot_config.all_config()
-    sections = {k: v for k, v in cfg.items()
-                if k != "_readme" and isinstance(v, dict)}
+    knobs = []
+    for k in robot_config.knobs():
+        section = cfg.get(k["section"])
+        section = section if isinstance(section, dict) else {}
+        file_val = section.get(k["key"])
+        knobs.append({
+            "section": k["section"], "key": k["key"], "type": k["type"],
+            "desc": k["desc"], "default": k["default"],
+            # The value the input shows/edits: the file's value, or the default
+            # when the file doesn't pin this knob.
+            "value": file_val if file_val is not None else k["default"],
+            "env": k["env"],
+            "env_override": robot_config.env_override(k["env"]),
+        })
     return {
-        "config": sections,
-        "help": _config_help(),
+        "knobs": knobs,
         "note": ("Saved to config.json. Environment variables still override "
                  "these at runtime, and most modules read config at startup - "
                  "so a change takes effect the next time that module restarts."),

@@ -11,6 +11,7 @@
 <div class="card">
   <h2>Configuration</h2>
   <div class="hint" id="cfg-note">loading…</div>
+  <div id="env-warn"></div>
   <div class="row" style="margin-top:10px">
     <button class="primary" onclick="saveConfig()">Save changes</button>
     <button onclick="loadConfig()">Revert</button>
@@ -22,23 +23,43 @@
 
 <script src="/app.js"></script>
 <script>
-let ORIG = {};   // section -> key -> original value (for change detection)
+let KNOBS = [];   // [{section,key,type,value,default,desc,env,env_override}, ...]
 
-function inputFor(section, key, value, help) {
-  const id = `cfg-${section}-${key}`;
-  const t = typeof value;
-  let field;
-  if (t === 'boolean') {
-    field = `<input type="checkbox" id="${id}" data-type="bool" ${value ? 'checked' : ''}>`;
-  } else if (t === 'number') {
-    field = `<input type="number" step="any" id="${id}" data-type="number" value="${value}">`;
-  } else if (value === null) {
-    field = `<input type="text" id="${id}" data-type="null" value="" placeholder="(uses default)">`;
-  } else {
-    field = `<input type="text" id="${id}" data-type="string" value="${PX.esc(String(value))}">`;
+function fieldId(k) { return `cfg-${k.section}-${k.key}`; }
+
+function inputFor(k) {
+  const id = fieldId(k), v = k.value;
+  if (k.type === 'bool')
+    return `<input type="checkbox" id="${id}" data-type="bool" ${v ? 'checked' : ''}>`;
+  if (k.type === 'int' || k.type === 'float')
+    return `<input type="number" step="${k.type === 'int' ? '1' : 'any'}" id="${id}" data-type="${k.type}" value="${v}">`;
+  return `<input type="text" id="${id}" data-type="str" value="${PX.esc(String(v == null ? '' : v))}">`;
+}
+
+function knobRow(k) {
+  const def = k.type === 'str' ? `"${k.default}"` : String(k.default);
+  let help = k.desc ? PX.esc(k.desc) + ' ' : '';
+  help += `<span style="opacity:.7">(default: ${PX.esc(def)})</span>`;
+  let warn = '';
+  if (k.env_override != null) {
+    warn = `<div class="khelp" style="color:var(--off)">⚠ Overridden by environment
+      variable <b>${PX.esc(k.env)}=${PX.esc(k.env_override)}</b> — this wins at runtime,
+      so your saved value won't take effect until that variable is unset.</div>`;
+  } else if (k.env) {
+    help += ` <span style="opacity:.55">· env: ${PX.esc(k.env)}</span>`;
   }
-  const helpHtml = help ? `<div class="khelp">${PX.esc(help)}</div>` : '';
-  return `<div class="knob"><span class="kname">${PX.esc(key)}</span>${field}${helpHtml}</div>`;
+  return `<div class="knob"><span class="kname">${PX.esc(k.key)}</span>${inputFor(k)}
+      <div class="khelp">${help}</div>${warn}</div>`;
+}
+
+function renderEnvBanner() {
+  const shadowed = KNOBS.filter(k => k.env_override != null);
+  const el = document.getElementById('env-warn');
+  if (!shadowed.length) { el.innerHTML = ''; return; }
+  const names = shadowed.map(k => k.env).join(', ');
+  el.innerHTML = `<div class="hint" style="color:var(--off);margin-top:8px">
+    ⚠ ${shadowed.length} setting(s) are currently overridden by environment
+    variables and won't change here until those are unset: <b>${PX.esc(names)}</b>.</div>`;
 }
 
 async function loadConfig() {
@@ -46,36 +67,32 @@ async function loadConfig() {
   try {
     const d = await PX.get('/config/data');
     document.getElementById('cfg-note').textContent = d.note || '';
-    ORIG = d.config || {};
-    const sections = Object.keys(ORIG).sort();
-    body.innerHTML = sections.map(sec => {
-      const knobs = Object.keys(ORIG[sec]).map(key =>
-        inputFor(sec, key, ORIG[sec][key], (d.help || {})[`${sec}.${key}`])).join('');
-      return `<div class="card cfg-sec"><h3>${PX.esc(sec)}</h3>${knobs}</div>`;
-    }).join('');
+    KNOBS = d.knobs || [];
+    renderEnvBanner();
+    const bySection = {};
+    for (const k of KNOBS) (bySection[k.section] = bySection[k.section] || []).push(k);
+    body.innerHTML = Object.keys(bySection).map(sec =>
+      `<div class="card cfg-sec"><h3>${PX.esc(sec)}</h3>` +
+      bySection[sec].map(knobRow).join('') + `</div>`).join('');
     document.getElementById('cfg-status').textContent = '';
   } catch (e) {
     body.innerHTML = '<div class="card hint">could not load config</div>';
   }
 }
 
-function readField(section, key) {
-  const el = document.getElementById(`cfg-${section}-${key}`);
-  const t = el.dataset.type;
-  if (t === 'bool') return el.checked;
-  if (t === 'number') { const n = parseFloat(el.value); return isNaN(n) ? null : n; }
-  if (t === 'null') { const v = el.value.trim(); return v === '' ? null : v; }
+function readField(k) {
+  const el = document.getElementById(fieldId(k));
+  if (k.type === 'bool') return el.checked;
+  if (k.type === 'int') { const n = parseInt(el.value, 10); return isNaN(n) ? k.value : n; }
+  if (k.type === 'float') { const n = parseFloat(el.value); return isNaN(n) ? k.value : n; }
   return el.value;
 }
 
 async function saveConfig() {
   const edits = {};
-  for (const sec of Object.keys(ORIG)) {
-    for (const key of Object.keys(ORIG[sec])) {
-      const val = readField(sec, key);
-      if (val === null && ORIG[sec][key] === null) continue;   // unchanged unpinned
-      if (val !== ORIG[sec][key]) (edits[sec] = edits[sec] || {})[key] = val;
-    }
+  for (const k of KNOBS) {
+    const val = readField(k);
+    if (val !== k.value) (edits[k.section] = edits[k.section] || {})[k.key] = val;
   }
   const status = document.getElementById('cfg-status');
   if (!Object.keys(edits).length) { status.textContent = 'no changes'; return; }

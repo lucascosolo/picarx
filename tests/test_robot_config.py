@@ -1,5 +1,7 @@
+import glob
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -143,6 +145,56 @@ class RobotConfigTest(unittest.TestCase):
         self.assertEqual(cfg["health"]["battery_adc"], False)
         self.assertEqual(cfg["web_console"]["port"], 8088)
         self.assertEqual(cfg["radio"]["alsa_device"], "plug:robot_speaker")
+
+
+class KnobRegistryTest(unittest.TestCase):
+    """The registry is the single source of truth behind the Config page; these
+    guard it against drift so 'every tunable is on the page' stays true."""
+
+    def _shipped(self):
+        with open(os.path.join(harness.LAYER_B, "config.json")) as f:
+            return json.load(f)
+
+    def test_registry_and_shipped_config_list_the_same_knobs(self):
+        cfg = self._shipped()
+        file_knobs = {(sec, key) for sec, kv in cfg.items()
+                      if sec != "_readme" and isinstance(kv, dict) for key in kv}
+        reg_knobs = {(k["section"], k["key"]) for k in robot_config.KNOBS}
+        # Every shipped knob is registered (so it appears on the page)...
+        self.assertEqual(file_knobs - reg_knobs, set(),
+                         "config.json has knobs missing from the registry")
+        # ...and every registered knob is shipped (so its default is honest).
+        self.assertEqual(reg_knobs - file_knobs, set(),
+                         "registry has knobs missing from config.json")
+
+    def test_registry_defaults_match_shipped_defaults(self):
+        cfg = self._shipped()
+        for k in robot_config.KNOBS:
+            self.assertEqual(cfg[k["section"]][k["key"]], k["default"],
+                             f"{k['section']}.{k['key']} default disagrees")
+
+    def test_every_env_knob_in_source_is_registered(self):
+        # Scan every module for `env="NAME"` (the get()/get_bool() overrides)
+        # and assert each is a registered knob - so a new env-tunable can never
+        # be added without it showing up on the Config page. The Claude API key
+        # is read via os.environ.get directly (never env=), so it's not here.
+        found = set()
+        for path in glob.glob(os.path.join(harness.REPO_ROOT, "**", "*.py"),
+                              recursive=True):
+            if "/tests/" in path:
+                continue
+            with open(path) as f:
+                found |= set(re.findall(r'env="([A-Z_]+)"', f.read()))
+        registered = {k["env"] for k in robot_config.KNOBS if k["env"]}
+        self.assertEqual(found - registered, set(),
+                         "env-var knob(s) read in source but absent from the registry")
+
+    def test_registry_knob_shapes_are_valid(self):
+        for k in robot_config.KNOBS:
+            self.assertEqual(set(k) >= {"section", "key", "type", "default",
+                                        "env", "desc"}, True)
+            self.assertIn(k["type"], ("str", "int", "float", "bool"))
+            self.assertTrue(k["desc"], f"{k['section']}.{k['key']} has no help text")
 
 
 if __name__ == "__main__":

@@ -79,32 +79,47 @@ class ConfigDataTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "config.json")
         with open(self.path, "w") as f:
-            json.dump({
-                "_readme": ["General note about the file.",
-                            "audio.gain: mic amplification for quiet USB mics"],
-                "audio": {"gain": 12.0, "espeak_voice": "mb-us1"},
-                "web_console": {"port": 8088},
-            }, f)
+            json.dump({"audio": {"gain": 5.0}}, f)   # only one knob pinned
         robot_config.CONFIG_PATH = self.path
         robot_config.reload()
+        self._saved_env = {}
 
     def tearDown(self):
         robot_config.CONFIG_PATH = self._orig_path
         robot_config.reload()
+        for name in self._saved_env:
+            os.environ.pop(name, None)
 
-    def test_config_data_excludes_readme_and_keeps_sections(self):
+    def _knob(self, d, section, key):
+        return next(k for k in d["knobs"] if k["section"] == section and k["key"] == key)
+
+    def test_lists_every_registry_knob(self):
         d = web_console.config_data()
-        self.assertIn("audio", d["config"])
-        self.assertNotIn("_readme", d["config"])
-        self.assertEqual(d["config"]["web_console"]["port"], 8088)
+        self.assertEqual(len(d["knobs"]), len(robot_config.KNOBS))
+        pairs = {(k["section"], k["key"]) for k in d["knobs"]}
+        self.assertEqual(pairs, {(k["section"], k["key"]) for k in robot_config.KNOBS})
         self.assertTrue(d["note"])
 
-    def test_help_is_parsed_from_readme_knob_lines(self):
-        help_map = web_console._config_help()
-        self.assertIn("audio.gain", help_map)
-        self.assertIn("amplification", help_map["audio.gain"])
-        # The general note (no 'section.key:' shape) is not a knob doc.
-        self.assertNotIn("General note about the file.", help_map.values())
+    def test_file_value_overrides_default_else_default_shown(self):
+        d = web_console.config_data()
+        self.assertEqual(self._knob(d, "audio", "gain")["value"], 5.0)   # from file
+        # A knob the file doesn't pin falls back to the registry default.
+        self.assertEqual(self._knob(d, "steering", "cruise_speed")["value"], 25)
+
+    def test_env_override_is_surfaced_and_cleared(self):
+        os.environ["ESPEAK_VOICE"] = "mb-en1"
+        self._saved_env["ESPEAK_VOICE"] = True
+        knob = self._knob(web_console.config_data(), "audio", "espeak_voice")
+        self.assertEqual(knob["env_override"], "mb-en1")
+        os.environ.pop("ESPEAK_VOICE")
+        knob = self._knob(web_console.config_data(), "audio", "espeak_voice")
+        self.assertIsNone(knob["env_override"])
+
+    def test_empty_env_is_not_treated_as_override(self):
+        os.environ["AUDIO_GAIN"] = ""   # set-but-empty falls through in get()
+        self._saved_env["AUDIO_GAIN"] = True
+        knob = self._knob(web_console.config_data(), "audio", "gain")
+        self.assertIsNone(knob["env_override"])
 
 
 class RouteTableTest(unittest.TestCase):

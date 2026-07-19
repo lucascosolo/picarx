@@ -46,6 +46,153 @@ CONFIG_PATH = os.environ.get(
 _cache = None
 
 
+# ---------------------------------------------------------------------------
+# Knob registry - the single source of truth for EVERYTHING a user can tune.
+#
+# Every get()/get_bool() call site across the modules is listed here exactly
+# once. The web console's Config page renders straight from this list, so it is
+# by construction complete: every file-or-env tunable shows up, with the right
+# type, help text, default, and - crucially - a warning when an environment
+# variable is currently shadowing the file value (env still wins at runtime, so
+# a stale `export` would otherwise silently defeat an edit made in the browser).
+#
+# Two tests keep this honest: one asserts the registry and config.json list the
+# same knobs at the same defaults; another scans the source for every
+# `env="..."` and asserts each is registered. Add a knob here the moment you
+# add a get() call, and it appears on the Config page for free.
+#
+# `env=None` means the knob is config-file-only (no environment override).
+# The Claude API key is deliberately absent: secrets never live in the file or
+# on the page (see the module docstring).
+#
+# type is one of "str" | "int" | "float" | "bool".
+# ---------------------------------------------------------------------------
+KNOBS = [
+    # ---- audio (audio_nodes.py) ----
+    {"section": "audio", "key": "speaker_enable_cmd", "type": "str",
+     "default": "robot_hat enable_speaker", "env": "SPEAKER_ENABLE_CMD",
+     "desc": "Shell command run to power the speaker amp before speaking."},
+    {"section": "audio", "key": "vosk_model_path", "type": "str",
+     "default": "/home/picarx/layer_b/modules/models/model-en-lgraph",
+     "env": "VOSK_MODEL_PATH", "desc": "Path to the Vosk speech-to-text model."},
+    {"section": "audio", "key": "debug_levels", "type": "bool",
+     "default": False, "env": "AUDIO_DEBUG_LEVELS",
+     "desc": "Print live mic input/noise levels to help tune the gates."},
+    {"section": "audio", "key": "espeak_voice", "type": "str",
+     "default": "mb-us1", "env": "ESPEAK_VOICE",
+     "desc": "TTS voice: mb-us1 (US female) / mb-us2, mb-us3 (US male) / "
+             "mb-en1 (British male). `espeak --voices=mb` lists installed ones."},
+    {"section": "audio", "key": "espeak_speed", "type": "int",
+     "default": 130, "env": "ESPEAK_SPEED",
+     "desc": "TTS words-per-minute (espeak default is ~175)."},
+    {"section": "audio", "key": "espeak_pitch", "type": "str",
+     "default": "", "env": "ESPEAK_PITCH",
+     "desc": "TTS pitch 0-99; empty string = espeak's default."},
+    {"section": "audio", "key": "gain", "type": "float",
+     "default": 12.0, "env": "AUDIO_GAIN",
+     "desc": "Digital mic amplification for low-gain USB mics."},
+    {"section": "audio", "key": "bandpass", "type": "bool",
+     "default": True, "env": "AUDIO_BANDPASS",
+     "desc": "Band-pass filter each capture chunk to reject out-of-band room noise."},
+    {"section": "audio", "key": "bandpass_hp_hz", "type": "int",
+     "default": 150, "env": "AUDIO_BANDPASS_HP",
+     "desc": "Band-pass high-pass cutoff (Hz): kill rumble below this."},
+    {"section": "audio", "key": "bandpass_lp_hz", "type": "int",
+     "default": 4000, "env": "AUDIO_BANDPASS_LP",
+     "desc": "Band-pass low-pass cutoff (Hz): kill hiss above this."},
+    {"section": "audio", "key": "heard_min_confidence", "type": "float",
+     "default": 0.3, "env": "HEARD_MIN_CONFIDENCE",
+     "desc": "Drop STT decodes below this mean word confidence (stop/halt always pass)."},
+    {"section": "audio", "key": "heard_min_snr", "type": "float",
+     "default": 2.5, "env": "HEARD_MIN_SNR",
+     "desc": "An utterance's peak level must exceed this multiple of the noise floor."},
+    # ---- companion (companion.py) ----
+    {"section": "companion", "key": "model", "type": "str",
+     "default": "claude-sonnet-5", "env": "COMPANION_MODEL",
+     "desc": "Claude model for conversation."},
+    {"section": "companion", "key": "intent_model", "type": "str",
+     "default": "claude-haiku-4-5-20251001", "env": "INTENT_MODEL",
+     "desc": "Cheaper Claude model for fast intent classification."},
+    {"section": "companion", "key": "chat_noise_quality", "type": "float",
+     "default": 0.2, "env": "CHAT_NOISE_QUALITY",
+     "desc": "Below this utterance-quality score, drop silently (likely noise)."},
+    {"section": "companion", "key": "chat_min_quality", "type": "float",
+     "default": 0.45, "env": "CHAT_MIN_QUALITY",
+     "desc": "Between noise_quality and this, say 'I didn't catch that' with no LLM call."},
+    # ---- coach (coach.py) ----
+    {"section": "coach", "key": "model", "type": "str",
+     "default": "claude-haiku-4-5-20251001", "env": "COACH_MODEL",
+     "desc": "Claude model for maneuver coaching."},
+    # ---- reflection (reflection.py) ----
+    {"section": "reflection", "key": "model", "type": "str",
+     "default": "claude-haiku-4-5-20251001", "env": "REFLECTION_MODEL",
+     "desc": "Claude model for idle-time reflection."},
+    # ---- radio (radio.py) ----
+    {"section": "radio", "key": "alsa_device", "type": "str",
+     "default": "plug:robot_speaker", "env": "RADIO_ALSA_DEVICE",
+     "desc": "ALSA output device the radio player writes to."},
+    {"section": "radio", "key": "tts_settle_sec", "type": "float",
+     "default": 2.0, "env": "RADIO_TTS_SETTLE",
+     "desc": "Pause radio for this long around spoken replies so TTS is audible."},
+    # ---- web console (web_console.py) ----
+    {"section": "web_console", "key": "port", "type": "int",
+     "default": 8088, "env": "WEB_CONSOLE_PORT",
+     "desc": "TCP port this console listens on (restart to apply)."},
+    # ---- bluetooth (tools/bluetooth_daemon.py) ----
+    {"section": "bluetooth", "key": "connect_cmd", "type": "str",
+     "default": "nmcli device connect {mac}", "env": "BT_CONNECT_CMD",
+     "desc": "Shell command to connect a device; {mac} is substituted."},
+    # ---- health (tools/health_daemon.py) ----
+    {"section": "health", "key": "battery_adc", "type": "bool",
+     "default": False, "env": "HEALTH_BATTERY_ADC",
+     "desc": "Direct-ADC battery fallback for setups without world_state "
+             "(leave off normally - it contends on the I2C bus)."},
+    # ---- embeddings (embedding_util.py) ----
+    {"section": "embeddings", "key": "model_path", "type": "str",
+     "default": "/home/picarx/layer_b/data/models/minilm/model.onnx",
+     "env": "EMBED_MODEL_PATH", "desc": "Path to the MiniLM ONNX embedding model."},
+    {"section": "embeddings", "key": "tokenizer_path", "type": "str",
+     "default": "/home/picarx/layer_b/data/models/minilm/tokenizer.json",
+     "env": "EMBED_TOKENIZER_PATH", "desc": "Path to the embedding model's tokenizer."},
+    # ---- kinematics (steering_controller.py) - file-only ----
+    {"section": "kinematics", "key": "wheelbase_mm", "type": "int",
+     "default": 95, "env": None,
+     "desc": "Physical wheelbase in mm - measure your chassis."},
+    {"section": "kinematics", "key": "max_steer_deg", "type": "int",
+     "default": 30, "env": None, "desc": "Maximum steering angle (deg)."},
+    {"section": "kinematics", "key": "steering_rate_deg_per_sec", "type": "int",
+     "default": 60, "env": None,
+     "desc": "Cap on commanded steering slew (lower = smoother arcs)."},
+    # ---- steering (steering_controller.py) - file-only ----
+    {"section": "steering", "key": "area_distance_k", "type": "float",
+     "default": 35.0, "env": None,
+     "desc": "Box-area->distance calibration: k = distance_cm * sqrt(area_ratio)."},
+    {"section": "steering", "key": "clearance_m", "type": "float",
+     "default": 0.15, "env": None, "desc": "Preferred lateral passing clearance (m)."},
+    {"section": "steering", "key": "cruise_speed", "type": "int",
+     "default": 25, "env": None, "desc": "Default forward speed while exploring."},
+    {"section": "steering", "key": "curve_slowdown_gain", "type": "float",
+     "default": 0.9, "env": None,
+     "desc": "How hard speed drops with steering angle (0 = never, 1 = full)."},
+]
+
+
+def knobs():
+    """The full knob registry as a deep copy (see KNOBS). The web console's
+    Config page renders from this, so it always lists every tunable."""
+    return copy.deepcopy(KNOBS)
+
+
+def env_override(env_name):
+    """The current value of environment variable `env_name` if it is SET and
+    non-empty (which is exactly when it wins over config.json in get()), else
+    None. Lets the Config page warn that a stale env var is shadowing a knob."""
+    if not env_name:
+        return None
+    v = os.environ.get(env_name)
+    return v if v not in (None, "") else None
+
+
 def reload():
     """Forget the cached file so the next get() re-reads it. For tests."""
     global _cache
