@@ -1,7 +1,11 @@
-"""Importing a picarx-training knowledge pack must MERGE into the robot's
-own learning, never clobber it: bandit arm records add together, unseen
-situations/arms are adopted, real-world-only knowledge is left alone, and
-transferable facts/patterns land in semantic.db through the normal dedup."""
+"""Importing a picarx-training knowledge pack must fold into the robot's own
+learning, never clobber it. Two combine modes for a SHARED bandit arm:
+  - merge (default): win/loss records add together (two independent learners)
+  - adopt (--adopt): the pack's refined counts REPLACE the robot's, because
+    the pack was seeded from this robot's own policy and summing would
+    double-count the seed.
+Both modes still adopt unseen situations/arms, leave real-world-only knowledge
+alone, and land transferable facts/patterns in semantic.db through the dedup."""
 import json
 import os
 import sys
@@ -90,6 +94,89 @@ class MergePolicyTest(unittest.TestCase):
         # freshest kept (highest ts survive the cap)
         self.assertEqual(demos[-1]["ts"], 108)
         self.assertEqual(stats["demonstrations_added"], 9)
+
+
+class AdoptPolicyTest(unittest.TestCase):
+    """--adopt: for an arm on BOTH sides, take the pack's refined record instead
+    of summing, so a self-training round-trip doesn't double-count the seed."""
+
+    def test_adopt_replaces_shared_arm_counts(self):
+        # the robot exported this arm as its 7/1 seed; the sim refined it to 10/2
+        sig, refined = _arm("backward", 10, 2)
+        base = {"k": _situation((sig, {**refined, "successes": 7, "failures": 1,
+                                       "rationale": "the seed"}))}
+        merged, stats = import_training.combine_policy(
+            base, {"k": _situation((sig, refined))}, mode="adopt")
+        got = merged["k"]["arms"][sig]
+        # 7/1 seed refined to 10/2 imports back as 10/2, NOT the 17/3 a sum gives
+        self.assertEqual((got["successes"], got["failures"]), (10, 2))
+        # the pack's steps/rationale replace base's too, not just the counts
+        self.assertEqual(got["rationale"], "backward arm")
+        self.assertEqual(stats["arms_replaced"], 1)
+        self.assertEqual(stats["arms_reinforced"], 0)
+        self.assertEqual(stats["situations_merged"], 1)
+
+    def test_adopt_still_adopts_new_situations_and_arms(self):
+        shared_sig, seed_stop = _arm("stop", 4, 0)
+        _, refined_stop = _arm("stop", 9, 1)          # same sig, refined counts
+        new_sig, new_arm = _arm("forward", 1, 5)
+        base = {"k": _situation((shared_sig, seed_stop))}
+        incoming = {"k": _situation((shared_sig, refined_stop), (new_sig, new_arm)),
+                    "novel:doorway": _situation(_arm("turn", 2, 0))}
+        merged, stats = import_training.combine_policy(base, incoming, mode="adopt")
+        arms = merged["k"]["arms"]
+        self.assertEqual((arms[shared_sig]["successes"],
+                          arms[shared_sig]["failures"]), (9, 1))  # replaced, not summed
+        self.assertIn(new_sig, arms)                              # unseen arm adopted
+        self.assertIn("novel:doorway", merged)                   # unseen situation adopted
+        self.assertEqual(stats["arms_added"], 2)                 # forward arm + turn arm
+        self.assertEqual(stats["arms_replaced"], 1)
+        self.assertEqual(stats["situations_added"], 1)
+
+    def test_adopt_does_not_mutate_base(self):
+        sig, refined = _arm("backward", 10, 2)
+        base = {"k": _situation((sig, {**refined, "successes": 7, "failures": 1}))}
+        import_training.combine_policy(
+            base, {"k": _situation((sig, refined))}, mode="adopt")
+        self.assertEqual((base["k"]["arms"][sig]["successes"],
+                          base["k"]["arms"][sig]["failures"]), (7, 1))
+
+    def test_adopt_preserves_base_embedding_when_pack_lacks_one(self):
+        sig, arm = _arm("backward", 5, 1)
+        base = {"k": {**_situation((sig, arm)), "embedding": [0.1, 0.2]}}
+        inc = {"k": _situation((sig, arm))}           # pack has no embedding
+        merged, _ = import_training.combine_policy(base, inc, mode="adopt")
+        self.assertEqual(merged["k"]["embedding"], [0.1, 0.2])
+
+    def test_merge_alias_still_sums(self):
+        sig, arm = _arm("backward", 7, 1)
+        base = {"k": _situation((sig, {**arm, "successes": 2, "failures": 1}))}
+        merged, _ = import_training.merge_policy(base, {"k": _situation((sig, arm))})
+        got = merged["k"]["arms"][sig]
+        self.assertEqual((got["successes"], got["failures"]), (9, 2))
+
+    def test_unknown_mode_rejected(self):
+        with self.assertRaises(ValueError):
+            import_training.combine_policy({}, {}, mode="clobber")
+
+
+class LineageTest(unittest.TestCase):
+    """The lineage fingerprint must match picarx-training's byte-for-byte and
+    ignore churny reserved sections, so the same-lineage --adopt hint fires."""
+
+    def test_empty_or_reserved_only_policy_is_cold(self):
+        self.assertEqual(import_training.policy_lineage({}), "cold")
+        self.assertEqual(import_training.policy_lineage({"_demonstrations": []}), "cold")
+        self.assertEqual(import_training.policy_lineage(None), "cold")
+
+    def test_lineage_deterministic_and_ignores_reserved(self):
+        sig, arm = _arm("backward", 7, 1)
+        p = {"k": _situation((sig, arm))}
+        lin = import_training.policy_lineage(p)
+        self.assertNotEqual(lin, "cold")
+        self.assertEqual(lin, import_training.policy_lineage(p))       # deterministic
+        p["_demonstrations"] = [{"ts": 1, "steps": []}]
+        self.assertEqual(lin, import_training.policy_lineage(p))       # reserved excluded
 
 
 class SemanticImportTest(unittest.TestCase):

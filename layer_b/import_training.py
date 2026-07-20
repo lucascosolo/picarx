@@ -12,13 +12,24 @@ sim/knowledge.py). It holds up to three files, each optional:
     navigation_facts.json transferable facts + mined behavioural patterns
     knowledge_pack.json   a manifest describing how it was trained
 
-This tool MERGES that pack into the robot's own data dir rather than
+This tool folds that pack into the robot's own data dir rather than
 overwriting it, so a robot that has already learned things in the real
-world keeps them:
+world keeps them. Coach arms combine in one of two MODES:
 
-  * coach_policy.json - per situation, arms are unioned; a maneuver the
-    robot already knows has the trained win/loss counts ADDED to its own,
-    so simulated and real experience reinforce the same UCB1 statistics.
+  * merge (default) - per situation, arms are unioned; a maneuver the robot
+    already knows has the trained win/loss counts ADDED to its own, so two
+    INDEPENDENT learners' evidence reinforces the same UCB1 statistics. This
+    is right when the robot and the trainer learned separately (e.g. a pack
+    built on a dev machine, or a cold-started sim).
+  * adopt (--adopt) - a shared arm's counts/steps/rationale are REPLACED by
+    the incoming pack's. This is right when the pack was seeded from THIS
+    robot's own policy and refined in sim (a self-training round-trip):
+    summing would double-count the shared seed (an arm that left the robot
+    at 7/1 and came back 10/2 would otherwise import as 17/3).
+
+Both modes still adopt unseen situations/arms wholesale and preserve the
+robot's own embedding, adopting the pack's only to fill a gap.
+
   * navigation facts/patterns - upserted into semantic.db through the store's
     normal dedup (same fact just reinforces, higher confidence wins), tagged
     source 'training' so their origin stays honest. Only robot-dynamics
@@ -28,19 +39,23 @@ world keeps them:
 RUN IT OFFLINE. reflection.py is normally the sole writer to semantic.db and
 coach.py to coach_policy.json; this tool writes both. Stop Layer B first
 (Ctrl-C the orchestrator), import, then start it again - the modules read
-these files at startup and will pick the merged versions up.
+these files at startup and will pick the combined versions up.
 
     # on the robot, orchestrator stopped:
     python3 layer_b/import_training.py /path/to/training_data
     python3 layer_b/import_training.py /path/to/training_data --dry-run
+    python3 layer_b/import_training.py /path/to/training_data --adopt
 
-Fail-soft and idempotent: a missing file in the pack is skipped, and
-re-importing the same pack only reinforces (it never double-counts arms it
-already merged... it does add counts again, so import a given pack ONCE -
---dry-run first if unsure). Nothing here talks to the bus or hardware.
+Fail-soft: a missing file in the pack is skipped. In merge mode, importing
+the same pack twice adds its counts twice, so import a given pack ONCE
+(--dry-run first if unsure); adopt mode replaces shared arms, so it is
+idempotent for those. If the pack's manifest carries a lineage id matching
+this robot's own policy, the tool flags it and suggests --adopt. Nothing
+here talks to the bus or hardware.
 """
 import argparse
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -58,21 +73,30 @@ MAX_DEMONSTRATIONS = 10
 # coach policy merge  (pure function - unit-tested)
 # --------------------------------------------------------------------------
 
-def merge_policy(base, incoming):
-    """Merge an incoming coach policy into base WITHOUT losing either side's
-    learning. Returns (merged_policy, stats). Pure: does not mutate `base`.
+def combine_policy(base, incoming, mode="merge"):
+    """Combine an incoming coach policy into base WITHOUT losing base's own
+    real-world learning. Returns (combined_policy, stats). Pure: does not
+    mutate `base` (or `incoming`).
 
-    Per situation key:
-      - unseen situation      -> adopted wholesale
-      - shared situation      -> arms unioned; an arm present on both sides has
-                                 its successes/failures SUMMED (so UCB1 sees the
-                                 combined evidence) and keeps base's steps/rationale
+    An arm signature present on BOTH sides is handled per `mode`:
+      - "merge" : successes/failures are SUMMED (so UCB1 sees the combined
+                  evidence of two INDEPENDENT learners) and base keeps its
+                  steps/rationale. Right when robot and trainer learned apart.
+      - "adopt" : the incoming pack's counts/steps/rationale REPLACE base's.
+                  Right when the pack was seeded from THIS robot's own policy
+                  and refined in sim - summing would double-count the seed.
+
+    Everything NOT shared is identical in both modes:
+      - unseen situation -> adopted wholesale
+      - unseen arm       -> adopted into the shared situation
       - base's embedding wins; incoming's is adopted only if base has none
     Reserved '_'-prefixed list sections (e.g. _demonstrations) are concatenated
-    and capped to the freshest MAX_DEMONSTRATIONS by timestamp."""
+    and capped to the freshest MAX_DEMONSTRATIONS by timestamp (mode-agnostic)."""
+    if mode not in ("merge", "adopt"):
+        raise ValueError(f"unknown combine mode: {mode!r} (want 'merge' or 'adopt')")
     merged = copy.deepcopy(base) if isinstance(base, dict) else {}
-    stats = {"situations_added": 0, "situations_merged": 0,
-             "arms_added": 0, "arms_reinforced": 0, "demonstrations_added": 0}
+    stats = {"situations_added": 0, "situations_merged": 0, "arms_added": 0,
+             "arms_reinforced": 0, "arms_replaced": 0, "demonstrations_added": 0}
     if not isinstance(incoming, dict):
         return merged, stats
 
@@ -92,18 +116,49 @@ def merge_policy(base, incoming):
         base_arms = base_entry.setdefault("arms", {})
         for sig, arm in entry["arms"].items():
             if sig in base_arms and isinstance(base_arms[sig], dict):
-                b = base_arms[sig]
-                b["successes"] = int(b.get("successes", 0)) + int(arm.get("successes", 0))
-                b["failures"] = int(b.get("failures", 0)) + int(arm.get("failures", 0))
-                b["last_updated"] = max(b.get("last_updated", 0) or 0,
-                                        arm.get("last_updated", 0) or 0)
-                stats["arms_reinforced"] += 1
+                if mode == "adopt":
+                    # the pack refined this robot's own seed: take it verbatim
+                    # (counts/steps/rationale) instead of summing the seed twice
+                    base_arms[sig] = copy.deepcopy(arm)
+                    stats["arms_replaced"] += 1
+                else:
+                    b = base_arms[sig]
+                    b["successes"] = int(b.get("successes", 0)) + int(arm.get("successes", 0))
+                    b["failures"] = int(b.get("failures", 0)) + int(arm.get("failures", 0))
+                    b["last_updated"] = max(b.get("last_updated", 0) or 0,
+                                            arm.get("last_updated", 0) or 0)
+                    stats["arms_reinforced"] += 1
             else:
                 base_arms[sig] = copy.deepcopy(arm)
                 stats["arms_added"] += 1
         if not base_entry.get("embedding") and entry.get("embedding"):
             base_entry["embedding"] = entry["embedding"]
     return merged, stats
+
+
+def merge_policy(base, incoming):
+    """Back-compat alias for combine_policy in the default 'merge' (sum) mode."""
+    return combine_policy(base, incoming, mode="merge")
+
+
+def policy_lineage(policy):
+    """A short, stable fingerprint of a coach policy's learned situations/arms.
+
+    Mirrors picarx-training sim/knowledge.py.policy_lineage EXACTLY so the two
+    repos agree: canonical JSON of the non-reserved ('_'-excluded) situations,
+    sha256, first 12 hex. Reserved sections (churny demonstration logs) are left
+    out so the id tracks learned behaviour, not bookkeeping. Empty/absent -> 'cold'.
+
+    Used only as a hint: a pack whose manifest lineage equals this robot's own
+    policy lineage was seeded from this robot (a self-training round-trip) and
+    wants --adopt. Kept local (no cross-repo import) like MAX_DEMONSTRATIONS."""
+    if not isinstance(policy, dict):
+        return "cold"
+    core = {k: v for k, v in policy.items() if not k.startswith("_")}
+    if not core:
+        return "cold"
+    blob = json.dumps(core, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:12]
 
 
 def _merge_reserved(merged, key, entry, stats):
@@ -137,18 +192,21 @@ def _load_json(path, default):
         return default
 
 
-def import_coach_policy(pack_dir, data_dir, dry_run=False):
+def import_coach_policy(pack_dir, data_dir, dry_run=False, mode="merge"):
     incoming = _load_json(os.path.join(pack_dir, "coach_policy.json"), None)
     if incoming is None:
         print("  coach policy:   (none in pack, skipped)")
         return
     dest = os.path.join(data_dir, "coach_policy.json")
     base = _load_json(dest, {})
-    merged, stats = merge_policy(base, incoming)
-    print(f"  coach policy:   +{stats['situations_added']} new situations, "
+    _lineage_hint(base, _pack_lineage(pack_dir), mode)
+    merged, stats = combine_policy(base, incoming, mode=mode)
+    shared_label = "replaced" if mode == "adopt" else "reinforced"
+    shared_n = stats["arms_replaced"] if mode == "adopt" else stats["arms_reinforced"]
+    print(f"  coach policy [{mode}]: +{stats['situations_added']} new situations, "
           f"{stats['situations_merged']} merged; "
           f"+{stats['arms_added']} new arms, "
-          f"{stats['arms_reinforced']} reinforced"
+          f"{shared_n} shared {shared_label}"
           + (f", +{stats['demonstrations_added']} demonstrations"
              if stats['demonstrations_added'] else ""))
     if dry_run:
@@ -158,6 +216,24 @@ def import_coach_policy(pack_dir, data_dir, dry_run=False):
     with open(tmp, "w") as f:
         json.dump(merged, f, indent=2)
     os.replace(tmp, dest)
+
+
+def _lineage_hint(base, pack_lineage, mode):
+    """If the pack descends from this robot's OWN policy (same lineage), nudge
+    toward the right mode: adopt for a self-training round-trip (so the shared
+    seed isn't summed twice), merge for an independently-trained pack."""
+    if not pack_lineage or pack_lineage == "cold":
+        return
+    if pack_lineage == policy_lineage(base):
+        if mode == "merge":
+            print(f"  ! this pack shares your robot's policy lineage "
+                  f"({pack_lineage}) - it looks seeded from this robot's own "
+                  "data. Re-run with --adopt so the shared seed isn't "
+                  "double-counted.")
+    elif mode == "adopt":
+        print(f"  ! --adopt on a pack whose lineage ({pack_lineage}) differs "
+              "from this robot's - adopt is meant for this robot's own "
+              "round-trip; merge may be the safer choice here.")
 
 
 def import_navigation_facts(pack_dir, data_dir, dry_run=False):
@@ -199,6 +275,14 @@ def import_navigation_facts(pack_dir, data_dir, dry_run=False):
             continue
 
 
+def _pack_lineage(pack_dir):
+    """The lineage id the trainer stamped into the manifest, or None."""
+    manifest = _load_json(os.path.join(pack_dir, "knowledge_pack.json"), None)
+    if isinstance(manifest, dict):
+        return manifest.get("lineage")
+    return None
+
+
 def _print_manifest(pack_dir):
     manifest = _load_json(os.path.join(pack_dir, "knowledge_pack.json"), None)
     if not isinstance(manifest, dict):
@@ -209,6 +293,12 @@ def _print_manifest(pack_dir):
     print(f"  pack trained {t.get('episodes', '?')} episode(s) "
           f"over {len(scenarios)} scenario(s) [{when}]"
           + (f": {', '.join(scenarios)}" if scenarios else ""))
+    lineage = manifest.get("lineage")
+    if lineage:
+        print(f"  pack lineage:   {lineage}"
+              + ("   (cold - not seeded from a robot; merge is right)"
+                 if lineage == "cold"
+                 else "   (seeded from a robot's policy; --adopt if it's THIS one)"))
 
 
 # --------------------------------------------------------------------------
@@ -217,32 +307,42 @@ def _print_manifest(pack_dir):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Merge a picarx-training knowledge pack into this robot.")
+        description="Combine a picarx-training knowledge pack into this robot.")
     ap.add_argument("pack_dir",
                     help="directory holding coach_policy.json / "
                          "navigation_facts.json / knowledge_pack.json")
     ap.add_argument("--data-dir", default=robot_config.data_path(),
-                    help="robot data dir to merge into "
+                    help="robot data dir to combine into "
                          "(default: layer_b/data/)")
+    ap.add_argument("--adopt", action="store_true",
+                    help="a shared arm takes the pack's counts/steps/rationale "
+                         "instead of SUMMING them. Use for a pack seeded from "
+                         "THIS robot's own policy (self-training round-trip), "
+                         "so the shared seed isn't double-counted. Default: "
+                         "merge (sum - for independently-trained packs).")
     ap.add_argument("--dry-run", action="store_true",
-                    help="show exactly what would be merged, write nothing")
+                    help="show exactly what would change, write nothing")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.pack_dir):
         ap.error(f"pack dir not found: {args.pack_dir}")
 
+    mode = "adopt" if args.adopt else "merge"
     print(f"Importing knowledge pack: {args.pack_dir}")
-    print(f"  into robot data dir:    {args.data_dir}"
+    print(f"  into robot data dir:    {args.data_dir}   [{mode} mode]"
           + ("   [DRY RUN - nothing written]" if args.dry_run else ""))
     _print_manifest(args.pack_dir)
-    import_coach_policy(args.pack_dir, args.data_dir, dry_run=args.dry_run)
+    import_coach_policy(args.pack_dir, args.data_dir, dry_run=args.dry_run, mode=mode)
     import_navigation_facts(args.pack_dir, args.data_dir, dry_run=args.dry_run)
     if args.dry_run:
-        print("Dry run complete - re-run without --dry-run to apply. "
-              "Import each pack only ONCE (arm counts accumulate).")
+        tail = ("Adopt mode replaces shared arms, so re-importing is idempotent."
+                if mode == "adopt"
+                else "In merge mode arm counts accumulate, so import each pack ONCE.")
+        print(f"Dry run complete ({mode} mode) - re-run without --dry-run to "
+              f"apply. {tail}")
     else:
         print("Done. Restart Layer B (orchestrator) so the modules reload "
-              "the merged files.")
+              "the combined files.")
 
 
 if __name__ == "__main__":

@@ -158,11 +158,11 @@ the sibling [**picarx-training**](../picarx-training) simulator, which runs
 `field_agent`/`coach`/… unmodified against synthetic sensors and distils each
 session into a portable **knowledge pack**:
 
-| File in the pack | Merged into | Carries |
+| File in the pack | Combined into | Carries |
 |---|---|---|
 | `coach_policy.json` | `data/coach_policy.json` | Learned escape maneuvers (bandit arms). |
 | `navigation_facts.json` | `semantic.db` | Transferable facts + mined behaviour patterns. |
-| `knowledge_pack.json` | — | Manifest: scenarios trained, episode counts, provenance. |
+| `knowledge_pack.json` | — | Manifest: scenarios trained, episode counts, provenance, lineage. |
 
 [`import_training.py`](layer_b/import_training.py) folds a pack into
 `layer_b/data/`, so the robot starts real-world operation already knowing how
@@ -171,16 +171,36 @@ to get unstuck instead of learning every escape on the carpet:
 ```bash
 # on the robot, with Layer B stopped (this tool writes files the modules own):
 python3 layer_b/import_training.py /path/to/training_data --dry-run   # preview
-python3 layer_b/import_training.py /path/to/training_data             # apply
+python3 layer_b/import_training.py /path/to/training_data             # apply (merge)
+python3 layer_b/import_training.py /path/to/training_data --adopt     # apply (adopt)
 ```
 
-It **merges** rather than overwrites: a maneuver the robot already knows gets
-the simulated win/loss counts *added* to its own UCB1 record, unseen situations
-and facts are adopted, and real-world learning is never clobbered. Only
-robot-dynamics knowledge is ever imported — the sim's rooms are not this house,
-so place-specific memories and the spatial map stay out of the pack, and the
-robot rebuilds those from real sensors. Restart the orchestrator afterwards so
-the modules reload the merged files.
+It **combines** rather than overwrites, and never clobbers real-world learning:
+unseen situations, arms, and facts are always adopted, and the robot's own
+embedding is kept (the pack's fills a gap only). For an arm the robot **already
+knows**, how the two records combine depends on where the pack came from:
+
+| Mode | Shared arm becomes | Use when |
+|---|---|---|
+| **merge** (default) | robot's counts **+** pack's counts | The robot and the trainer learned **independently** — a pack built on a dev machine, or a cold-started sim. Two separate bodies of evidence genuinely add up. |
+| **adopt** (`--adopt`) | the pack's refined counts **replace** the robot's | The pack was seeded from **this robot's own** `coach_policy.json` and refined in sim (a self-training round-trip). Summing would double-count the shared seed. |
+
+The double-counting adopt avoids is concrete: an arm the robot exports at 7 wins
+/ 1 loss and the sim refines to 10/2 would import **back** as 17/3 under merge,
+inflating an arm the robot has really only seen ten times. `--adopt` imports it
+as 10/2.
+
+To make picking the mode easy, the trainer stamps each pack's manifest with a
+**lineage** id — a hash of the seed policy it was trained from (or `cold` if it
+started from scratch). The importer prints it, and if it matches this robot's
+own policy it flags the pack as a self-training round-trip and suggests
+`--adopt`. `--dry-run` shows the active mode and exactly what would change,
+writing nothing.
+
+Only robot-dynamics knowledge is ever imported — the sim's rooms are not this
+house, so place-specific memories and the spatial map stay out of the pack, and
+the robot rebuilds those from real sensors. Restart the orchestrator afterwards
+so the modules reload the combined files.
 
 ---
 
@@ -262,7 +282,7 @@ layer_b/
   robot_config.py       env > config.json > default resolution
   semantic_store.py     facts / patterns / self-model  (semantic.db)
   spatial_store.py      the topological place graph      (spatial.db)
-  import_training.py    merge a picarx-training knowledge pack into data/
+  import_training.py    combine a picarx-training knowledge pack into data/ (merge|adopt)
   embedding_util.py     on-board text embeddings (MiniLM/ONNX)
   modules/              the ~25 Layer B behaviours
     tools/              utility daemons (health, reminders, follow, bluetooth)
