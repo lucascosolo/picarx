@@ -151,6 +151,37 @@ human corrections, and now `expressions`' notes-to-self — and they flow *back*
 into future coach and companion prompts, so the robot's behaviour is shaped by
 its own accumulated experience.
 
+### Importing pre-trained knowledge
+
+The robot's decision modules can also practise in a virtual world first — see
+the sibling [**picarx-training**](../picarx-training) simulator, which runs
+`field_agent`/`coach`/… unmodified against synthetic sensors and distils each
+session into a portable **knowledge pack**:
+
+| File in the pack | Merged into | Carries |
+|---|---|---|
+| `coach_policy.json` | `data/coach_policy.json` | Learned escape maneuvers (bandit arms). |
+| `navigation_facts.json` | `semantic.db` | Transferable facts + mined behaviour patterns. |
+| `knowledge_pack.json` | — | Manifest: scenarios trained, episode counts, provenance. |
+
+[`import_training.py`](layer_b/import_training.py) folds a pack into
+`layer_b/data/`, so the robot starts real-world operation already knowing how
+to get unstuck instead of learning every escape on the carpet:
+
+```bash
+# on the robot, with Layer B stopped (this tool writes files the modules own):
+python3 layer_b/import_training.py /path/to/training_data --dry-run   # preview
+python3 layer_b/import_training.py /path/to/training_data             # apply
+```
+
+It **merges** rather than overwrites: a maneuver the robot already knows gets
+the simulated win/loss counts *added* to its own UCB1 record, unseen situations
+and facts are adopted, and real-world learning is never clobbered. Only
+robot-dynamics knowledge is ever imported — the sim's rooms are not this house,
+so place-specific memories and the spatial map stay out of the pack, and the
+robot rebuilds those from real sensors. Restart the orchestrator afterwards so
+the modules reload the merged files.
+
 ---
 
 ## Running it
@@ -231,6 +262,7 @@ layer_b/
   robot_config.py       env > config.json > default resolution
   semantic_store.py     facts / patterns / self-model  (semantic.db)
   spatial_store.py      the topological place graph      (spatial.db)
+  import_training.py    merge a picarx-training knowledge pack into data/
   embedding_util.py     on-board text embeddings (MiniLM/ONNX)
   modules/              the ~25 Layer B behaviours
     tools/              utility daemons (health, reminders, follow, bluetooth)
