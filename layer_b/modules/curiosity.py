@@ -53,6 +53,7 @@ OBJECTS_TOPIC = "picarx/vision/objects"
 HEARD_TOPIC = "picarx/audio/heard"
 SPEAK_TOPIC = "picarx/audio/speak"
 LABEL_TOPIC = "picarx/perception/label"
+MOVE_TOPIC = "picarx/intent/move"
 # LAST-resort tier: when a spoken question goes unanswered, hand the object
 # to companion.py to identify with the cloud LLM. companion feeds the answer
 # back on LABEL_TOPIC, which trains the on-board memory - so the cloud is
@@ -68,6 +69,13 @@ ANSWER_WINDOW_SEC = 12.0     # how long the next utterance counts as the answer
 ASKED_MEMORY = 300           # cap on remembered "already asked" object ids
 LLM_COOLDOWN = 60.0          # min seconds between cloud identify escalations
 
+# When it asks, the robot briefly holds still so it visibly WAITS for an answer
+# instead of driving on. A modest priority + short TTL stop: wander (5) and a
+# passive watch (6) yield to it, but obstacle evasion (8), coach maneuvers (9)
+# and the safety daemon all still preempt - the pause never overrides a reflex.
+ATTENTION_PRIORITY = 7
+ATTENTION_PAUSE_SEC = 2.5
+
 # Words that aren't the noun in a spoken answer ("it's a speaker", "I think
 # that's a chair", "no, a mug") - stripped so what's left is the label.
 _ANSWER_FILLER = {
@@ -75,6 +83,25 @@ _ANSWER_FILLER = {
     "this", "i", "think", "maybe", "looks", "look", "like", "actually", "no",
     "not", "but", "sorry", "um", "uh", "well", "you", "mean", "meant", "of",
     "course", "yeah", "yes", "nope", "just", "some", "kind", "sort",
+}
+
+
+# Words that mark an utterance as a COMMAND or QUESTION addressed to the robot
+# rather than a label answer. If any appears, "what is that?" must not swallow
+# it as a label - object labels are nouns and never contain these. Guards the
+# real bug: a command issued while a question is open (spoken, or a web-console
+# button, which publishes on the SAME heard topic - e.g. "who am I") was being
+# mis-stored as a label ("I'll remember that's a 'who am'").
+_NON_LABEL_WORDS = {
+    # interrogatives
+    "who", "whom", "whose", "whos", "what", "whats", "where", "when", "why",
+    "how", "which",
+    # question-leading auxiliaries ("are you...", "can you...", "do you...")
+    "are", "am", "do", "does", "did", "can", "could", "would", "will", "should",
+    # command verbs / motion the robot acts on
+    "stop", "halt", "go", "come", "follow", "wander", "explore", "turn", "move",
+    "drive", "spin", "find", "search", "play", "pause", "resume", "forward",
+    "backward", "left", "right",
 }
 
 
@@ -91,6 +118,23 @@ def parse_label_answer(text, options):
             return opt
     words = [w for w in re.findall(r"[a-z']+", low) if w not in _ANSWER_FILLER]
     return " ".join(words[:3]) if words else None
+
+
+def looks_like_label_answer(text, options):
+    """True if `text` could plausibly answer 'what is that?' - an affirmation or
+    negation, one of the offered options, or a plain noun label - and NOT a
+    command or question aimed at the robot. Pure/unit-testable. Keeps an
+    unrelated command from being mis-stored as a label when a question happens
+    to be open (see _NON_LABEL_WORDS)."""
+    low = (text or "").lower().strip()
+    if not low:
+        return False
+    if speech_match.parse_feedback(low) in ("correct", "incorrect"):
+        return True                      # "yes" / "no, a mug" - a real answer
+    tokens = re.findall(r"[a-z']+", low)
+    if any(t in _NON_LABEL_WORDS for t in tokens):
+        return False                     # a command/question, not a label
+    return True
 
 
 class Curiosity:
@@ -182,13 +226,27 @@ class Curiosity:
             self.last_ask_at = now
         print(f"Curiosity: asking about {target['id']} - '{text}'")
         self._say(text, kind="question", label=guess, object_id=target["id"])
+        self._pause_to_listen()
+
+    def _pause_to_listen(self):
+        """Briefly hold still when asking, so the robot visibly waits for the
+        answer instead of driving on to its next thought. Fail-soft - a pause
+        that can't publish must never stop the question itself."""
+        try:
+            self.bus.publish(MOVE_TOPIC, {
+                "source": "curiosity", "priority": ATTENTION_PRIORITY,
+                "action": {"direction": "stop"}, "ttl": ATTENTION_PAUSE_SEC})
+        except Exception as e:
+            print(f"Curiosity: attention pause failed: {e}")
 
     # ---------- answer capture ----------
 
     def on_heard(self, payload):
-        """The next human utterance after a question is its answer. Repaired
-        and correction echoes are skipped (same guard companion uses), and a
-        stale/absent question just clears - this never dispatches anything."""
+        """The next human utterance after a question is its answer. Repaired and
+        correction echoes are skipped (same guard companion uses); a stale or
+        absent question just clears; and an utterance that is really a COMMAND or
+        question addressed to the robot is left alone so it isn't mis-stored as a
+        label - the question stays open for a genuine answer. Never dispatches."""
         if payload.get("source") in ("intent_repair", "user_correction"):
             return
         text = (payload.get("text") or "").strip()
@@ -197,9 +255,23 @@ class Curiosity:
         now = time.time()
         with self.lock:
             pending = self.pending
-            self.pending = None
-        if not pending or now > pending["until"]:
+        if not pending:
             return
+        if now > pending["until"]:
+            with self.lock:
+                if self.pending is pending:
+                    self.pending = None    # window closed - drop it, no answer
+            return
+        # Don't hijack a command/question meant for the robot (spoken, or a
+        # web-console button on this same heard topic) as a label answer. Leave
+        # the question open so a real answer within the window still lands.
+        if not looks_like_label_answer(text, pending["options"]):
+            print(f"Curiosity: '{text}' looks like a command, not a label "
+                  f"- leaving the question open")
+            return
+        with self.lock:
+            if self.pending is pending:
+                self.pending = None
         self._resolve_answer(pending, text, origin="voice")
 
     def _resolve_answer(self, pending, text, origin):

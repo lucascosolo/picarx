@@ -94,7 +94,8 @@ KNOBS = [
      "desc": "Shell command run to power the speaker amp before speaking."},
     {"section": "audio", "key": "vosk_model_path", "type": "str",
      "default": base_path("modules", "models", "model-en-lgraph"),
-     "env": "VOSK_MODEL_PATH", "desc": "Path to the Vosk speech-to-text model."},
+     "env": "VOSK_MODEL_PATH", "desc": "Path to the Vosk speech-to-text model.",
+     "config_default": None},   # install-derived: materialize as null (portable)
     {"section": "audio", "key": "debug_levels", "type": "bool",
      "default": False, "env": "AUDIO_DEBUG_LEVELS",
      "desc": "Print live mic input/noise levels to help tune the gates."},
@@ -193,10 +194,12 @@ KNOBS = [
     # ---- embeddings (embedding_util.py) ----
     {"section": "embeddings", "key": "model_path", "type": "str",
      "default": data_path("models", "minilm", "model.onnx"),
-     "env": "EMBED_MODEL_PATH", "desc": "Path to the MiniLM ONNX embedding model."},
+     "env": "EMBED_MODEL_PATH", "desc": "Path to the MiniLM ONNX embedding model.",
+     "config_default": None},   # install-derived: materialize as null (portable)
     {"section": "embeddings", "key": "tokenizer_path", "type": "str",
      "default": data_path("models", "minilm", "tokenizer.json"),
-     "env": "EMBED_TOKENIZER_PATH", "desc": "Path to the embedding model's tokenizer."},
+     "env": "EMBED_TOKENIZER_PATH", "desc": "Path to the embedding model's tokenizer.",
+     "config_default": None},   # install-derived: materialize as null (portable)
     # ---- kinematics (steering_controller.py) - file-only ----
     {"section": "kinematics", "key": "wheelbase_mm", "type": "int",
      "default": 95, "env": None,
@@ -224,6 +227,50 @@ def knobs():
     """The full knob registry as a deep copy (see KNOBS). The web console's
     Config page renders from this, so it always lists every tunable."""
     return copy.deepcopy(KNOBS)
+
+
+def _knob_file_default(knob):
+    """The value a knob should be MATERIALIZED as in config.json. Path knobs
+    whose built-in default is derived from the install location carry
+    "config_default": None so they land as JSON null (get() treats null as
+    unset and re-derives the path), keeping a written config.json portable."""
+    return knob.get("config_default", knob["default"]) if "config_default" in knob \
+        else knob["default"]
+
+
+def sync_defaults(write=True):
+    """Materialize the KNOBS registry into config.json: KNOBS is the single
+    source of truth (in code, version-controlled), and this tops up config.json
+    with any knob it is missing, at that knob's default. Existing values and the
+    `_readme` block are PRESERVED - only missing knobs are added - so a user's
+    web-console edits survive, and pulling code that introduces a new knob makes
+    it appear (at its default) in config.json and on the Config page with no
+    manual step. Creates the file if absent. Writes atomically, and only when
+    something changed. Fail-soft: a write error is logged, never raised. Returns
+    the list of (section, key) added."""
+    current = _load()
+    merged = copy.deepcopy(current) if isinstance(current, dict) else {}
+    added = []
+    for knob in KNOBS:
+        section = merged.setdefault(knob["section"], {})
+        if not isinstance(section, dict):
+            continue   # a corrupt/hand-broken section - leave it for the user
+        if knob["key"] not in section:
+            section[knob["key"]] = _knob_file_default(knob)
+            added.append((knob["section"], knob["key"]))
+    if added and write:
+        try:
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(merged, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, CONFIG_PATH)   # atomic: a reader never sees a half file
+            reload()
+        except OSError as e:
+            print(f"robot_config: could not materialize defaults into "
+                  f"{CONFIG_PATH} ({e}); running on built-in defaults")
+            return []
+    return added
 
 
 def env_override(env_name):

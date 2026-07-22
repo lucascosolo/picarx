@@ -132,53 +132,55 @@ class RobotConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             robot_config.merge_and_save({"audio": 5})
 
-    # ---- the shipped file ----
+    # ---- runtime materialization (config.json is derived from KNOBS) ----
 
-    def test_shipped_config_parses_and_matches_key_defaults(self):
-        shipped = os.path.join(harness.LAYER_B, "config.json")
-        with open(shipped) as f:
+    def test_sync_defaults_materializes_every_knob(self):
+        # A fresh/absent config.json is topped up with every registered knob at
+        # its default, so pulling code that adds a knob needs no manual edit.
+        added = robot_config.sync_defaults()
+        self.assertTrue(os.path.exists(self.path))
+        with open(self.path) as f:
             cfg = json.load(f)
-        self.assertIsInstance(cfg, dict)
-        # Spot-check that the shipped file states the same defaults the
-        # modules bake in - the file's whole point is being an honest menu.
-        self.assertEqual(cfg["audio"]["espeak_voice"], "mb-us1")
-        self.assertEqual(cfg["health"]["battery_adc"], False)
-        self.assertEqual(cfg["web_console"]["port"], 8088)
-        self.assertEqual(cfg["radio"]["alsa_device"], "plug:robot_speaker")
-
-
-class KnobRegistryTest(unittest.TestCase):
-    """The registry is the single source of truth behind the Config page; these
-    guard it against drift so 'every tunable is on the page' stays true."""
-
-    def _shipped(self):
-        with open(os.path.join(harness.LAYER_B, "config.json")) as f:
-            return json.load(f)
-
-    def test_registry_and_shipped_config_list_the_same_knobs(self):
-        cfg = self._shipped()
         file_knobs = {(sec, key) for sec, kv in cfg.items()
                       if sec != "_readme" and isinstance(kv, dict) for key in kv}
         reg_knobs = {(k["section"], k["key"]) for k in robot_config.KNOBS}
-        # Every shipped knob is registered (so it appears on the page)...
-        self.assertEqual(file_knobs - reg_knobs, set(),
-                         "config.json has knobs missing from the registry")
-        # ...and every registered knob is shipped (so its default is honest).
-        self.assertEqual(reg_knobs - file_knobs, set(),
-                         "registry has knobs missing from config.json")
+        self.assertEqual(reg_knobs, file_knobs)          # exact 1:1 coverage
+        self.assertEqual(set(added), reg_knobs)          # all were newly added
 
-    def test_registry_defaults_match_shipped_defaults(self):
-        cfg = self._shipped()
+    def test_sync_defaults_values_match_registry(self):
+        robot_config.sync_defaults()
+        with open(self.path) as f:
+            cfg = json.load(f)
         for k in robot_config.KNOBS:
-            shipped = cfg[k["section"]][k["key"]]
-            # A null in the shipped file means "fall through to the built-in
-            # default" (get() treats JSON null as unset) - used for path knobs
-            # whose default is derived from the install location and so can't be
-            # written as a fixed string here. Still an honest listing.
-            if shipped is None:
-                continue
-            self.assertEqual(shipped, k["default"],
-                             f"{k['section']}.{k['key']} default disagrees")
+            written = cfg[k["section"]][k["key"]]
+            # Path knobs carry config_default=None -> materialized as JSON null.
+            expected = k.get("config_default", k["default"]) \
+                if "config_default" in k else k["default"]
+            self.assertEqual(written, expected,
+                             f"{k['section']}.{k['key']} materialized wrongly")
+
+    def test_sync_defaults_preserves_user_values_and_readme(self):
+        self._write({"_readme": ["note"], "audio": {"gain": 5.0}})
+        robot_config.sync_defaults()
+        with open(self.path) as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["_readme"], ["note"])       # docs preserved
+        self.assertEqual(cfg["audio"]["gain"], 5.0)      # user edit preserved
+        self.assertEqual(cfg["web_console"]["port"], 8088)  # missing knob added
+
+    def test_sync_defaults_is_idempotent(self):
+        robot_config.sync_defaults()
+        self.assertEqual(robot_config.sync_defaults(), [])   # nothing left to add
+
+
+class KnobRegistryTest(unittest.TestCase):
+    """The registry is the single source of truth behind the Config page and
+    behind config.json (materialized via sync_defaults); these guard it against
+    drift so 'every tunable is on the page' stays true."""
+
+    def test_registry_has_no_duplicate_knobs(self):
+        keys = [(k["section"], k["key"]) for k in robot_config.KNOBS]
+        self.assertEqual(len(keys), len(set(keys)), "duplicate knob in registry")
 
     def test_every_env_knob_in_source_is_registered(self):
         # Scan every module for `env="NAME"` (the get()/get_bool() overrides)

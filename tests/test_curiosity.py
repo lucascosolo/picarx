@@ -82,6 +82,24 @@ class ParseLabelAnswerTest(unittest.TestCase):
             "chairman")
 
 
+class LooksLikeLabelAnswerTest(unittest.TestCase):
+    def test_plain_noun_and_options_and_affirmations_pass(self):
+        self.assertTrue(curiosity.looks_like_label_answer("a coffee mug", ["chair"]))
+        self.assertTrue(curiosity.looks_like_label_answer("it's the speaker",
+                                                          ["chair", "speaker"]))
+        self.assertTrue(curiosity.looks_like_label_answer("yes", ["chair"]))
+        self.assertTrue(curiosity.looks_like_label_answer("no, a mug", ["chair"]))
+
+    def test_commands_and_questions_are_rejected(self):
+        for cmd in ("who am I", "what do you see", "stop", "follow me",
+                    "come here", "go to the kitchen", "turn left"):
+            self.assertFalse(curiosity.looks_like_label_answer(cmd, ["chair"]),
+                             f"{cmd!r} should not read as a label")
+
+    def test_empty_is_rejected(self):
+        self.assertFalse(curiosity.looks_like_label_answer("", ["chair"]))
+
+
 class CuriosityAskTest(unittest.TestCase):
     def setUp(self):
         self.c = curiosity.Curiosity()  # __init__ only builds a FakeBus + locks
@@ -103,6 +121,16 @@ class CuriosityAskTest(unittest.TestCase):
                                         "alt_label": None, "confidence": 0.52}]})
         self.assertIn("bottle", self.c.bus.last("picarx/audio/speak")["text"])
         self.assertEqual(self.c.pending["options"], ["bottle"])
+
+    def test_asking_pauses_the_robot_to_listen(self):
+        # Asking publishes a brief hold so the robot waits for an answer; it
+        # yields to reflexes (below evade/coach), so it must stay a low-ish stop.
+        self.c.on_objects(self._ambiguous())
+        hold = self.c.bus.last("picarx/intent/move")
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold["source"], "curiosity")
+        self.assertEqual(hold["action"], {"direction": "stop"})
+        self.assertLess(hold["priority"], 8)          # below EVADE_PRIORITY
 
     def test_confident_unambiguous_object_is_left_alone(self):
         self.c.on_objects({"objects": [{"id": "object_2", "label": "chair",
@@ -155,6 +183,18 @@ class CuriosityAnswerTest(unittest.TestCase):
         self.c.on_heard({"text": "speaker", "source": "intent_repair"})
         self.assertIsNone(self.c.bus.last("picarx/perception/label"))
         self.assertIsNotNone(self.c.pending)  # still waiting for a real answer
+
+    def test_command_is_not_swallowed_as_a_label(self):
+        # The reported bug: pressing "who am I" while a question is open must NOT
+        # be stored as the label - and the question stays open for a real answer.
+        self.c.on_heard({"text": "who am I"})
+        self.assertIsNone(self.c.bus.last("picarx/perception/label"))
+        self.assertIsNotNone(self.c.pending)          # question left open
+        # a genuine answer right after still lands
+        self.c.on_heard({"text": "it's a speaker"})
+        self.assertEqual(self.c.bus.last("picarx/perception/label")["correct_label"],
+                         "speaker")
+        self.assertIsNone(self.c.pending)
 
     def test_stale_question_expires(self):
         self.c.pending["until"] = curiosity.time.time() - 1

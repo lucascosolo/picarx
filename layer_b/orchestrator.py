@@ -135,6 +135,10 @@ signal.signal(signal.SIGINT, shutdown)
 
 def main():
     print("Orchestrator starting, syncing initial module state...")
+    added = robot_config.sync_defaults()
+    if added:
+        print(f"Orchestrator: materialized {len(added)} new config default(s) "
+              f"into config.json ({', '.join(f'{s}.{k}' for s, k in added)})")
     sync_with_registry()
     while True:
         time.sleep(5)
