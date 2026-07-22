@@ -120,13 +120,68 @@ class IMUModuleTest(unittest.TestCase):
 
     def test_missing_chip_reports_reason_and_beacons_status(self):
         m = imu.IMU()                                      # no injected sensor
-        ok, reason = m._open_sensor()                      # mpu6050 not installed here
+        ok, reason = m._open_sensor()                      # robot_hat absent off-robot
         self.assertFalse(ok)
-        self.assertIn("mpu6050", reason.lower())
+        self.assertIn("robot_hat", reason.lower())
         m._publish_status(False, reason)
         status = m.bus.last("picarx/sensors/imu/status")
         self.assertFalse(status["available"])
         self.assertEqual(status["reason"], reason)
+
+
+class _FakeI2C:
+    """Stand-in for robot_hat.I2C: write([reg,...]) sets the register pointer
+    from the first byte; read(n) returns n bytes from a reg->byte map."""
+    def __init__(self, regs=None):
+        self.regs = dict(regs or {})
+        self._ptr = 0
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(list(data))
+        if data:
+            self._ptr = data[0]
+
+    def read(self, n):
+        return [self.regs.get(self._ptr + i, 0) for i in range(n)]
+
+    def scan(self):
+        return [0x68]
+
+
+class RobotHatBackendTest(unittest.TestCase):
+    """The MPU-6050 register protocol: wake, pointer+burst read, signed 16-bit
+    combine, and datasheet scaling to m/s^2 / deg/s / Celsius."""
+
+    def _regs(self):
+        # accel Z = +1g (0x4000=16384), accel X = -1g (0xC000), gyro X = +1 dps
+        # (131=0x0083), temperature raw 0 -> 36.53 C.
+        return {0x3B: 0xC0, 0x3C: 0x00,          # accel X -16384
+                0x3F: 0x40, 0x40: 0x00,          # accel Z +16384
+                0x43: 0x00, 0x44: 0x83,          # gyro X +131
+                0x41: 0x00, 0x42: 0x00}          # temp 0
+
+    def test_wake_writes_power_register(self):
+        i2c = _FakeI2C()
+        imu.RobotHatMPU6050(i2c).wake()
+        self.assertIn([0x6B, 0x00], i2c.writes)
+
+    def test_accel_scaled_and_signed(self):
+        s = imu.RobotHatMPU6050(_FakeI2C(self._regs()))
+        a = s.get_accel_data()
+        self.assertAlmostEqual(a["z"], imu.STANDARD_GRAVITY, places=3)   # +1g
+        self.assertAlmostEqual(a["x"], -imu.STANDARD_GRAVITY, places=3)  # -1g
+        self.assertAlmostEqual(a["y"], 0.0, places=3)
+
+    def test_gyro_and_temperature_scaled(self):
+        s = imu.RobotHatMPU6050(_FakeI2C(self._regs()))
+        self.assertAlmostEqual(s.get_gyro_data()["x"], 1.0, places=2)    # 131 LSB/dps
+        self.assertAlmostEqual(s.get_temperature(), 36.53, places=2)
+
+    def test_reads_set_the_register_pointer(self):
+        i2c = _FakeI2C(self._regs())
+        imu.RobotHatMPU6050(i2c).get_accel_data()
+        self.assertIn([0x3B], i2c.writes)        # pointed at ACCEL_XOUT_H first
 
 
 class WorldStateImuTest(unittest.TestCase):
