@@ -264,25 +264,31 @@ class IMU:
         self._prev_derived = derived
 
     def _open_sensor(self):
-        """Open the MPU-6050, or return False if the library/chip is absent.
-        Guarded so the module runs (idle) off-robot and never crash-loops."""
+        """Open the MPU-6050. Returns (ok, reason); reason is a human string
+        when ok is False. Guarded so the module runs (idle) off-robot / with no
+        chip and never crash-loops."""
         if self.sensor is not None:
-            return True
+            return True, "ok"
         try:
             from mpu6050 import mpu6050
         except ImportError:
-            print("IMU: python-mpu6050 not installed (pip install mpu6050-raspberrypi) "
-                  "- IMU disabled, idling.")
-            return False
+            return False, ("python-mpu6050 not installed "
+                           "(pip install mpu6050-raspberrypi)")
         try:
             self.sensor = mpu6050(I2C_ADDRESS)
             self.sensor.get_accel_data()   # probe: raises if the chip isn't there
-            return True
+            return True, "ok"
         except Exception as e:
-            print(f"IMU: MPU-6050 not found at 0x{I2C_ADDRESS:02x} ({e}) - "
-                  "IMU disabled, idling.")
             self.sensor = None
-            return False
+            return False, f"MPU-6050 not found at 0x{I2C_ADDRESS:02x} ({e})"
+
+    def _publish_status(self, available, reason):
+        """A bus-visible health beacon (picarx/sensors/imu/status) so the IMU's
+        state is discoverable with `mosquitto_sub` - not just buried in a log.
+        Republished periodically while idle so a late subscriber still sees it."""
+        self.bus.publish("picarx/sensors/imu/status", {
+            "available": bool(available), "reason": reason,
+            "address": I2C_ADDRESS, "hz": IMU_HZ, "ts": time.time()})
 
     # ---------- main loop ----------
 
@@ -290,19 +296,26 @@ class IMU:
         self.bus.subscribe(LOOK_TOPIC, self.on_look)
         self.bus.subscribe("picarx/sensors/imu/recalibrate", self.on_recalibrate)
 
-        if not self._open_sensor():
+        ok, reason = self._open_sensor()
+        if not ok:
             # Stay alive (don't exit -> the orchestrator would just restart us in
-            # a loop) but publish nothing; a robot without the chip runs normally.
+            # a loop) but publish nothing on the data topic; a robot without the
+            # chip runs normally. Beacon the reason so it's visible on the bus.
+            print(f"IMU: {reason} - IMU disabled, idling.")
             while True:
-                time.sleep(60)
+                self._publish_status(False, reason)
+                time.sleep(30)
 
         if not self.calibrate_at_rest():
-            print("IMU: could not calibrate (no readings) - idling.")
+            reason = "could not calibrate (no readings from the chip)"
+            print(f"IMU: {reason} - idling.")
             while True:
-                time.sleep(60)
+                self._publish_status(False, reason)
+                time.sleep(30)
 
         print(f"IMU active on picarx/sensors/imu at {IMU_HZ:.0f}Hz "
               f"(address 0x{I2C_ADDRESS:02x})")
+        self._publish_status(True, "ok")
         period = 1.0 / max(1.0, IMU_HZ)
         while True:
             reading = self._read()

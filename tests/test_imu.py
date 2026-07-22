@@ -118,6 +118,16 @@ class IMUModuleTest(unittest.TestCase):
         self.assertIsNone(m._read())                       # no raise
         self.assertFalse(m.calibrate_at_rest(samples=2, delay=0))  # no samples
 
+    def test_missing_chip_reports_reason_and_beacons_status(self):
+        m = imu.IMU()                                      # no injected sensor
+        ok, reason = m._open_sensor()                      # mpu6050 not installed here
+        self.assertFalse(ok)
+        self.assertIn("mpu6050", reason.lower())
+        m._publish_status(False, reason)
+        status = m.bus.last("picarx/sensors/imu/status")
+        self.assertFalse(status["available"])
+        self.assertEqual(status["reason"], reason)
+
 
 class WorldStateImuTest(unittest.TestCase):
     def test_imu_folds_into_snapshot_with_staleness(self):
