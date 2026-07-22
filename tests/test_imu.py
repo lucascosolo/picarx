@@ -109,6 +109,14 @@ class IMUModuleTest(unittest.TestCase):
         m._publish_reading((0, 0, 9.8), (0, 0, 0), 25.0)   # calib is None
         self.assertIsNone(m.bus.last("picarx/sensors/imu"))
 
+    def test_training_mode_toggles_pause_flag(self):
+        m = imu.IMU(read_raw=_reader())
+        self.assertFalse(m._training)
+        m.on_training({"active": True})
+        self.assertTrue(m._training)      # loop will skip the I2C read while set
+        m.on_training({"active": False})
+        self.assertFalse(m._training)
+
     def test_read_error_is_soft(self):
         m = imu.IMU(read_raw=_reader(error="read 0x68: NAK"))
         self.assertIsNone(m._read())                       # no raise

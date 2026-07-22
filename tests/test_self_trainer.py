@@ -221,6 +221,22 @@ class IdleActivityTest(unittest.TestCase):
         self.assertTrue(proc.terminated)                      # session killed
 
 
+class TrainingModeSignalTest(unittest.TestCase):
+    def _trainer(self):
+        st = self_trainer.SelfTrainer.__new__(self_trainer.SelfTrainer)
+        st.bus = harness.FakeBus()
+        st.training_repo = "/fake"
+        return st
+
+    def test_publishes_training_signal_on_and_off(self):
+        st = self._trainer()
+        st._set_training_mode(True)      # daemon socket best-effort (no daemon here)
+        msg = st.bus.last(self_trainer.TRAINING_TOPIC)
+        self.assertTrue(msg["active"])
+        st._set_training_mode(False)
+        self.assertFalse(st.bus.last(self_trainer.TRAINING_TOPIC)["active"])
+
+
 class StatusPublishTest(unittest.TestCase):
     def _trainer(self, repo="/fake/picarx-training", last_activity=0.0,
                  last_session_end=0.0):

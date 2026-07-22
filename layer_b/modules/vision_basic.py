@@ -319,6 +319,8 @@ FORCE_DETECT_INTERVAL = 6.0     # always refresh at least this often, motion or 
 # hands-on debugging - never during autonomous operation, preserving the
 # CPU budget this module guards everywhere else.
 STREAM_CONTROL_TOPIC = "picarx/vision/stream_control"
+TRAINING_TOPIC = "picarx/system/training"   # self_trainer: throttle to free CPU
+TRAINING_LOOP_INTERVAL = 1.0                # slow the capture loop while training
 STREAM_FRAME_TOPIC = "picarx/vision/frame"
 STREAM_MIN_INTERVAL = 0.2       # cap publish rate (~5 fps ceiling; loop tick bounds it lower)
 STREAM_JPEG_QUALITY = 60        # small over MQTT/base64; a debug view doesn't need more
@@ -660,6 +662,17 @@ def run():
         print(f"vision: low-power {state}")
     bus.subscribe(LOW_POWER_TOPIC, on_low_power)
 
+    # Idle self-training (picarx/system/training): while a training session runs
+    # the robot is parked, so free the camera's expensive SSD/Haar passes for the
+    # trainer. Throttled exactly like low-power-CRITICAL, and released the instant
+    # the session ends/aborts. Face/object detection still tick (rarely), so a
+    # person walking up is still eventually seen.
+    training = {"active": False}
+    def on_training(payload):
+        training["active"] = bool(payload.get("active", False))
+        print(f"vision: self-training mode {'ON - throttling detection' if training['active'] else 'off'}")
+    bus.subscribe(TRAINING_TOPIC, on_training)
+
     # On-board label memory (recognition tier 2): visual signatures of tracked
     # objects, cached by track id on each detection pass, plus the persistent
     # signature->label store a human/LLM teaches. A label arriving on
@@ -717,9 +730,12 @@ def run():
         # itself backs off to 1s/2s while conserving power (see the FACE_DETECT
         # interval constants).
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        # Training mode throttles detection like low-power CRITICAL (see on_training).
+        power_critical = low_power["critical"] or training["active"]
+        power_active = low_power["active"] or training["active"]
         face_now = time.time()
-        face_interval = (CRITICAL_FACE_DETECT_INTERVAL if low_power["critical"]
-                         else LOW_POWER_FACE_DETECT_INTERVAL if low_power["active"]
+        face_interval = (CRITICAL_FACE_DETECT_INTERVAL if power_critical
+                         else LOW_POWER_FACE_DETECT_INTERVAL if power_active
                          else 0.0)
         if face_now - last_face_detect >= face_interval:
             last_face_detect = face_now
@@ -763,7 +779,7 @@ def run():
 
         # ---------- object detection (motion-gated + throttled) ----------
         now = time.time()
-        detect_interval = (LOW_POWER_OBJECT_DETECT_INTERVAL if low_power["active"]
+        detect_interval = (LOW_POWER_OBJECT_DETECT_INTERVAL if power_active
                            else OBJECT_DETECT_INTERVAL)
         if now - last_object_detect >= detect_interval:
             last_object_detect = now
@@ -880,7 +896,9 @@ def run():
                     "w": frame_w, "h": frame_h, "ts": now,
                 })
 
-        time.sleep(DETECT_INTERVAL)
+        # While self-training, slow the whole capture loop too (not just the
+        # detection passes) so the trainer gets the CPU. Released on session end.
+        time.sleep(TRAINING_LOOP_INTERVAL if training["active"] else DETECT_INTERVAL)
 
 
 if __name__ == "__main__":

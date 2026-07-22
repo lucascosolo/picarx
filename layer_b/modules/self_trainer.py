@@ -54,6 +54,7 @@ import glob
 import json
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -74,6 +75,8 @@ CHECK_INTERVAL = 30.0     # how often the idle/eligibility check runs
 POLL_INTERVAL = 1.0       # how often a running session is checked for abort/timeout
 NICE = 10                 # subprocess niceness - training must never starve live work
 STATUS_TOPIC = "picarx/self_trainer/status"   # bus-visible lifecycle heartbeat
+TRAINING_TOPIC = "picarx/system/training"     # tells heavy modules to conserve CPU
+SAFETY_SOCKET = "/tmp/picarx_safety.sock"     # Layer A (SIM uses its own; N/A here)
 
 # Battery is only a proxy for "on the dock / topped up": there's no explicit
 # charging line on picarx/state/world, so a healthy, high pack stands in.
@@ -347,6 +350,27 @@ class SelfTrainer:
         except Exception as e:
             print(f"Self-trainer: status publish failed: {e}")
 
+    def _set_training_mode(self, active):
+        """Tell the rest of the robot to conserve CPU/I2C for the training
+        subprocess: a bus signal (vision throttles, imu pauses) plus a direct
+        message to the safety daemon (which then skips its non-critical IMU
+        read). Always called with False in the session finally, so a killed or
+        crashed session still releases everyone. Fail-soft - motion, veto and
+        battery monitoring on the daemon are never touched by this."""
+        try:
+            self.bus.publish(TRAINING_TOPIC, {"active": bool(active), "ts": time.time()})
+        except Exception as e:
+            print(f"Self-trainer: training signal failed: {e}")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                s.connect(SAFETY_SOCKET)
+                s.sendall(json.dumps(
+                    {"command": "training_mode", "active": bool(active)}).encode())
+                s.recv(256)
+        except Exception as e:
+            print(f"Self-trainer: could not set safety training_mode: {e}")
+
     # ---------- session orchestration (thin) ----------
 
     def _terminate(self, proc, why):
@@ -411,6 +435,7 @@ class SelfTrainer:
             print(f"Self-trainer: training on {scenario_name} "
                   f"(speedf {SPEEDF:g}, nice {NICE})")
             self._publish_status("training", scenario=scenario_name, speedf=SPEEDF)
+            self._set_training_mode(True)    # free CPU/I2C before the run starts
             proc = subprocess.Popen(cmd, cwd=self.training_repo, env=env,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
@@ -428,6 +453,7 @@ class SelfTrainer:
             self._publish_status("error", detail=str(e))
             print(f"Self-trainer: session error: {e}")
         finally:
+            self._set_training_mode(False)    # always release (abort/crash included)
             with self.lock:
                 self.proc = None
                 self.last_session_end = time.time()   # cooldown applies even on abort/failure

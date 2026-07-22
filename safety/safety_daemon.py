@@ -45,6 +45,12 @@ px = Picarx()
 battery_adc = ADC(BATTERY_ADC_CHANNEL)
 battery_state = {"voltage": None, "critical": False, "low": False}
 
+# Set by self_trainer via the "training_mode" command: while a self-training
+# session runs the robot is parked, so we skip the non-safety-critical IMU read
+# to free the I2C bus + CPU for training. Motion, veto and battery monitoring are
+# NEVER disabled - safety and machine preservation stay fully live.
+training_mode = False
+
 hardware_lock = threading.Lock()
 
 # ---- IMU (MPU-6050) read, on request ----
@@ -411,6 +417,7 @@ def execute(action):
             px.set_cam_tilt_angle(tilt)
 
 def main():
+    global training_mode
     if os.path.exists(SOCKET_PATH):
         os.remove(SOCKET_PATH)
         
@@ -466,7 +473,14 @@ def main():
             if action.get("query") == "imu":
                 # The MPU shares the I2C bus with the ADC/servos, so serialize
                 # the read under hardware_lock. Fail-soft: an error dict tells
-                # Layer B the sensor is absent/unreadable.
+                # Layer B the sensor is absent/unreadable. Skipped entirely in
+                # training mode (parked robot) to free the bus for the trainer.
+                if training_mode:
+                    try:
+                        conn.sendall(json.dumps({"error": "paused for training"}).encode())
+                    except Exception:
+                        pass
+                    continue
                 try:
                     address = int(action.get("address", 0x68))
                     with hardware_lock:
@@ -477,6 +491,16 @@ def main():
                         conn.sendall(json.dumps({"error": str(sensor_err)}).encode())
                     except Exception:
                         pass
+                continue
+
+            # --- Commands (state changes, not sensor reads) ---
+            if action.get("command") == "training_mode":
+                training_mode = bool(action.get("active", False))
+                print(f"Safety daemon: training mode {'ON (IMU read paused)' if training_mode else 'off'}")
+                try:
+                    conn.sendall(json.dumps({"training_mode": training_mode}).encode())
+                except Exception:
+                    pass
                 continue
             # ---------------
 

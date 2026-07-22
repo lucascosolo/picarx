@@ -222,6 +222,7 @@ class IMU:
         self.head_tilt = 0.0
         self._prev_derived = {}       # for edge-triggered events
         self._event_at = {}           # kind -> last-published ts (throttle)
+        self._training = False        # paused while a self-training session runs
 
     # ---------- head pose (from the look channel; not otherwise published) ----
 
@@ -274,6 +275,12 @@ class IMU:
         """picarx/sensors/imu/recalibrate: re-zero while parked (e.g. after a
         pickup, or a head re-home). Fail-soft - a bad recal just keeps the old."""
         self.calibrate_at_rest()
+
+    def on_training(self, payload):
+        """Pause polling while a self-training session runs (picarx/system/
+        training) - the robot is parked, so free the I2C bus + CPU for training.
+        Resumes the instant the session ends/aborts."""
+        self._training = bool(payload.get("active", False))
 
     # ---------- one publish cycle (pure-ish given a reading) ----------
 
@@ -339,6 +346,7 @@ class IMU:
     def run(self):
         self.bus.subscribe(LOOK_TOPIC, self.on_look)
         self.bus.subscribe("picarx/sensors/imu/recalibrate", self.on_recalibrate)
+        self.bus.subscribe("picarx/system/training", self.on_training)
 
         ok, reason = self._probe_available()
         if not ok:
@@ -362,6 +370,9 @@ class IMU:
         self._publish_status(True, "ok")
         period = 1.0 / max(1.0, IMU_HZ)
         while True:
+            if self._training:
+                time.sleep(1.0)          # parked for training - skip the I2C read
+                continue
             reading = self._read()
             if reading is not None:
                 self._publish_reading(*reading)
