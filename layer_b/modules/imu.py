@@ -34,16 +34,18 @@ of the chip: magnitudes and angles, not raw per-axis body angles.
   body_tilt       - tilt_from_rest with the commanded head tilt removed: a
                     heuristic chassis tilt (ramp / being tipped or picked up).
 
-The chip is read through robot_hat's own I2C stack (the same one the safety
-daemon uses), NOT the smbus-based `mpu6050` library - that library's block
-reads returned [Errno 5] I/O error on this HAT, whereas robot_hat.I2C's plain
-write-pointer-then-read transactions work. See RobotHatMPU6050 below.
+This module NEVER touches hardware directly. Layer A (the safety daemon) owns
+ALL hardware, so - exactly like distance_sensor.py - the MPU-6050 is READ by the
+safety daemon over its socket ({"query": "imu"}) and this module just asks for a
+reading, then does the calibration / derived-signal / publish work. Importing
+robot_hat here would pull in lgpio/GPIO, which won't initialize in the Layer B
+service environment (and would double-own the I2C bus); the daemon already has
+robot_hat working, so the raw read lives there.
 
-Fail-soft and hardware-isolated: if robot_hat or the chip is absent, the module
-logs once, beacons a status message, and idles (it never crash-loops the
-orchestrator, and never touches the drive motors or the safety daemon - it only
-reads I2C and publishes). All the decision math lives in pure module-level
-helpers so it is unit-tested off-robot with a fake sensor.
+Fail-soft: if the daemon reports the chip is absent/unreadable, the module logs
+once, beacons a status message, and idles (it never crash-loops the
+orchestrator). All the decision math lives in pure module-level helpers so it is
+unit-tested off-robot with an injected fake reader.
 """
 import os
 import getpass
@@ -54,12 +56,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 
+import json
 import math
+import socket
 import time
 import threading
 
 IMU_TOPIC = "picarx/sensors/imu"
 LOOK_TOPIC = "picarx/intent/look"
+# Layer A's socket (the sim's run_module redirects this to its private socket,
+# same as distance_sensor's SOCKET_PATH).
+SOCKET_PATH = "/tmp/picarx_safety.sock"
 
 def _parse_address(raw, default=0x68):
     """Accept an I2C address as a decimal int (104), a decimal string ("104"),
@@ -180,68 +187,23 @@ def compute_derived(accel, gyro_corrected, calib, head_tilt_cmd,
 
 
 # --------------------------------------------------------------------------
-# MPU-6050 over robot_hat's I2C (avoids the smbus block-read EIO on this HAT)
+# reading the sensor: ask Layer A (the safety daemon owns the hardware)
 # --------------------------------------------------------------------------
 
-_REG_PWR_MGMT_1 = 0x6B     # power management: clear bit6 (SLEEP) to wake
-_REG_ACCEL_XOUT_H = 0x3B   # accel X/Y/Z high bytes start here (6 bytes)
-_REG_TEMP_OUT_H = 0x41     # temperature high byte (2 bytes)
-_REG_GYRO_XOUT_H = 0x43    # gyro X/Y/Z high bytes start here (6 bytes)
-_ACCEL_LSB_PER_G = 16384.0  # AFS_SEL=0 (default, +-2g)
-_GYRO_LSB_PER_DPS = 131.0   # FS_SEL=0 (default, +-250 deg/s)
-
-
-def _to_signed16(value):
-    """A 16-bit unsigned register pair as a signed int (two's complement)."""
-    return value - 65536 if value >= 0x8000 else value
-
-
-def _scan_hint(i2c):
-    """A ' (bus has: 0x68, 0x69)' fragment from robot_hat's scan(), for the
-    'not answering' message - so the real address is visible without i2cdetect.
-    Fail-soft: returns '' if scan isn't available or errors."""
+def query_safety_imu(address=I2C_ADDRESS, socket_path=None):
+    """One MPU-6050 reading from the safety daemon, as {"accel","gyro","temp"}
+    (physical units) or {"error": ...}. Mirrors distance_sensor.query_safety_
+    distance: a short-lived Unix-socket request, fail-soft on any error."""
+    path = socket_path or SOCKET_PATH
     try:
-        addrs = i2c.scan()
-        if addrs:
-            return " (bus has: " + ", ".join(f"0x{int(a):02x}" for a in addrs) + ")"
-    except Exception:
-        pass
-    return ""
-
-
-class RobotHatMPU6050:
-    """Read an MPU-6050 through a robot_hat.I2C handle, exposing the SAME
-    get_accel_data()/get_gyro_data()/get_temperature() interface (m/s^2, deg/s,
-    Celsius) the mpu6050 library did, so the rest of imu.py is unchanged. Each
-    read is a write-register-pointer then read-N-bytes pair (not an smbus block
-    read), which this HAT's I2C stack handles cleanly. Pure protocol logic -
-    unit-testable with a fake I2C, no hardware."""
-
-    def __init__(self, i2c):
-        self._i2c = i2c
-
-    def wake(self):
-        self._i2c.write([_REG_PWR_MGMT_1, 0x00])   # clear SLEEP -> sensor runs
-
-    def _read_words(self, start_reg, count):
-        self._i2c.write([start_reg])               # set the register pointer
-        raw = self._i2c.read(count * 2)            # burst-read count 16-bit words
-        return [_to_signed16((raw[2 * i] << 8) | raw[2 * i + 1])
-                for i in range(count)]
-
-    def get_accel_data(self):
-        x, y, z = self._read_words(_REG_ACCEL_XOUT_H, 3)
-        s = STANDARD_GRAVITY / _ACCEL_LSB_PER_G
-        return {"x": x * s, "y": y * s, "z": z * s}
-
-    def get_gyro_data(self):
-        x, y, z = self._read_words(_REG_GYRO_XOUT_H, 3)
-        return {"x": x / _GYRO_LSB_PER_DPS, "y": y / _GYRO_LSB_PER_DPS,
-                "z": z / _GYRO_LSB_PER_DPS}
-
-    def get_temperature(self):
-        (raw,) = self._read_words(_REG_TEMP_OUT_H, 1)
-        return raw / 340.0 + 36.53   # per the MPU-6050 datasheet
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect(path)
+            s.sendall(json.dumps({"query": "imu", "address": address}).encode())
+            resp = s.recv(1024)
+        return json.loads(resp.decode())
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # --------------------------------------------------------------------------
@@ -249,10 +211,12 @@ class RobotHatMPU6050:
 # --------------------------------------------------------------------------
 
 class IMU:
-    def __init__(self, sensor=None):
+    def __init__(self, read_raw=None):
         self.bus = Bus()
         self.lock = threading.Lock()
-        self.sensor = sensor          # injected in tests; opened in run() otherwise
+        # Returns one raw reading dict ({"accel","gyro","temp"} or {"error"}).
+        # Defaults to the safety-daemon socket query; tests inject a fake.
+        self._read_raw = read_raw or query_safety_imu
         self.calib = None
         self.head_pan = 0.0
         self.head_tilt = 0.0
@@ -269,16 +233,17 @@ class IMU:
             self.head_pan = float(action.get("pan", self.head_pan) or 0.0)
             self.head_tilt = float(action.get("tilt", self.head_tilt) or 0.0)
 
-    # ---------- sensor access (guarded) ----------
+    # ---------- sensor access (via the safety daemon) ----------
 
     def _read(self):
-        """(accel_vec, gyro_vec, temp_c) or None on any read error. The chip
-        occasionally NAKs a read; a dropped sample is skipped, not fatal."""
+        """(accel_vec, gyro_vec, temp_c) or None. The daemon returns physical
+        units; a NAK/absent sample comes back as {"error"} and is skipped."""
         try:
-            accel = _vec(self.sensor.get_accel_data())
-            gyro = _vec(self.sensor.get_gyro_data())
-            temp = float(self.sensor.get_temperature())
-            return accel, gyro, temp
+            data = self._read_raw()
+            if not isinstance(data, dict) or "error" in data or "accel" not in data:
+                raise IOError((data or {}).get("error", "no imu data")
+                              if isinstance(data, dict) else "no imu data")
+            return _vec(data["accel"]), _vec(data["gyro"]), float(data.get("temp", 0.0))
         except Exception as e:
             print(f"IMU: read failed ({e}); skipping this sample")
             return None
@@ -345,40 +310,21 @@ class IMU:
                   f"|accel| {derived['accel_magnitude_ms2']:.1f})")
         self._prev_derived = derived
 
-    def _open_sensor(self):
-        """Open the MPU-6050 through robot_hat's I2C stack (the same one the
-        safety daemon uses). Returns (ok, reason); reason is a human string when
-        ok is False. Guarded so the module runs (idle) off-robot / with no chip
-        and never crash-loops.
-
-        We deliberately DON'T use the smbus-based `mpu6050` library: its block
-        reads returned [Errno 5] I/O error on this hardware. robot_hat.I2C does
-        plain write-pointer-then-read transactions the MPU-6050 is happy with."""
-        if self.sensor is not None:
-            return True, "ok"
-        try:
-            from robot_hat import I2C
-        except ImportError as e:
-            return False, f"robot_hat not available ({e}) - reinstall robot_hat"
-        try:
-            i2c = I2C(I2C_ADDRESS)
-        except Exception as e:
-            return False, f"could not open robot_hat I2C for 0x{I2C_ADDRESS:02x} ({e})"
-        sensor = RobotHatMPU6050(i2c)
-        last = None
+    def _probe_available(self):
+        """Confirm the safety daemon can read the MPU-6050. Returns (ok, reason);
+        reason is the daemon's error string when ok is False. Retried a few times
+        so a flaky mount or a daemon still starting up doesn't fail us outright."""
+        last = "no imu data"
         for _ in range(PROBE_RETRIES):
-            try:
-                sensor.wake()                  # clear the sleep bit
-                sensor.get_accel_data()        # probe: raises if the chip isn't answering
-                self.sensor = sensor
+            data = self._read_raw()
+            if isinstance(data, dict) and "error" not in data and "accel" in data:
                 return True, "ok"
-            except Exception as e:
-                last = e
-                time.sleep(0.1)
-        found = _scan_hint(i2c)
-        return False, (f"MPU-6050 not answering at 0x{I2C_ADDRESS:02x} ({last})"
-                       f"{found} - set imu.i2c_address if it's elsewhere "
-                       "(0x69 if AD0 is high), else check wiring/power")
+            if isinstance(data, dict) and data.get("error"):
+                last = data["error"]
+            time.sleep(0.2)
+        return False, (f"safety daemon has no MPU-6050 at 0x{I2C_ADDRESS:02x}: "
+                       f"{last} - check the address (imu.i2c_address; 0x69 if AD0 "
+                       "is high) and wiring, and confirm the safety daemon is up")
 
     def _publish_status(self, available, reason):
         """A bus-visible health beacon (picarx/sensors/imu/status) so the IMU's
@@ -394,7 +340,7 @@ class IMU:
         self.bus.subscribe(LOOK_TOPIC, self.on_look)
         self.bus.subscribe("picarx/sensors/imu/recalibrate", self.on_recalibrate)
 
-        ok, reason = self._open_sensor()
+        ok, reason = self._probe_available()
         if not ok:
             # Stay alive (don't exit -> the orchestrator would just restart us in
             # a loop) but publish nothing on the data topic; a robot without the

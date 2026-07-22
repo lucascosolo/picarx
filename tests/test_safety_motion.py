@@ -110,5 +110,49 @@ class MotionSmootherTest(unittest.TestCase):
         self.assertIn(("stop",), px.calls)
 
 
+class _FakeI2C:
+    """robot_hat.I2C stand-in: write([reg,...]) sets the register pointer from
+    the first byte; read(n) returns n bytes from a reg->byte map."""
+    def __init__(self, regs=None):
+        self.regs = dict(regs or {})
+        self._ptr = 0
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(list(data))
+        if data:
+            self._ptr = data[0]
+
+    def read(self, n):
+        return [self.regs.get(self._ptr + i, 0) for i in range(n)]
+
+
+class ImuReadTest(unittest.TestCase):
+    """The daemon's MPU-6050 register protocol + datasheet scaling (Layer A owns
+    the hardware read; Layer B's imu.py just consumes this over the socket)."""
+
+    def test_signed16(self):
+        self.assertEqual(safety_daemon._signed16(0x0083), 131)
+        self.assertEqual(safety_daemon._signed16(0xC000), -16384)
+
+    def test_words_are_pointer_then_burst_read(self):
+        i2c = _FakeI2C({0x3B: 0xC0, 0x3C: 0x00, 0x3F: 0x40, 0x40: 0x00})
+        words = safety_daemon._mpu_words(i2c, 0x3B, 3)
+        self.assertEqual(words, [-16384, 0, 16384])      # X=-1g, Y=0, Z=+1g raw
+        self.assertIn([0x3B], i2c.writes)                # pointer was set first
+
+    def test_scaling_to_physical_units(self):
+        out = safety_daemon.imu_from_words(0, 0, 16384, 131, 0, 0, 0)
+        self.assertAlmostEqual(out["accel"]["z"], 9.80665, places=3)   # +1g
+        self.assertAlmostEqual(out["gyro"]["x"], 1.0, places=3)        # 131 LSB/dps
+        self.assertAlmostEqual(out["temp"], 36.53, places=2)
+
+    def test_read_imu_reports_error_when_bus_absent(self):
+        # robot_hat is a bare stub here (no I2C), so opening the handle fails ->
+        # a fail-soft {"error": ...}, never a raise.
+        out = safety_daemon.read_imu(0x68)
+        self.assertIn("error", out)
+
+
 if __name__ == "__main__":
     unittest.main()

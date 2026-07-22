@@ -47,6 +47,70 @@ battery_state = {"voltage": None, "critical": False, "low": False}
 
 hardware_lock = threading.Lock()
 
+# ---- IMU (MPU-6050) read, on request ----
+# Layer A owns ALL hardware, so the head-mounted MPU-6050 is read here (through
+# the HAT's own robot_hat.I2C) and served over the socket, exactly like the
+# ultrasonic distance query. Layer B's imu.py just asks for a reading and does
+# the calibration/derived-signal/publish work - it never imports robot_hat
+# (which pulls in lgpio/GPIO and won't init in the Layer B service environment).
+_MPU_PWR_MGMT_1 = 0x6B      # clear the SLEEP bit to wake the sensor
+_MPU_ACCEL_XOUT_H = 0x3B    # accel X/Y/Z high bytes (6 bytes)
+_MPU_TEMP_OUT_H = 0x41      # temperature (2 bytes)
+_MPU_GYRO_XOUT_H = 0x43     # gyro X/Y/Z high bytes (6 bytes)
+_MPU_ACCEL_LSB_PER_G = 16384.0   # AFS_SEL=0 default (+-2g)
+_MPU_GYRO_LSB_PER_DPS = 131.0    # FS_SEL=0 default (+-250 deg/s)
+_GRAVITY = 9.80665
+_imu_i2c = {}              # address -> robot_hat.I2C handle, cached once opened
+
+
+def _signed16(value):
+    """A 16-bit unsigned register pair as a signed int (two's complement)."""
+    return value - 65536 if value >= 0x8000 else value
+
+
+def imu_from_words(ax, ay, az, gx, gy, gz, t_raw):
+    """Raw MPU-6050 counts -> physical units (accel m/s^2, gyro deg/s, temp C),
+    per the datasheet. Pure - unit-tested off-robot."""
+    a = _GRAVITY / _MPU_ACCEL_LSB_PER_G
+    return {
+        "accel": {"x": ax * a, "y": ay * a, "z": az * a},
+        "gyro": {"x": gx / _MPU_GYRO_LSB_PER_DPS, "y": gy / _MPU_GYRO_LSB_PER_DPS,
+                 "z": gz / _MPU_GYRO_LSB_PER_DPS},
+        "temp": t_raw / 340.0 + 36.53,
+    }
+
+
+def _mpu_words(i2c, start_reg, count):
+    """Set the register pointer, then burst-read `count` signed 16-bit words.
+    Plain write-then-read (not an smbus block read, which NAKs on this HAT)."""
+    i2c.write([start_reg])
+    raw = i2c.read(count * 2)
+    return [_signed16((raw[2 * i] << 8) | raw[2 * i + 1]) for i in range(count)]
+
+
+def read_imu(address=0x68):
+    """One MPU-6050 reading (physical units), or {"error": ...}. Opens the I2C
+    handle lazily (caching it once the wake write succeeds) and retries the open
+    on each call until the chip answers, so a late/flaky sensor still comes up.
+    The caller holds hardware_lock (the MPU shares the I2C bus with the ADC)."""
+    i2c = _imu_i2c.get(address)
+    if i2c is None:
+        try:
+            from robot_hat import I2C
+            i2c = I2C(address)
+            i2c.write([_MPU_PWR_MGMT_1, 0x00])   # wake; raises if nothing answers
+            _imu_i2c[address] = i2c
+        except Exception as e:
+            return {"error": f"open 0x{address:02x}: {e}"}
+    try:
+        ax, ay, az = _mpu_words(i2c, _MPU_ACCEL_XOUT_H, 3)
+        gx, gy, gz = _mpu_words(i2c, _MPU_GYRO_XOUT_H, 3)
+        (t_raw,) = _mpu_words(i2c, _MPU_TEMP_OUT_H, 1)
+        return imu_from_words(ax, ay, az, gx, gy, gz, t_raw)
+    except Exception as e:
+        return {"error": f"read 0x{address:02x}: {e}"}
+
+
 # ---- MotionSmoother tuning ----
 # Ramp RATES are per-second (not per-tick), so motion is time-consistent
 # even when the control loop is jittered by hardware_lock contention with
@@ -392,6 +456,22 @@ def main():
                 try:
                     current_distance = px.ultrasonic.read()
                     conn.sendall(json.dumps({"distance_cm": current_distance}).encode())
+                except Exception as sensor_err:
+                    try:
+                        conn.sendall(json.dumps({"error": str(sensor_err)}).encode())
+                    except Exception:
+                        pass
+                continue
+
+            if action.get("query") == "imu":
+                # The MPU shares the I2C bus with the ADC/servos, so serialize
+                # the read under hardware_lock. Fail-soft: an error dict tells
+                # Layer B the sensor is absent/unreadable.
+                try:
+                    address = int(action.get("address", 0x68))
+                    with hardware_lock:
+                        reading = read_imu(address)
+                    conn.sendall(json.dumps(reading).encode())
                 except Exception as sensor_err:
                     try:
                         conn.sendall(json.dumps({"error": str(sensor_err)}).encode())
