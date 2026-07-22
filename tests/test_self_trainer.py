@@ -229,6 +229,7 @@ class StatusPublishTest(unittest.TestCase):
         st.lock = threading.Lock()
         st._abort = threading.Event()
         st.last_activity = last_activity
+        st.last_activity_topic = "startup"
         st.last_session_end = last_session_end
         st.latest_battery = {}
         st.proc = None
@@ -237,11 +238,16 @@ class StatusPublishTest(unittest.TestCase):
         return st
 
     def test_busy_heartbeat_when_recently_active(self):
-        st = self._trainer(last_activity=NOW)          # active "now"
+        st = self._trainer(last_activity=NOW - 42)      # active 42s ago
+        st.last_activity_topic = "audio/heard"
         st.maybe_train(now=NOW)
         s = st.bus.last(self_trainer.STATUS_TOPIC)
         self.assertEqual(s["state"], "busy")
         self.assertTrue(s["repo"])
+        # the diagnostic fields that reveal WHAT is keeping it busy
+        self.assertEqual(s["idle_for_sec"], 42)
+        self.assertEqual(s["last_activity"], "audio/heard")
+        self.assertEqual(s["idle_needed_sec"], self_trainer.IDLE_AFTER_SEC)
 
     def test_cooldown_heartbeat_reports_remaining(self):
         # idle long enough, but a session just ended -> cooldown, with an ETA

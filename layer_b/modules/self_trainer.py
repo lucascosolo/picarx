@@ -274,6 +274,7 @@ class SelfTrainer:
         self.bus = Bus()
         self.lock = threading.Lock()
         self.last_activity = time.time()
+        self.last_activity_topic = "startup"   # which topic last reset the idle clock
         self.last_session_end = 0.0
         self.latest_battery = {}
         self.proc = None                     # the running training subprocess, or None
@@ -293,22 +294,34 @@ class SelfTrainer:
         a running session, so live driving always preempts training."""
         try:
             if _is_motion_intent(payload.get("action")):
-                self.on_activity(payload)
+                self._mark_activity("intent/move")
         except Exception as e:
             print(f"Self-trainer: move handler error: {e}")
 
-    def on_activity(self, _payload):
-        """Live behaviour wins: reset the idle clock and, if a session is
-        running, kill it this instant so responsiveness never waits on training."""
+    def on_heard_activity(self, _payload):
+        self._mark_activity("audio/heard")
+
+    def on_coach_activity(self, _payload):
+        self._mark_activity("coach/query")
+
+    def _mark_activity(self, topic):
+        """Live behaviour wins: reset the idle clock (recording WHICH topic did
+        it, for the status heartbeat) and, if a session is running, kill it this
+        instant so responsiveness never waits on training."""
         try:
             with self.lock:
                 self.last_activity = time.time()
+                self.last_activity_topic = topic
                 proc = self.proc
             if proc is not None:
                 self._abort.set()
-                self._terminate(proc, "activity")
+                self._terminate(proc, f"activity ({topic})")
         except Exception as e:
             print(f"Self-trainer: activity handler error: {e}")
+
+    # back-compat alias (older callers / tests)
+    def on_activity(self, payload):
+        self._mark_activity("activity")
 
     def on_world(self, payload):
         try:
@@ -352,6 +365,7 @@ class SelfTrainer:
         now = now if now is not None else time.time()
         with self.lock:
             last_activity = self.last_activity
+            last_activity_topic = self.last_activity_topic
             last_session_end = self.last_session_end
             battery = dict(self.latest_battery)
         ok, reason = training_eligibility(
@@ -361,9 +375,16 @@ class SelfTrainer:
             self._publish_status("disabled", reason="no picarx-training repo")
             return False
         if not ok:
-            # Heartbeat the reason we're holding off, with the cooldown ETA.
-            self._publish_status(reason, cooldown_remaining_sec=round(
-                max(0.0, COOLDOWN_SEC - (now - last_session_end))))
+            # Heartbeat WHY we're holding off, plus how long we've actually been
+            # idle and which topic last reset it - so "stuck busy" is diagnosable
+            # (e.g. last_activity "audio/heard" -> the mic is spraying messages).
+            self._publish_status(
+                reason,
+                idle_for_sec=round(now - last_activity),
+                last_activity=last_activity_topic,
+                idle_needed_sec=IDLE_AFTER_SEC,
+                cooldown_remaining_sec=round(
+                    max(0.0, COOLDOWN_SEC - (now - last_session_end))))
             return False
         self._run_session()
         return True
@@ -460,8 +481,8 @@ class SelfTrainer:
 
     def run(self):
         self.bus.subscribe("picarx/intent/move", self.on_move_intent)
-        self.bus.subscribe("picarx/audio/heard", self.on_activity)
-        self.bus.subscribe("picarx/coach/query", self.on_activity)
+        self.bus.subscribe("picarx/audio/heard", self.on_heard_activity)
+        self.bus.subscribe("picarx/coach/query", self.on_coach_activity)
         self.bus.subscribe("picarx/state/world", self.on_world)
 
         if not self.training_repo:
