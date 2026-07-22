@@ -2585,6 +2585,16 @@ class FieldAgent:
         return angle, (f"still learning {loc['label']} "
                        f"(uncertainty {loc['uncertainty']:.2f}), poking around it at random")
 
+    @staticmethod
+    def _imu_impact(snap):
+        """True when a FRESH, calibrated IMU reports an impact - a physical jolt
+        (a bump/collision) the ranged sensors may have missed: glass, a low sill,
+        a wall the ultrasonic cone skimmed. Fail-soft: an absent/stale/
+        uncalibrated IMU reads False, so a robot without the sensor is unchanged."""
+        imu = (snap or {}).get("imu") or {}
+        return bool(imu.get("impact") and imu.get("calibrated")
+                    and not imu.get("stale", True))
+
     def _note_forward_and_check_stuck(self, now, snap):
         """Physical stuck detection: continuously commanding forward
         while the camera view stays static means the wheels are pushing
@@ -2595,6 +2605,15 @@ class FieldAgent:
         if self.forward_since is None:
             self.forward_since = now
             return False
+        # A physical jolt while pushing forward = we hit something the ranged
+        # sensors couldn't see. The IMU feels it directly, so react at once
+        # instead of waiting out the vision window (this is the fast path for
+        # glass/low-obstacle collisions).
+        if self._imu_impact(snap):
+            self.forward_since = None
+            self.announce("I just bumped into something I couldn't see. Backing off.")
+            self._begin_evasion("imu_impact")
+            return True
         if now - self.forward_since < STUCK_AFTER_SEC:
             return False
         objects = (snap or {}).get("objects", {})

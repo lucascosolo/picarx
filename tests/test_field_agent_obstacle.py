@@ -90,5 +90,41 @@ class OverheadCrossCheckTest(unittest.TestCase):
         self.assertEqual(self.fa.state, "EVADING")
 
 
+class ImuImpactStuckTest(unittest.TestCase):
+    """A fresh IMU impact while pushing forward is a collision the ranged
+    sensors missed (glass, a low sill) - back off at once, fail-soft."""
+
+    def setUp(self):
+        self.fa = field_agent.FieldAgent()
+
+    def _snap(self, impact, moving_scene=8.0):
+        return {"objects": {"stale": False, "scene_motion": moving_scene,
+                            "items": [], "close_object": False, "overhead": None},
+                "imu": {"impact": impact, "calibrated": True, "stale": False}}
+
+    def test_impact_helper_is_failsoft(self):
+        self.assertFalse(field_agent.FieldAgent._imu_impact({"objects": {}}))     # no imu
+        self.assertFalse(field_agent.FieldAgent._imu_impact(
+            {"imu": {"impact": True, "stale": True}}))                            # stale
+        self.assertFalse(field_agent.FieldAgent._imu_impact(
+            {"imu": {"impact": True, "calibrated": False, "stale": False}}))      # uncal
+        self.assertTrue(field_agent.FieldAgent._imu_impact(
+            {"imu": {"impact": True, "calibrated": True, "stale": False}}))
+
+    def test_impact_evades_even_with_a_moving_scene(self):
+        # scene_motion is high (would NOT trip the vision stuck window), but the
+        # physical jolt does - the IMU catches what vision can't.
+        self.fa._note_forward_and_check_stuck(100.0, self._snap(False))   # arm forward_since
+        fired = self.fa._note_forward_and_check_stuck(100.1, self._snap(True))
+        self.assertTrue(fired)
+        self.assertEqual(self.fa.state, "EVADING")
+
+    def test_no_impact_keeps_driving(self):
+        self.fa._note_forward_and_check_stuck(100.0, self._snap(False))
+        fired = self.fa._note_forward_and_check_stuck(100.1, self._snap(False))
+        self.assertFalse(fired)                            # moving scene, no jolt
+        self.assertNotEqual(self.fa.state, "EVADING")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -143,6 +143,15 @@ class WorldStateImuTest(unittest.TestCase):
         w.state["imu"]["updated_at"] = 1.0
         self.assertTrue(w.build_snapshot()["imu"]["stale"])
 
+    def test_impact_is_latched_across_the_2hz_snapshot_gap(self):
+        w = ws.WorldState()
+        w.on_imu({"impact": True, "calibrated": True})    # brief impact sample
+        w.on_imu({"impact": False, "calibrated": True})   # next sample: already gone
+        # the snapshot must still report the impact (latched), not lose it
+        self.assertTrue(w.build_snapshot()["imu"]["impact"])
+        # ...and it clears on the following snapshot
+        self.assertFalse(w.build_snapshot()["imu"]["impact"])
+
 
 if __name__ == "__main__":
     unittest.main()

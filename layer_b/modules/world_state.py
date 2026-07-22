@@ -168,6 +168,8 @@ class WorldState:
         # depth-free "it's closing in" trick used for tracked objects above,
         # applied to the class-agnostic overhang mass. None until first seen.
         self._overhead_prev = None
+        # See on_imu: latches a transient impact across the 2Hz snapshot gap.
+        self._imu_impact_latch = False
 
     # ---------- bus callbacks ----------
 
@@ -186,6 +188,11 @@ class WorldState:
     def on_imu(self, payload):
         with self.lock:
             self.state["imu"] = {**payload, "updated_at": time.time()}
+            # The IMU publishes ~20Hz but this snapshot is only 2Hz, so a brief
+            # impact would fall between snapshots. Latch it: if ANY sample since
+            # the last snapshot saw an impact, the next snapshot reports one.
+            if payload.get("impact"):
+                self._imu_impact_latch = True
 
     def on_distance(self, payload):
         with self.lock:
@@ -321,6 +328,8 @@ class WorldState:
             scene_motion = self.state["scene_motion"]
             battery = dict(self.state["battery"])
             imu = dict(self.state["imu"])
+            imu_impact_latched = self._imu_impact_latch
+            self._imu_impact_latch = False       # consumed by this snapshot
             heard = dict(self.state["last_heard"])
             last_action = dict(self.state["last_action"])
 
@@ -361,6 +370,8 @@ class WorldState:
             },
             "imu": {
                 **imu,
+                # latched so a brief impact between snapshots isn't lost
+                "impact": bool(imu.get("impact") or imu_impact_latched),
                 "stale": self._is_stale(imu.get("updated_at"), "imu"),
             },
             "last_heard": {
