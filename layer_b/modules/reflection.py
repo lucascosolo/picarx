@@ -242,6 +242,32 @@ class Reflection:
         except Exception as e:
             print(f"Reflection: failed to store note: {e}")
 
+    # ---------- mined patterns handed over for storage ----------
+
+    def on_pattern(self, payload):
+        """A behavioural pattern handed over for durable storage
+        (picarx/memory/pattern) - e.g. the idle self_trainer forwarding a
+        pattern its sim run mined. Reflection is the sole writer of the patterns
+        table (its own miner writes there too), so pattern learning lands HERE
+        rather than the sender touching semantic.db. upsert_pattern REPLACES the
+        row for a (condition, outcome) pair, so a later real re-mine stays
+        authoritative. Fail-soft: a malformed payload is ignored."""
+        condition = (payload.get("condition") or "").strip()
+        outcome = (payload.get("outcome") or "").strip()
+        if not condition or not outcome:
+            return
+        try:
+            frequency = int(payload.get("frequency", 0))
+            confidence = float(payload.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            return
+        try:
+            self.store.upsert_pattern(condition, outcome, frequency, confidence)
+            print(f"Reflection: pattern [{condition} -> {outcome}] stored "
+                  f"({confidence:.0%} x{frequency})")
+        except Exception as e:
+            print(f"Reflection: failed to store pattern: {e}")
+
     # ---------- events.db digest ----------
 
     def _fetch_new_events(self, since_id):
@@ -694,6 +720,7 @@ class Reflection:
         self.bus.subscribe("picarx/audio/heard", self.on_activity)
         self.bus.subscribe("picarx/perception/label", self.on_label)
         self.bus.subscribe("picarx/memory/note", self.on_note)
+        self.bus.subscribe("picarx/memory/pattern", self.on_pattern)
 
         print(f"Reflection active ({self.store.fact_count()} facts known), "
               f"reflecting when idle {IDLE_AFTER_SEC:.0f}s+, analyzing when idle "

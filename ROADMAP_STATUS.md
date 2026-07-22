@@ -185,3 +185,47 @@ faces, recognized people by name) scaled over the JPEG feed, and the
 Audio card gains a speaker kill-switch: off silences TTS, and the
 off->on press re-runs `robot_hat enable_speaker` so the amp is always
 re-asserted before speech resumes.
+
+## Idle self-training round-trip (2026-07-20)
+
+`modules/self_trainer.py` (disabled by default in `module_registry.json`)
+closes the loop between the sibling **picarx-training** simulator and the
+live robot: while idle it refines the robot's OWN learning in the sim and
+folds the result back in — without ever becoming a second writer of the
+learning stores.
+
+One eligible idle window does: (1) snapshot the live data dir
+(`coach_policy.json` + `events.db`/`semantic.db`, via the SQLite backup API
+so a live write can't tear it) into a scratch dir; (2) run
+`picarx-training/run_training.py <scenario> --knowledge-dir <scratch>
+--seed-from <scratch> --speedf <low> --quiet` as a `nice`-d subprocess,
+seeded from the robot's own policy so the pack is a same-lineage refinement
+(Steps A/B1); (3) on clean success, publish the produced pack to the online
+intakes the owning modules expose — `picarx/coach/adopt` (coach folds arms
+into `coach_policy.json` in **adopt** mode, so this robot's own round-trip
+never double-counts the seed), `picarx/memory/note` and
+`picarx/memory/pattern` (reflection persists facts + patterns). The trainer
+never writes `coach_policy.json` or `semantic.db` itself — **single-writer
+ownership is preserved**.
+
+Guardrails, all preserved from the surrounding design:
+- **Live behaviour always wins.** Any `picarx/intent/move`,
+  `picarx/audio/heard`, or `picarx/coach/query` resets the idle clock and, if
+  a session is running, SIGTERMs it instantly (run_training tears down
+  cleanly on SIGTERM). A hard `max_session_sec` wall-clock caps every run.
+- **Reality-gap guard.** Adopted arms are tagged `trained_in_sim`;
+  `combine_policy` never deletes an arm, and `coach._maybe_retire_arm` refuses
+  to retire a sim-tagged arm — sim learning may add or refresh, never retire a
+  real maneuver.
+- **Safety isolation inherited.** The subprocess only ever talks to the sim's
+  private `/tmp/picarx_train_<port>.sock` and an ephemeral bus port — never
+  `/tmp/picarx_safety.sock` or `localhost:1883`.
+- **Fail-soft.** A missing sibling repo, or a crashed/killed/timed-out
+  session, degrades to "no self-training this window" — never stuck, never a
+  direct DB write.
+
+Tunables (Config page / `self_trainer.*`): `idle_after_sec`, `cooldown_sec`,
+`speedf`, `max_session_sec`, `scenario_source`, `charging_only` (only train on
+a healthy/topped-up battery — a proxy for being docked). Enable the module
+only on a robot with picarx-training checked out alongside (or
+`PICARX_TRAINING_REPO` set).

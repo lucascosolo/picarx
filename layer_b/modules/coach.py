@@ -80,7 +80,12 @@ from broker_client import Bus
 import robot_config
 from semantic_store import SemanticStore
 from embedding_util import Embedder
+# combine_policy is a PURE function (no bus/hardware); reusing it keeps the
+# online adopt path and the offline import_training tool folding packs in
+# identically. See its two modes ("merge" sums, "adopt" replaces shared arms).
+from import_training import combine_policy
 
+import copy
 import json
 import math
 import random
@@ -332,6 +337,13 @@ class Coach:
         arm = arms.get(arm_sig)
         if arm is None:
             return
+        # Reality-gap guard: an arm carrying simulator-derived counts is never
+        # auto-retired. Self-training may ADD or REFRESH an arm, never delete a
+        # real one - a purely-sim record must not retire a maneuver the robot
+        # learned on the carpet. Its poor record simply stops UCB1 from picking
+        # it; only arms whose failures are entirely real get culled here.
+        if arm.get("trained_in_sim"):
+            return
         pulls = arm["successes"] + arm["failures"]
         if arm["failures"] < RETIRE_MIN_FAILURES:
             return
@@ -576,6 +588,60 @@ class Coach:
                  "resolved": d.get("resolved")}
                 for d in demos[:DEMONSTRATIONS_IN_PROMPT]]
 
+    # ---------- inbound: adopt trained learning (online intake) ----------
+
+    @staticmethod
+    def _tag_trained_in_sim(policy):
+        """Deep copy of an incoming pack's policy with every bandit arm marked
+        `trained_in_sim`, so the reality-gap guard (see _maybe_retire_arm) knows
+        these counts came from simulation. Reserved '_' sections (e.g.
+        _demonstrations) are copied through untouched."""
+        out = {}
+        for key, entry in policy.items():
+            if key.startswith("_") or not isinstance(entry, dict):
+                out[key] = copy.deepcopy(entry)
+                continue
+            e = copy.deepcopy(entry)
+            for arm in (e.get("arms") or {}).values():
+                if isinstance(arm, dict):
+                    arm["trained_in_sim"] = True
+            out[key] = e
+        return out
+
+    def on_adopt(self, payload):
+        """Fold newly-trained learning (from the idle self_trainer, or an
+        offline import routed over the bus) into the LIVE policy in-process, so
+        coach stays the sole writer of coach_policy.json - the sender never
+        touches the file. Payload:
+
+            {"coach_policy": {...}, "mode": "adopt"|"merge", "lineage": "..."}
+
+        mode defaults to "adopt" (right for this robot's own self-training
+        round-trip: shared arms take the refined counts instead of summing a
+        seed twice; "merge" sums, for an independently-trained pack). Fail-soft:
+        a malformed payload is ignored. combine_policy never deletes an existing
+        arm, and every adopted arm is tagged trained_in_sim, so sim learning can
+        only add or refresh - never retire - a real maneuver."""
+        incoming = payload.get("coach_policy")
+        if not isinstance(incoming, dict) or not incoming:
+            return
+        mode = payload.get("mode", "adopt")
+        if mode not in ("adopt", "merge"):
+            mode = "adopt"
+        lineage = payload.get("lineage")
+        tagged = self._tag_trained_in_sim(incoming)
+        try:
+            with self.lock:
+                self.policy, stats = combine_policy(self.policy, tagged, mode=mode)
+        except Exception as e:
+            print(f"Coach: failed to adopt trained learning: {e}")
+            return
+        self._save_policy()
+        shared = stats["arms_replaced"] if mode == "adopt" else stats["arms_reinforced"]
+        print(f"Coach: adopted self-training [{mode}] "
+              f"(lineage {lineage or '?'}): +{stats['situations_added']} situations, "
+              f"+{stats['arms_added']} arms, {shared} shared updated")
+
     # ---------- inbound: queries ----------
 
     def on_query(self, payload):
@@ -785,6 +851,7 @@ class Coach:
         self.bus.subscribe("picarx/coach/query", self.on_query)
         self.bus.subscribe("picarx/coach/outcome", self.on_outcome)
         self.bus.subscribe("picarx/rc/demonstration", self.on_demonstration)
+        self.bus.subscribe("picarx/coach/adopt", self.on_adopt)
 
         for _ in range(WORKER_THREADS):
             threading.Thread(target=self._worker_loop, daemon=True).start()

@@ -147,6 +147,29 @@ KNOBS = [
     {"section": "reflection", "key": "model", "type": "str",
      "default": "claude-haiku-4-5-20251001", "env": "REFLECTION_MODEL",
      "desc": "Claude model for idle-time reflection."},
+    # ---- self-trainer (self_trainer.py) - disabled in module_registry.json ----
+    {"section": "self_trainer", "key": "idle_after_sec", "type": "float",
+     "default": 600.0, "env": "SELF_TRAIN_IDLE_AFTER",
+     "desc": "Idle seconds (no movement/speech/coach activity) before an idle "
+             "self-training session may start."},
+    {"section": "self_trainer", "key": "cooldown_sec", "type": "float",
+     "default": 10800.0, "env": "SELF_TRAIN_COOLDOWN",
+     "desc": "Minimum seconds between self-training sessions."},
+    {"section": "self_trainer", "key": "speedf", "type": "float",
+     "default": 3.0, "env": "SELF_TRAIN_SPEEDF",
+     "desc": "Sim time-dilation factor for training runs (higher = faster but "
+             "more CPU; keep low on a Pi so live work never starves)."},
+    {"section": "self_trainer", "key": "max_session_sec", "type": "float",
+     "default": 900.0, "env": "SELF_TRAIN_MAX_SESSION",
+     "desc": "Hard wall-clock cap on one training session before it is killed."},
+    {"section": "self_trainer", "key": "scenario_source", "type": "str",
+     "default": "", "env": "SELF_TRAIN_SCENARIOS",
+     "desc": "Scenario to train on: empty = the training repo's scenarios/ dir; "
+             "or a directory, a single .json file, or a glob."},
+    {"section": "self_trainer", "key": "charging_only", "type": "bool",
+     "default": False, "env": "SELF_TRAIN_CHARGING_ONLY",
+     "desc": "Only self-train when the battery reads healthy/topped-up (a proxy "
+             "for being on the charging dock)."},
     # ---- radio (radio.py) ----
     {"section": "radio", "key": "alsa_device", "type": "str",
      "default": "plug:robot_speaker", "env": "RADIO_ALSA_DEVICE",
