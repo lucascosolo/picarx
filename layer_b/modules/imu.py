@@ -271,9 +271,14 @@ class IMU:
             return True, "ok"
         try:
             from mpu6050 import mpu6050
-        except ImportError:
-            return False, ("python-mpu6050 not installed "
-                           "(pip install mpu6050-raspberrypi)")
+        except ImportError as e:
+            # Surface the REAL import error - mpu6050-raspberrypi is pure Python
+            # and imports `smbus`, which pip does NOT pull in, so the usual
+            # failure is a missing smbus (sudo apt install python3-smbus), not a
+            # missing mpu6050. Reporting the generic name hid that.
+            return False, (f"IMU driver import failed: {e}. Need "
+                           "'mpu6050-raspberrypi' AND its I2C backend "
+                           "(sudo apt install python3-smbus).")
         try:
             self.sensor = mpu6050(I2C_ADDRESS)
             self.sensor.get_accel_data()   # probe: raises if the chip isn't there
