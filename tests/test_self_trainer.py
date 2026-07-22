@@ -181,5 +181,58 @@ class ActivityAbortTest(unittest.TestCase):
         self.assertEqual(st.latest_battery["voltage"], 7.9)
 
 
+class StatusPublishTest(unittest.TestCase):
+    def _trainer(self, repo="/fake/picarx-training", last_activity=0.0,
+                 last_session_end=0.0):
+        st = self_trainer.SelfTrainer.__new__(self_trainer.SelfTrainer)
+        st.bus = harness.FakeBus()
+        st.lock = threading.Lock()
+        st._abort = threading.Event()
+        st.last_activity = last_activity
+        st.last_session_end = last_session_end
+        st.latest_battery = {}
+        st.proc = None
+        st._session_counter = 0
+        st.training_repo = repo
+        return st
+
+    def test_busy_heartbeat_when_recently_active(self):
+        st = self._trainer(last_activity=NOW)          # active "now"
+        st.maybe_train(now=NOW)
+        s = st.bus.last(self_trainer.STATUS_TOPIC)
+        self.assertEqual(s["state"], "busy")
+        self.assertTrue(s["repo"])
+
+    def test_cooldown_heartbeat_reports_remaining(self):
+        # idle long enough, but a session just ended -> cooldown, with an ETA
+        st = self._trainer(last_activity=NOW - 100000, last_session_end=NOW - 5)
+        st.maybe_train(now=NOW)
+        s = st.bus.last(self_trainer.STATUS_TOPIC)
+        self.assertEqual(s["state"], "cooldown")
+        self.assertGreater(s["cooldown_remaining_sec"], 0)
+
+    def test_disabled_when_no_repo(self):
+        st = self._trainer(repo=None)
+        st.maybe_train(now=NOW)
+        self.assertEqual(st.bus.last(self_trainer.STATUS_TOPIC)["state"], "disabled")
+
+    def test_publish_pack_emits_published_status(self):
+        import json
+        import os
+        import tempfile
+        st = self._trainer()
+        d = tempfile.mkdtemp()
+        json.dump({"k": {"arms": {}}}, open(os.path.join(d, "coach_policy.json"), "w"))
+        json.dump({"facts": [{"subject": "s", "fact": "f"}], "patterns": []},
+                  open(os.path.join(d, "navigation_facts.json"), "w"))
+        json.dump({"lineage": "abc123"}, open(os.path.join(d, "knowledge_pack.json"), "w"))
+        st._publish_pack(d, scenario="box_corner.json")
+        s = st.bus.last(self_trainer.STATUS_TOPIC)
+        self.assertEqual(s["state"], "published")
+        self.assertEqual(s["scenario"], "box_corner.json")
+        self.assertTrue(s["adopted"])
+        self.assertEqual(s["notes"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

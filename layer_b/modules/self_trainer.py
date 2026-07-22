@@ -73,6 +73,7 @@ SEED_FILES = ("coach_policy.json", "events.db", "semantic.db")
 CHECK_INTERVAL = 30.0     # how often the idle/eligibility check runs
 POLL_INTERVAL = 1.0       # how often a running session is checked for abort/timeout
 NICE = 10                 # subprocess niceness - training must never starve live work
+STATUS_TOPIC = "picarx/self_trainer/status"   # bus-visible lifecycle heartbeat
 
 # Battery is only a proxy for "on the dock / topped up": there's no explicit
 # charging line on picarx/state/world, so a healthy, high pack stands in.
@@ -290,6 +291,21 @@ class SelfTrainer:
         except Exception as e:
             print(f"Self-trainer: world handler error: {e}")
 
+    # ---------- bus-visible status ----------
+
+    def _publish_status(self, state, **extra):
+        """Publish the self-trainer's current state to picarx/self_trainer/status
+        so it's watchable with `mosquitto_sub`. Fail-soft: a status hiccup must
+        never disturb (or block) the training loop. States: busy | cooldown |
+        not-charging | training | published | aborted | timeout | failed |
+        error | disabled | no-scenarios."""
+        try:
+            self.bus.publish(STATUS_TOPIC, {
+                "state": state, "ts": time.time(),
+                "repo": bool(self.training_repo), **extra})
+        except Exception as e:
+            print(f"Self-trainer: status publish failed: {e}")
+
     # ---------- session orchestration (thin) ----------
 
     def _terminate(self, proc, why):
@@ -310,12 +326,16 @@ class SelfTrainer:
             last_activity = self.last_activity
             last_session_end = self.last_session_end
             battery = dict(self.latest_battery)
-        ok, _reason = training_eligibility(
+        ok, reason = training_eligibility(
             now, last_activity, last_session_end, battery,
             IDLE_AFTER_SEC, COOLDOWN_SEC, CHARGING_ONLY)
-        if not ok:
-            return False
         if not self.training_repo:
+            self._publish_status("disabled", reason="no picarx-training repo")
+            return False
+        if not ok:
+            # Heartbeat the reason we're holding off, with the cooldown ETA.
+            self._publish_status(reason, cooldown_remaining_sec=round(
+                max(0.0, COOLDOWN_SEC - (now - last_session_end))))
             return False
         self._run_session()
         return True
@@ -329,16 +349,19 @@ class SelfTrainer:
             scenario = pick_scenario(scenarios, self._session_counter)
             self._session_counter += 1
             if not scenario:
+                self._publish_status("no-scenarios")
                 print("Self-trainer: no scenarios to train on - skipping")
                 return
+            scenario_name = os.path.basename(scenario)
             cmd = ["nice", "-n", str(NICE), sys.executable,
                    os.path.join(self.training_repo, "run_training.py"), scenario,
                    "--knowledge-dir", scratch, "--seed-from", scratch,
                    "--speedf", f"{SPEEDF:g}", "--quiet"]
             env = dict(os.environ)
             env.setdefault("PICARX_REPO", PICARX_ROOT)   # help the sim find our repo
-            print(f"Self-trainer: training on {os.path.basename(scenario)} "
+            print(f"Self-trainer: training on {scenario_name} "
                   f"(speedf {SPEEDF:g}, nice {NICE})")
+            self._publish_status("training", scenario=scenario_name, speedf=SPEEDF)
             proc = subprocess.Popen(cmd, cwd=self.training_repo, env=env,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
@@ -348,10 +371,12 @@ class SelfTrainer:
             with self.lock:
                 self.proc = None
             if outcome != "done":
+                self._publish_status(outcome, scenario=scenario_name)
                 print(f"Self-trainer: session {outcome} - no learning published")
                 return
-            self._publish_pack(scratch)
+            self._publish_pack(scratch, scenario_name)
         except Exception as e:
+            self._publish_status("error", detail=str(e))
             print(f"Self-trainer: session error: {e}")
         finally:
             with self.lock:
@@ -386,7 +411,7 @@ class SelfTrainer:
             return "timeout"
         return "done" if proc.returncode == 0 else "failed"
 
-    def _publish_pack(self, scratch):
+    def _publish_pack(self, scratch, scenario=None):
         policy = _load_json(os.path.join(scratch, "coach_policy.json"), {})
         nav = _load_json(os.path.join(scratch, "navigation_facts.json"), {})
         manifest = _load_json(os.path.join(scratch, "knowledge_pack.json"), {})
@@ -400,6 +425,8 @@ class SelfTrainer:
         print(f"Self-trainer: published refined learning (lineage {lineage or '?'}) "
               f"-> coach/adopt {'yes' if adopted else 'no'}, "
               f"{notes} notes, {patterns} patterns")
+        self._publish_status("published", scenario=scenario, lineage=lineage,
+                             adopted=adopted, notes=notes, patterns=patterns)
 
     # ---------- main loop ----------
 
@@ -412,10 +439,13 @@ class SelfTrainer:
         if not self.training_repo:
             print("Self-trainer: picarx-training repo not found beside this repo "
                   "(set PICARX_TRAINING_REPO) - idle self-training disabled.")
+            self._publish_status("disabled", reason="no picarx-training repo")
         else:
             print(f"Self-trainer active (repo {self.training_repo}), training when "
                   f"idle {IDLE_AFTER_SEC:.0f}s+, cooldown {COOLDOWN_SEC:.0f}s"
                   + (", only when charging" if CHARGING_ONLY else ""))
+            self._publish_status("starting", idle_after_sec=IDLE_AFTER_SEC,
+                                 cooldown_sec=COOLDOWN_SEC, charging_only=CHARGING_ONLY)
         while True:
             time.sleep(CHECK_INTERVAL)
             try:
