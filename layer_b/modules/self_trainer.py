@@ -129,6 +129,21 @@ def training_eligibility(now, last_activity, last_session_end, battery,
     return True, "idle"
 
 
+def _is_motion_intent(action):
+    """True if a picarx/intent/move action is the robot actually DRIVING (a
+    non-zero forward/backward/turn), False for a stop / zero-speed / wheel-
+    straighten. Pure/unit-tested - the idle detector keys on this so a parked
+    robot's steady 'stop' stream doesn't read as activity."""
+    if not isinstance(action, dict):
+        return False
+    direction = action.get("direction")
+    if direction in ("forward", "backward"):
+        return bool(action.get("speed"))
+    if direction == "turn":
+        return bool(action.get("angle"))
+    return False   # stop / look / unknown -> not driving
+
+
 def pick_scenario(scenario_paths, counter):
     """Deterministically rotate through the suite so successive sessions train
     on different scenarios. Sorted for stability. None if there are none."""
@@ -268,6 +283,19 @@ class SelfTrainer:
             os.environ.get("PICARX_TRAINING_REPO"), PICARX_ROOT)
 
     # ---------- activity tracking (anything here means "not idle") ----------
+
+    def on_move_intent(self, payload):
+        """A DRIVING intent counts as activity; a 'stop' (or a zero-speed /
+        straighten) does not. field_agent republishes 'stop' at 5Hz while parked
+        or given-up, so counting stops would pin the idle clock and self-training
+        would NEVER fire on a robot that is sitting still - exactly when we want
+        it. Real motion (forward/backward/turn) still resets the clock and kills
+        a running session, so live driving always preempts training."""
+        try:
+            if _is_motion_intent(payload.get("action")):
+                self.on_activity(payload)
+        except Exception as e:
+            print(f"Self-trainer: move handler error: {e}")
 
     def on_activity(self, _payload):
         """Live behaviour wins: reset the idle clock and, if a session is
@@ -431,7 +459,7 @@ class SelfTrainer:
     # ---------- main loop ----------
 
     def run(self):
-        self.bus.subscribe("picarx/intent/move", self.on_activity)
+        self.bus.subscribe("picarx/intent/move", self.on_move_intent)
         self.bus.subscribe("picarx/audio/heard", self.on_activity)
         self.bus.subscribe("picarx/coach/query", self.on_activity)
         self.bus.subscribe("picarx/state/world", self.on_world)

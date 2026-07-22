@@ -181,6 +181,46 @@ class ActivityAbortTest(unittest.TestCase):
         self.assertEqual(st.latest_battery["voltage"], 7.9)
 
 
+class IdleActivityTest(unittest.TestCase):
+    """A parked robot's steady 'stop' stream must NOT count as activity, or
+    self-training could never fire when the robot is sitting still. Real motion
+    still does (and kills a running session)."""
+
+    def test_is_motion_intent(self):
+        self.assertTrue(self_trainer._is_motion_intent({"direction": "forward", "speed": 25}))
+        self.assertTrue(self_trainer._is_motion_intent({"direction": "backward", "speed": 30}))
+        self.assertTrue(self_trainer._is_motion_intent({"direction": "turn", "angle": -20}))
+        # holds / straightens / stops are NOT driving
+        self.assertFalse(self_trainer._is_motion_intent({"direction": "stop"}))
+        self.assertFalse(self_trainer._is_motion_intent({"direction": "forward", "speed": 0}))
+        self.assertFalse(self_trainer._is_motion_intent({"direction": "turn", "angle": 0}))
+        self.assertFalse(self_trainer._is_motion_intent(None))
+
+    def _trainer(self):
+        st = self_trainer.SelfTrainer.__new__(self_trainer.SelfTrainer)
+        st.bus = harness.FakeBus()
+        st.lock = threading.Lock()
+        st._abort = threading.Event()
+        st.last_activity = 0.0
+        st.proc = None
+        return st
+
+    def test_stop_intents_do_not_count_as_activity(self):
+        st = self._trainer()
+        st.on_move_intent({"source": "field_agent",
+                           "action": {"direction": "stop"}})   # parked robot
+        self.assertEqual(st.last_activity, 0.0)                 # clock NOT bumped
+
+    def test_driving_intent_counts_and_kills_session(self):
+        st = self._trainer()
+        proc = ActivityAbortTest._FakeProc()
+        st.proc = proc
+        st.on_move_intent({"source": "field_agent",
+                           "action": {"direction": "forward", "speed": 25}})
+        self.assertGreater(st.last_activity, 0.0)              # clock bumped
+        self.assertTrue(proc.terminated)                      # session killed
+
+
 class StatusPublishTest(unittest.TestCase):
     def _trainer(self, repo="/fake/picarx-training", last_activity=0.0,
                  last_session_end=0.0):
