@@ -171,6 +171,30 @@ KNOBS = [
      "default": False, "env": "SELF_TRAIN_CHARGING_ONLY",
      "desc": "Only self-train when the battery reads healthy/topped-up (a proxy "
              "for being on the charging dock)."},
+    # ---- imu (imu.py) - MPU-6050 accelerometer/gyro on the camera head ----
+    {"section": "imu", "key": "i2c_address", "type": "int",
+     "default": 0x68, "env": "IMU_I2C_ADDRESS",
+     "desc": "MPU-6050 I2C address (0x68=104 default; 0x69=105 if AD0 is high)."},
+    {"section": "imu", "key": "hz", "type": "float",
+     "default": 20.0, "env": "IMU_HZ",
+     "desc": "IMU sample/publish rate (Hz). Kept modest so I2C reads stay light."},
+    {"section": "imu", "key": "calibration_samples", "type": "int",
+     "default": 40, "env": "IMU_CALIBRATION_SAMPLES",
+     "desc": "Resting samples averaged at startup to learn gravity + gyro bias "
+             "(run parked, level, head centred)."},
+    {"section": "imu", "key": "move_gyro_dps", "type": "float",
+     "default": 8.0, "env": "IMU_MOVE_GYRO_DPS",
+     "desc": "Rotation rate (deg/s) above which the body counts as moving."},
+    {"section": "imu", "key": "move_accel_ms2", "type": "float",
+     "default": 0.6, "env": "IMU_MOVE_ACCEL_MS2",
+     "desc": "Accel deviation from rest (m/s^2) above which the body counts as moving."},
+    {"section": "imu", "key": "impact_ms2", "type": "float",
+     "default": 6.0, "env": "IMU_IMPACT_MS2",
+     "desc": "Accel spike beyond gravity (m/s^2) that reads as a bump/impact."},
+    {"section": "imu", "key": "tilt_alert_deg", "type": "float",
+     "default": 25.0, "env": "IMU_TILT_ALERT_DEG",
+     "desc": "Estimated chassis tilt (deg) beyond which it's flagged tilted "
+             "(ramp / tipped / picked up)."},
     # ---- radio (radio.py) ----
     {"section": "radio", "key": "alsa_device", "type": "str",
      "default": "plug:robot_speaker", "env": "RADIO_ALSA_DEVICE",

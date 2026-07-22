@@ -63,6 +63,13 @@ Output (published):
         "updated_at": <float or None>,
         "stale": bool
     },
+    "imu": {              # head-mounted MPU-6050 (imu.py, optional); the whole
+        "moving": bool,   # imu.py payload passes through, plus "stale". Absent
+        "impact": bool,   # sensor -> {"updated_at": None, "stale": True}. Key
+        "tilted": bool,   # fields: moving/impact/tilted, rotation_rate_dps,
+        ...,              # tilt_from_rest_deg, body_tilt_deg, accel/gyro, head_pose
+        "stale": bool
+    },
     "last_heard": {
         "text": <str or None>,
         "updated_at": <float or None>,
@@ -105,6 +112,9 @@ STALE_AFTER = {
     "objects": 2.0,
     "heard": 15.0,
     "battery": 20.0,
+    # The IMU publishes fast (~20Hz); a gap much longer than a couple of its
+    # cycles means the sensor dropped out (absent chip, read errors).
+    "imu": 1.0,
     # Identity is re-asserted every few seconds while the person is in
     # view (person_memory's REPUBLISH_INTERVAL is 3s), so anything much
     # older means they've stepped away.
@@ -147,6 +157,9 @@ class WorldState:
             "overhead": None,      # head-height overhang mass (see on_objects), or None
             "scene_motion": None,  # vision's motion-thumb diff; low while camera view is static
             "battery": {"voltage": None, "low": False, "critical": False, "updated_at": None},
+            # Head-mounted MPU-6050 (imu.py, optional): the body's own motion /
+            # orientation. Whole imu.py payload, or {"updated_at": None} until seen.
+            "imu": {"updated_at": None},
             "last_heard": {"text": None, "updated_at": None},
             "last_action": {"source": None, "action": None, "result": None, "updated_at": None},
         }
@@ -169,6 +182,10 @@ class WorldState:
                 "confidence": payload.get("confidence"),
                 "updated_at": time.time(),
             }
+
+    def on_imu(self, payload):
+        with self.lock:
+            self.state["imu"] = {**payload, "updated_at": time.time()}
 
     def on_distance(self, payload):
         with self.lock:
@@ -303,6 +320,7 @@ class WorldState:
             overhead = dict(self.state["overhead"]) if self.state["overhead"] else None
             scene_motion = self.state["scene_motion"]
             battery = dict(self.state["battery"])
+            imu = dict(self.state["imu"])
             heard = dict(self.state["last_heard"])
             last_action = dict(self.state["last_action"])
 
@@ -341,6 +359,10 @@ class WorldState:
                 **battery,
                 "stale": self._is_stale(battery.get("updated_at"), "battery"),
             },
+            "imu": {
+                **imu,
+                "stale": self._is_stale(imu.get("updated_at"), "imu"),
+            },
             "last_heard": {
                 **heard,
                 "stale": self._is_stale(heard.get("updated_at"), "heard"),
@@ -355,6 +377,7 @@ class WorldState:
         self.bus.subscribe("picarx/vision/person", self.on_person)
         self.bus.subscribe("picarx/vision/objects", self.on_objects)
         self.bus.subscribe("picarx/sensors/distance", self.on_distance)
+        self.bus.subscribe("picarx/sensors/imu", self.on_imu)
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
 
