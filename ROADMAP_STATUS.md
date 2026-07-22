@@ -229,3 +229,32 @@ Tunables (Config page / `self_trainer.*`): `idle_after_sec`, `cooldown_sec`,
 a healthy/topped-up battery — a proxy for being docked). Enable the module
 only on a robot with picarx-training checked out alongside (or
 `PICARX_TRAINING_REPO` set).
+
+## Fluid driving + richer escape tactics (2026-07-22)
+
+Two changes so the robot flows around obstacles and learns real repositioning
+tactics instead of bumping-and-reversing and only ever "backing up first".
+
+**Fluid driving (`field_agent.py`).** The vision obstacle reflex used to
+stop-and-reverse the moment something loomed, before the smooth
+`SteeringController` was ever consulted. Now a looming-but-not-point-blank
+object with a *fresh* distance beyond `STEER_COMMIT_CM` (30 cm) is first offered
+to the controller via the extracted `_steer_around_tick(...,
+min_commit_deg=AVOID_MIN_COMMIT_DEG)`: if it finds a committed arc (≥8°) with
+lateral room, the robot bends around it and keeps rolling instead of reversing.
+It still reverses when the object is close (< 30 cm), the distance is
+unknown/stale (emergency territory), or there is no committed arc (dead-ahead,
+nowhere to go). The safety daemon's 15 cm veto and reverse cap are untouched —
+this only changes field_agent's *preference* for an arc over a reverse.
+
+**Richer tactics (`coach.py`, `pattern_miner.py`).** The coach prompt now
+pushes maneuvers that leave the car pointed at open space — turning reverses and
+multi-point turn-arounds — and explicitly says to switch tactic (turn around,
+reverse into the open area) rather than reverse harder when a plain reverse is
+shown failing; arm diversity was raised (`MAX_ARMS_PER_SITUATION` 4→6,
+`NOVELTY_RATE` 0.10→0.15) so those richer maneuvers get explored. The pattern
+miner now names the actual maneuver *shape* ("escapes here that reverse then
+turn out usually work") instead of only its first move ("starting with
+backward"), keyed on the first move so multi-step shapes don't fragment below
+`MIN_FREQUENCY`. This flows into both on-robot mining and the training sim's
+knowledge pack.

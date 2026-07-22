@@ -302,6 +302,14 @@ AVOID_RESEND_DELTA = 4        # re-aim only when the target angle really moved (
 AVOID_SEND_DEADBAND = 1.0     # smooth controller: min angle change (deg) worth a steer tick
 AVOID_HOLD_SEC = 0.8          # steering-reset window kept refreshed while actively avoiding
 AVOID_SPEED = 20              # ease off (from cruise 25) while maneuvering around something
+# Fluid driving: when a visible obstacle is looming but NOT point-blank, try a
+# smooth arc around it before falling back to the stop-and-reverse reflex - so
+# the robot flows around things instead of bumping and backing out. Only when
+# it's farther than STEER_COMMIT_CM (still well clear of the daemon's 15cm veto)
+# and the controller finds a MEANINGFUL turn (>= AVOID_MIN_COMMIT_DEG) with
+# lateral room; a dead-ahead object with nowhere to go still reverses.
+STEER_COMMIT_CM = 30.0        # steer around above this; reverse when closer
+AVOID_MIN_COMMIT_DEG = 8.0    # a real turn, not a token wiggle, to commit to an arc
 
 
 def _steer_away_angle(snapshot):
@@ -2237,6 +2245,71 @@ class FieldAgent:
 
     # ---------- exploration behavior ----------
 
+    def _steer_around_tick(self, snap, now, min_commit_deg=0.0):
+        """Bend the heading around whatever's visible off-center and keep
+        rolling. Returns True if it steered (caller should return), False if
+        there is no viable arc (caller falls through to reverse, or to
+        wander/cruise). The smooth SteeringController produces a continuous
+        float-degree arc with curvature/proximity-scaled speed; the discrete
+        _steer_away_angle law is the fail-soft fallback. Either way this
+        outranks wander and keeps steering_active_until refreshed so the timed
+        reset straightens the wheels once the object clears.
+
+        min_commit_deg lets a caller demand a MEANINGFUL turn before committing:
+        offered as an alternative to reversing, a ~0deg 'arc' into a dead-ahead
+        obstacle is no escape, so the caller reverses instead. Left 0.0 at the
+        normal cruise call site, so ordinary steer-around behavior is unchanged."""
+        if self.steering is not None:
+            cmd = self.steering.compute_command(snap, now=now)
+            if cmd["active"] and abs(cmd["steering_angle_deg"]) >= min_commit_deg:
+                angle = cmd["steering_angle_deg"]
+                if self.avoid_active_angle is None:
+                    self.publish_decision(
+                        "steer_around",
+                        {"angle": round(angle, 1), "speed": round(cmd["speed"], 1)},
+                        cmd["reason"])
+                self.steering_active_until = now + AVOID_HOLD_SEC
+                # One primitive per tick (see the __init__ note): steer
+                # when the angle materially moved, never twice in a row.
+                steer_tick = (not self._avoid_turn_last_tick
+                              and (self.avoid_active_angle is None
+                                   or abs(angle - self._avoid_sent_angle)
+                                   >= AVOID_SEND_DEADBAND))
+                self.avoid_active_angle = angle
+                if steer_tick:
+                    self._avoid_turn_last_tick = True
+                    self._avoid_sent_angle = angle
+                    self.publish_intent({"direction": "turn", "angle": angle})
+                    return True
+                self._avoid_turn_last_tick = False
+                if self._note_forward_and_check_stuck(now, snap):
+                    return True
+                self.publish_intent({"direction": "forward", "speed": cmd["speed"]})
+                return True
+            self._avoid_turn_last_tick = False
+            self.avoid_active_angle = None
+            return False
+
+        avoid = _steer_away_angle(snap)
+        if avoid is not None and abs(avoid["angle"]) >= min_commit_deg:
+            angle = avoid["angle"]
+            if self.avoid_active_angle is None:
+                self.publish_decision(
+                    "steer_around", {"angle": angle},
+                    f"steering around {', '.join(sorted(set(avoid['labels'])))} "
+                    f"seen off-center ahead")
+            if (self.avoid_active_angle is None
+                    or abs(angle - self.avoid_active_angle) >= AVOID_RESEND_DELTA):
+                self.publish_intent({"direction": "turn", "angle": angle})
+                self.avoid_active_angle = angle
+            self.steering_active_until = now + AVOID_HOLD_SEC
+            if self._note_forward_and_check_stuck(now, snap):
+                return True
+            self.publish_intent({"direction": "forward", "speed": AVOID_SPEED})
+            return True
+        self.avoid_active_angle = None
+        return False
+
     def explore_tick(self):
         now = time.time()
 
@@ -2369,6 +2442,17 @@ class FieldAgent:
                     self._begin_evasion("overhead")
                     return
             elif not ultrasonic_says_clear:
+                # Prefer a smooth arc AROUND it over a reverse when it isn't
+                # point-blank and the controller finds lateral room to pass -
+                # reversing is the last resort, not the first reflex. Requires a
+                # FRESH, confident distance beyond STEER_COMMIT_CM: an unknown or
+                # stale reading is genuine emergency territory (reverse), and so
+                # is a dead-ahead object with no committed arc.
+                if (distance is not None and not distance_stale
+                        and distance > STEER_COMMIT_CM
+                        and self._steer_around_tick(
+                            snap, now, min_commit_deg=AVOID_MIN_COMMIT_DEG)):
+                    return
                 label = vision_obstacle.get("label", "something")
                 if label == "something":
                     self.announce("Something's right in front of me, backing away.")
@@ -2437,54 +2521,8 @@ class FieldAgent:
         # active, and steering_active_until is kept refreshed so the
         # existing timed-reset block straightens the wheels automatically
         # once the object is cleared and this stops firing.
-        if self.steering is not None:
-            cmd = self.steering.compute_command(snap, now=now)
-            if cmd["active"]:
-                angle = cmd["steering_angle_deg"]
-                if self.avoid_active_angle is None:
-                    self.publish_decision(
-                        "steer_around",
-                        {"angle": round(angle, 1), "speed": round(cmd["speed"], 1)},
-                        cmd["reason"])
-                self.steering_active_until = now + AVOID_HOLD_SEC
-                # One primitive per tick (see the __init__ note): steer
-                # when the angle materially moved, never twice in a row.
-                steer_tick = (not self._avoid_turn_last_tick
-                              and (self.avoid_active_angle is None
-                                   or abs(angle - self._avoid_sent_angle)
-                                   >= AVOID_SEND_DEADBAND))
-                self.avoid_active_angle = angle
-                if steer_tick:
-                    self._avoid_turn_last_tick = True
-                    self._avoid_sent_angle = angle
-                    self.publish_intent({"direction": "turn", "angle": angle})
-                    return
-                self._avoid_turn_last_tick = False
-                if self._note_forward_and_check_stuck(now, snap):
-                    return
-                self.publish_intent({"direction": "forward", "speed": cmd["speed"]})
-                return
-            self._avoid_turn_last_tick = False
-            self.avoid_active_angle = None
-        else:
-            avoid = _steer_away_angle(snap)
-            if avoid is not None:
-                angle = avoid["angle"]
-                if self.avoid_active_angle is None:
-                    self.publish_decision(
-                        "steer_around", {"angle": angle},
-                        f"steering around {', '.join(sorted(set(avoid['labels'])))} "
-                        f"seen off-center ahead")
-                if (self.avoid_active_angle is None
-                        or abs(angle - self.avoid_active_angle) >= AVOID_RESEND_DELTA):
-                    self.publish_intent({"direction": "turn", "angle": angle})
-                    self.avoid_active_angle = angle
-                self.steering_active_until = now + AVOID_HOLD_SEC
-                if self._note_forward_and_check_stuck(now, snap):
-                    return
-                self.publish_intent({"direction": "forward", "speed": AVOID_SPEED})
-                return
-            self.avoid_active_angle = None
+        if self._steer_around_tick(snap, now):
+            return
 
         # --- Handle Timed Steering Reset during standard wander ---
         if self.steering_active_until != 0 and now >= self.steering_active_until:

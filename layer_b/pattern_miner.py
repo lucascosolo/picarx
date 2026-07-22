@@ -24,6 +24,7 @@ Spurious-correlation guard (roadmap mitigation): a pattern is only
 returned with frequency >= MIN_FREQUENCY and confidence at/beyond
 CONFIDENCE_BAND on either side.
 """
+import collections
 import json
 import sqlite3
 
@@ -31,6 +32,31 @@ MIN_FREQUENCY = 3
 CONFIDENCE_BAND = 0.70     # emit "works" at >= this, "fails" at <= 1 - this
 VETO_BURST_WINDOW = 5.0    # seconds - a follow-up veto within this = a loop
 MAX_ROWS_PER_TOPIC = 4000  # bound the scan; recent history is what matters
+
+# Readable words for an escape maneuver's step directions, so a mined pattern
+# names the actual TACTIC ("reverse then turn out") instead of only its first
+# move ("starting with backward") - the coarse first-move summary hid whether
+# the robot was learning real multi-step repositioning or just backing up.
+_MANEUVER_WORD = {"backward": "reverse", "forward": "pull forward",
+                  "turn": "turn out", "stop": "pause"}
+
+
+def maneuver_phrase(steps):
+    """Describe an escape maneuver's SHAPE from its steps: 'reverse',
+    'reverse then turn out', 'reverse, turn out, then pull forward'.
+    Consecutive same-direction steps collapse. None if there are no steps.
+    Pure/unit-testable."""
+    dirs = []
+    for s in steps or []:
+        d = (s.get("action") or {}).get("direction") if isinstance(s, dict) else None
+        if d and (not dirs or dirs[-1] != d):
+            dirs.append(d)
+    if not dirs:
+        return None
+    words = [_MANEUVER_WORD.get(d, d) for d in dirs]
+    if len(words) == 1:
+        return words[0]
+    return ", ".join(words[:-1]) + " then " + words[-1]
 
 
 def _fetch(conn, topic, limit=MAX_ROWS_PER_TOPIC):
@@ -41,7 +67,12 @@ def _fetch(conn, topic, limit=MAX_ROWS_PER_TOPIC):
 
 
 def _mine_coach_first_moves(conn):
-    stats = {}  # (situation_key, first_direction) -> [wins, total]
+    # Keyed by (situation, FIRST move) so frequency stays high enough to clear
+    # MIN_FREQUENCY (full-sequence keys would fragment). But we also track the
+    # modal full-maneuver SHAPE within each group, so the emitted hint names the
+    # actual tactic - "escapes here that reverse then turn out usually work" -
+    # instead of the shape-blind "starting with backward".
+    stats = {}  # (key, first) -> {"wins", "total", "win_shapes", "all_shapes"}
     for _ts, payload_json in _fetch(conn, "picarx/coach/episode"):
         try:
             p = json.loads(payload_json)
@@ -52,21 +83,31 @@ def _mine_coach_first_moves(conn):
             continue
         if not key or not first:
             continue
-        wins, total = stats.setdefault((key, first), [0, 0])
-        stats[(key, first)] = [wins + (1 if p.get("success") else 0), total + 1]
+        g = stats.setdefault((key, first), {
+            "wins": 0, "total": 0,
+            "win_shapes": collections.Counter(), "all_shapes": collections.Counter()})
+        shape = maneuver_phrase(steps) or first
+        g["total"] += 1
+        g["all_shapes"][shape] += 1
+        if p.get("success"):
+            g["wins"] += 1
+            g["win_shapes"][shape] += 1
 
     out = []
-    for (key, first), (wins, total) in stats.items():
+    for (key, first), g in stats.items():
+        total = g["total"]
         if total < MIN_FREQUENCY:
             continue
-        rate = wins / total
+        rate = g["wins"] / total
         if rate >= CONFIDENCE_BAND:
+            shape = (g["win_shapes"] or g["all_shapes"]).most_common(1)[0][0]
             out.append({"condition": f"stuck:{key}",
-                        "outcome": f"escapes starting with '{first}' usually work",
+                        "outcome": f"escapes here that {shape} usually work",
                         "frequency": total, "confidence": rate})
         elif rate <= 1.0 - CONFIDENCE_BAND:
+            shape = g["all_shapes"].most_common(1)[0][0]
             out.append({"condition": f"stuck:{key}",
-                        "outcome": f"escapes starting with '{first}' keep failing",
+                        "outcome": f"escapes here that {shape} keep failing",
                         "frequency": total, "confidence": 1.0 - rate})
     return out
 

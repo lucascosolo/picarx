@@ -97,7 +97,8 @@ DATA_DIR = robot_config.data_path()
 COACH_POLICY_PATH = f"{DATA_DIR}/coach_policy.json"
 
 MIN_ARMS_BEFORE_EXPLOIT = 2   # always ask the LLM until a situation has this many tried arms
-MAX_ARMS_PER_SITUATION = 4    # stop growing new arms past this many
+MAX_ARMS_PER_SITUATION = 6    # stop growing new arms past this many (room for richer,
+                              # multi-step repositioning tactics, not just a couple reverses)
 NEW_ARM_EXPLORE_RATE = 0.2    # even once past MIN_ARMS_BEFORE_EXPLOIT, try something new this often
 UCB_C = 1.4                   # exploration bonus weight (classic UCB1 uses sqrt(2) ~= 1.41)
 
@@ -111,7 +112,7 @@ RETIRE_MAX_SUCCESS_RATE = 0.2  # ...and a success rate at or below this
 # exactly like everything else). Kept low per the roadmap so curiosity
 # never crowds out reliability. One experimental slot may exceed
 # MAX_ARMS_PER_SITUATION; growth stays bounded and retirement culls.
-NOVELTY_RATE = 0.10
+NOVELTY_RATE = 0.15
 # Surprise detection: an arm this proven failing (or this disproven
 # succeeding) is worth an event of its own for reflection to chew on.
 SURPRISE_MIN_PULLS = 4
@@ -165,6 +166,19 @@ The car uses Ackermann steering (like a real car): it can ONLY change heading wh
 it is moving. Turning the wheels while stopped does nothing. So a real escape is
 usually a SEQUENCE, e.g. reverse a bit, then reverse-or-drive with the wheels turned
 to swing the nose away, then straighten.
+
+Aim for a maneuver that leaves the car POINTED AT OPEN SPACE so it can drive away
+cleanly afterwards - not one that merely nudges back from the obstacle and leaves it
+facing the same wall (that just gets stuck again). Think like a driver getting out of
+a tight parking spot: reverse while turning to swing the nose around, or do a
+multi-point turn (reverse-turn, pull-forward-turn, reverse-turn) to actually TURN
+AROUND, then leave. Reversing STRAIGHT back is the weakest option - use it only for a
+short unstick, and prefer a turning reverse or a full turn-around.
+
+If already_tried_here shows a plain reverse (or reversing straight) has been tried and
+is FAILING here, do NOT just propose reversing again harder or longer - switch tactic:
+turn around and reverse INTO the open area, or arc out to one side. Escalate from
+simple to repositioning maneuvers as simple ones prove they don't clear this spot.
 
 Reply with JSON only, no prose, no markdown fences, as an ordered list of 1 to 4
 steps to perform back to back:

@@ -140,6 +140,47 @@ class SteerAroundTickTest(unittest.TestCase):
         self.assertEqual(self.fa.state, "EVADING")
 
 
+class FluidSteerBeforeReverseTest(unittest.TestCase):
+    """A looming but not-point-blank object with lateral room should be steered
+    AROUND (stay CRUISING) rather than triggering a stop-and-reverse - fluid
+    driving instead of bump-and-back-out. It still reverses when it's close or
+    the distance is unknown/stale."""
+
+    def setUp(self):
+        self.fa = field_agent.FieldAgent()
+        self.fa.state = "CRUISING"
+        self.fa.last_scan_at = time.time()
+        self.fa.last_wander = time.time()
+
+    def _drive(self, world):
+        self.fa.latest_world = world
+        self.fa.explore_tick()
+
+    def test_looming_object_with_room_is_steered_not_reversed(self):
+        # Fresh reading in the steer band (30 < d <= 60), object off to the
+        # right with room -> a smooth arc, no evasion.
+        world = _world([_obj(area=0.3, offset=80, approaching=True)],
+                       distance=45, distance_stale=False)
+        self._drive(world)
+        self.assertEqual(self.fa.state, "CRUISING")           # steered, not EVADING
+        turns = [p["action"] for p in self.fa.bus.of("picarx/intent/move")
+                 if p["action"].get("direction") == "turn"]
+        self.assertTrue(turns and turns[-1]["angle"] < 0)     # away from the right
+
+    def test_close_object_still_reverses(self):
+        # Same object but point-blank (< STEER_COMMIT_CM) -> reverse reflex wins.
+        self._drive(_world([_obj(area=0.3, offset=80, approaching=True)],
+                           distance=22, distance_stale=False))
+        self.assertEqual(self.fa.state, "EVADING")
+
+    def test_stale_distance_still_reverses(self):
+        # No trustworthy distance -> emergency territory, reverse (don't assume
+        # there's room to arc).
+        self._drive(_world([_obj(area=0.3, offset=80, approaching=True)],
+                           distance=None, distance_stale=True))
+        self.assertEqual(self.fa.state, "EVADING")
+
+
 class EscapeSideHintTest(unittest.TestCase):
     """Evasion swings away from the side the obstacle was seen on."""
 
