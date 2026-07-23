@@ -55,6 +55,7 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
+import heartbeat
 
 DATA_DIR = robot_config.data_path()
 LOG_PATH = f"{DATA_DIR}/resource_log.jsonl"
@@ -66,6 +67,24 @@ SPIKE_REPORT_PCT = 90.0           # print (not just log) when a module/overall C
 
 FAIL_LOOP_WINDOW = 120.0          # seconds - how far back to look for a repeating fail-state pattern
 FAIL_LOOP_THRESHOLD = 3           # this many collision_loop queries within the window -> flag it
+
+# A module is "silent" (presumed dead/wedged) if its last unified heartbeat
+# (see heartbeat.py) is older than this. Default: three heartbeat intervals, so
+# one dropped beat is fine but a crashed module is caught quickly.
+_HB_INTERVAL = float(robot_config.get(
+    "observability", "heartbeat_interval_sec", heartbeat.DEFAULT_INTERVAL_SEC,
+    env="PICARX_HEARTBEAT_INTERVAL"))
+HEARTBEAT_STALE_SEC = max(15.0, _HB_INTERVAL * 3)
+
+
+def evaluate_liveness(heartbeats, now, stale_after=HEARTBEAT_STALE_SEC):
+    """Split the modules we've ever heard a heartbeat from into alive vs silent
+    by how long ago each was last seen. Pure - the caller owns the clock and the
+    seen-map. `heartbeats` is {name: {"last_seen": ts, ...}}."""
+    alive, silent = [], []
+    for name, hb in heartbeats.items():
+        (alive if (now - hb.get("last_seen", 0)) <= stale_after else silent).append(name)
+    return {"alive": sorted(alive), "silent": sorted(silent)}
 
 # Matched against /proc/<pid>/cmdline substrings - these are the actual
 # entrypoint filenames from module_registry.json (plus this module itself,
@@ -168,8 +187,43 @@ class DebugMonitor:
         self.lock = threading.Lock()
         self.fail_events = deque()   # timestamps of collision_loop coach queries
         self.latest_context = {}     # last known world-state snapshot, for correlating fail events
+        self.heartbeats = {}         # module name -> last heartbeat {last_seen, pid, seq, status}
+        self._silent = set()         # modules currently flagged silent (to log transitions once)
 
     # ---------- bus callbacks ----------
+
+    def on_heartbeat(self, payload):
+        name = payload.get("name")
+        if not name:
+            return
+        with self.lock:
+            self.heartbeats[name] = {
+                "last_seen": payload.get("ts") or time.time(),
+                "pid": payload.get("pid"), "seq": payload.get("seq"),
+                "status": payload.get("status")}
+
+    def _check_liveness(self, now):
+        """Log current module liveness and print transitions (a module going
+        silent, or coming back). Returns the liveness dict."""
+        with self.lock:
+            snapshot = {n: dict(hb) for n, hb in self.heartbeats.items()}
+            prev_silent = set(self._silent)
+        live = evaluate_liveness(snapshot, now)
+        silent = set(live["silent"])
+        newly_silent = silent - prev_silent
+        recovered = prev_silent - silent
+        with self.lock:
+            self._silent = silent
+        for name in sorted(newly_silent):
+            last = snapshot[name]["last_seen"]
+            print(f"Debug Monitor: module '{name}' went SILENT - no heartbeat for "
+                  f"{now - last:.0f}s (crashed, exited, or wedged?)")
+        for name in sorted(recovered):
+            print(f"Debug Monitor: module '{name}' is heartbeating again")
+        if newly_silent or recovered:
+            self._write({"ts": now, "type": "module_liveness",
+                         "alive": live["alive"], "silent": live["silent"]})
+        return live
 
     def on_world_state(self, payload):
         with self.lock:
@@ -270,6 +324,11 @@ class DebugMonitor:
                 entry.update(_read_temp_and_throttle())
                 next_temp_check = now + TEMP_CHECK_INTERVAL
 
+            # Module self-reported liveness (unified heartbeat) rides along on
+            # every sample, and going-silent/recovering transitions are logged
+            # and printed separately by _check_liveness.
+            entry["module_liveness"] = self._check_liveness(now)
+
             self._write(entry)
 
             spiking = [f"{name}={pct}%" for name, pct in per_module.items() if pct >= SPIKE_REPORT_PCT]
@@ -282,6 +341,7 @@ class DebugMonitor:
     def run(self):
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe("picarx/coach/query", self.on_coach_query)
+        self.bus.subscribe(heartbeat.HEARTBEAT_TOPIC, self.on_heartbeat)
 
         threading.Thread(target=self._resource_loop, daemon=True).start()
 

@@ -144,6 +144,15 @@ KNOBS = [
      "default": 45.0, "env": "DIALOG_CONVERSATION_WINDOW_SEC",
      "desc": "After a wake-word or command, how long follow-ups may skip the "
              "wake word before it's needed again."},
+    # ---- observability (heartbeat.py / broker_client / debug_monitor) ----
+    {"section": "observability", "key": "heartbeat", "type": "bool",
+     "default": True, "env": "PICARX_HEARTBEAT",
+     "desc": "Every module's Bus emits a liveness heartbeat on "
+             "picarx/module/heartbeat; debug_monitor flags modules that go silent."},
+    {"section": "observability", "key": "heartbeat_interval_sec", "type": "float",
+     "default": 10.0, "env": "PICARX_HEARTBEAT_INTERVAL",
+     "desc": "Seconds between module heartbeats (a module is flagged silent "
+             "after ~3x this with no beat)."},
     # ---- companion (companion.py) ----
     {"section": "companion", "key": "model", "type": "str",
      "default": "claude-sonnet-5", "env": "COMPANION_MODEL",
