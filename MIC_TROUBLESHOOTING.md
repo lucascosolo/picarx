@@ -1,10 +1,23 @@
 # Microphone troubleshooting
 
 The mic pipeline is `audio_nodes.py` (Layer B): a USB mic → ALSA capture → gain
-+ band-pass → an energy/SNR gate → Vosk (Kaldi) speech-to-text → published on
++ band-pass → a **speech gate** → Vosk (Kaldi) speech-to-text → published on
 **`picarx/audio/heard`**. Command routers (companion, field_agent, tools) read
 that topic. TTS ("speech out") is a *separate* path in the same module, so the
 robot can talk while the mic is dead, or vice-versa.
+
+The speech gate is now a **voice-activity detector** (`webrtcvad`) rather than
+the old amplitude threshold. Install it once on the robot:
+
+```
+pip install webrtcvad
+```
+
+If it isn't installed the module logs one line and **falls back to the adaptive
+energy/SNR gate automatically** — nothing breaks, so this is optional but
+recommended. Tune with `audio.vad` (on/off) and `audio.vad_aggressiveness`
+(`0` hears more / `3` rejects more) in `layer_b/config.json`. The SNR/confidence
+reject in step 7 still runs on top of either gate.
 
 Nothing in the recent IMU / self-trainer work touches this pipeline — the mic is
 USB, the IMU is I²C — so start by assuming a hardware / ALSA / config cause.

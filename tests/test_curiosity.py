@@ -153,14 +153,23 @@ class CuriosityAskTest(unittest.TestCase):
 
 
 class CuriosityAnswerTest(unittest.TestCase):
+    """Answers now arrive from the dialog broker on picarx/dialog/answer (the
+    broker owns deciding WHAT is an answer - see test_dialog.py). Curiosity just
+    resolves the routed reply into a label."""
+
     def setUp(self):
         self.c = curiosity.Curiosity()
         self.c.on_objects({"objects": [{"id": "object_0", "label": "chair",
                                         "alt_label": "speaker", "confidence": 0.7}]})
+        self.qid = self.c.pending["question_id"]
         self.c.bus.clear()
 
+    def _answer(self, text):
+        self.c.on_answer({"asker": "curiosity", "question_id": self.qid,
+                          "text": text})
+
     def test_naming_the_other_option_publishes_correction(self):
-        self.c.on_heard({"text": "it's a speaker"})
+        self._answer("it's a speaker")
         label = self.c.bus.last("picarx/perception/label")
         self.assertEqual(label["correct_label"], "speaker")
         self.assertEqual(label["guess"], "chair")
@@ -169,70 +178,68 @@ class CuriosityAnswerTest(unittest.TestCase):
         self.assertIsNone(self.c.pending)
 
     def test_yes_confirms_the_guess(self):
-        self.c.on_heard({"text": "yes that's right"})
+        self._answer("yes that's right")
         label = self.c.bus.last("picarx/perception/label")
         self.assertEqual(label["correct_label"], "chair")
         # A plain confirmation needs no spoken reply (chatter reduction).
         self.assertEqual(self.c.bus.of("picarx/audio/speak"), [])
 
     def test_correction_gets_a_terse_acknowledgement(self):
-        self.c.on_heard({"text": "a speaker"})
+        self._answer("a speaker")
         self.assertIn("speaker", self.c.bus.last("picarx/audio/speak")["text"])
 
-    def test_repair_echo_is_not_taken_as_answer(self):
-        self.c.on_heard({"text": "speaker", "source": "intent_repair"})
+    def test_answer_for_a_stale_question_id_is_ignored(self):
+        # A newer question superseded this one; a late answer for the old id
+        # (or for another asker) must not resolve the current question.
+        self.c.on_answer({"asker": "curiosity", "question_id": "old_id",
+                          "text": "a speaker"})
+        self.c.on_answer({"asker": "companion", "question_id": self.qid,
+                          "text": "a speaker"})
         self.assertIsNone(self.c.bus.last("picarx/perception/label"))
-        self.assertIsNotNone(self.c.pending)  # still waiting for a real answer
-
-    def test_command_is_not_swallowed_as_a_label(self):
-        # The reported bug: pressing "who am I" while a question is open must NOT
-        # be stored as the label - and the question stays open for a real answer.
-        self.c.on_heard({"text": "who am I"})
-        self.assertIsNone(self.c.bus.last("picarx/perception/label"))
-        self.assertIsNotNone(self.c.pending)          # question left open
-        # a genuine answer right after still lands
-        self.c.on_heard({"text": "it's a speaker"})
-        self.assertEqual(self.c.bus.last("picarx/perception/label")["correct_label"],
-                         "speaker")
-        self.assertIsNone(self.c.pending)
-
-    def test_stale_question_expires(self):
-        self.c.pending["until"] = curiosity.time.time() - 1
-        self.c.on_heard({"text": "a speaker"})
-        self.assertIsNone(self.c.bus.last("picarx/perception/label"))
+        self.assertIsNotNone(self.c.pending)          # still open
 
 
 class CuriosityLlmEscalationTest(unittest.TestCase):
+    """Escalation now fires when the broker reports the question expired
+    (picarx/dialog/cleared, reason 'expired'), not on an in-module timeout."""
+
     def setUp(self):
         self.c = curiosity.Curiosity()
         self.c.on_objects({"objects": [{"id": "object_0", "label": "chair",
                                         "alt_label": "speaker", "confidence": 0.7}]})
+        self.qid = self.c.pending["question_id"]
         self.c.bus.clear()
 
-    def _expire(self):
-        self.c.pending["until"] = curiosity.time.time() - 1
+    def _cleared(self, reason="expired", qid=None):
+        self.c.on_cleared({"asker": "curiosity",
+                           "question_id": qid or self.qid, "reason": reason})
 
     def test_unanswered_question_escalates_to_llm(self):
-        self._expire()
-        self.c.on_objects({"objects": []})
+        self._cleared("expired")
         req = self.c.bus.last("picarx/perception/identify_request")
         self.assertIsNotNone(req)
         self.assertEqual(req["object_id"], "object_0")
         self.assertEqual(req["guess"], "chair")
         self.assertIsNone(self.c.pending)
 
+    def test_replaced_question_does_not_escalate(self):
+        # A question displaced by a newer one just drops - no cloud call.
+        self._cleared("replaced")
+        self.assertIsNone(self.c.bus.last("picarx/perception/identify_request"))
+        self.assertIsNone(self.c.pending)
+
     def test_answered_question_never_escalates(self):
-        self.c.on_heard({"text": "it's a speaker"})   # answered before timeout
-        self.c.on_objects({"objects": []})
+        self.c.on_answer({"asker": "curiosity", "question_id": self.qid,
+                          "text": "it's a speaker"})
+        self._cleared("expired")   # a late clear for the resolved id is a no-op
         self.assertIsNone(self.c.bus.last("picarx/perception/identify_request"))
 
     def test_escalation_is_throttled(self):
-        self._expire()
-        self.c.on_objects({"objects": []})            # escalates once
-        # A second timed-out question inside the cooldown must not re-escalate.
-        self.c.pending = {"object_id": "object_9", "guess": "bottle",
-                          "options": ["bottle"], "until": curiosity.time.time() - 1}
-        self.c.on_objects({"objects": []})
+        self._cleared("expired")                      # escalates once
+        # A second expired question inside the LLM cooldown must not re-escalate.
+        self.c.pending = {"question_id": "q2", "object_id": "object_9",
+                          "guess": "bottle", "options": ["bottle"]}
+        self._cleared("expired", qid="q2")
         self.assertEqual(len(self.c.bus.of("picarx/perception/identify_request")), 1)
 
 

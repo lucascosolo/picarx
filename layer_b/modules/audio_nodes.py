@@ -147,6 +147,21 @@ CHUNK_BYTES = 4000              # ~125ms per chunk at 16kHz/16-bit/mono
 # this cooldown only throttles the audible confirmation.
 STOP_REFLEX_COOLDOWN = 4.0
 
+# --- speech gate: VAD (primary) with the adaptive energy gate as fallback ---
+# The decode gate (what Kaldi is allowed to see) is now a real Voice Activity
+# Detector - webrtcvad, a tiny C extension that classifies 30ms frames as
+# speech/not-speech far more robustly than an amplitude threshold ever could.
+# The adaptive energy gate below is kept as a FAIL-SOFT fallback: if webrtcvad
+# isn't installed (`pip install webrtcvad`) or is disabled, the module behaves
+# exactly as it did before. Both gates share one interface -
+# process(data, rms, now) -> bool plus a .noise_floor attribute (the SNR
+# reject in _emit_result reads the floor regardless of which gate is active).
+VAD_ENABLED = robot_config.get_bool("audio", "vad", True, env="AUDIO_VAD")
+VAD_AGGRESSIVENESS = int(robot_config.get(
+    "audio", "vad_aggressiveness", 2, env="AUDIO_VAD_AGGRESSIVENESS"))  # 0 (loose)..3 (strict)
+VAD_FRAME_MS = 30               # webrtcvad accepts 10/20/30ms frames only
+VAD_FRAME_BYTES = 16000 * VAD_FRAME_MS // 1000 * 2  # 960 B @ 16kHz / 16-bit mono
+
 # --- adaptive energy gate tuning ---
 NOISE_FLOOR_ALPHA = 0.05        # how fast the ambient-floor estimate adapts (per chunk)
 NOISE_MULTIPLIER = 2.2          # trigger this many times above the tracked floor
@@ -269,8 +284,10 @@ class EnergyGate:
         self.open_since = None          # when the gate last transitioned closed -> open
         self.recent_rms = deque(maxlen=RESEED_RMS_WINDOW)
 
-    def process(self, rms, now):
-        """Returns True if this chunk should be decoded."""
+    def process(self, data, rms, now):
+        """Returns True if this chunk should be decoded. `data` is ignored
+        here (energy keys purely on rms); it's in the signature so VadGate and
+        EnergyGate are interchangeable in the capture loop."""
         self.recent_rms.append(rms)
         if self.noise_floor is None:
             self.noise_floor = rms
@@ -303,6 +320,78 @@ class EnergyGate:
         if DEBUG_LEVELS:
             print(f"Audio node: chunk rms={rms:.0f} floor={self.noise_floor:.0f} threshold={threshold:.0f}")
         return gate_open
+
+
+class VadGate:
+    """Decides, chunk by chunk, whether Kaldi should see any audio - using a
+    real Voice Activity Detector (webrtcvad) instead of an amplitude threshold.
+
+    Same interface as EnergyGate (process(data, rms, now) -> bool, plus a
+    .noise_floor read by the emit-time SNR check). webrtcvad only accepts
+    fixed-size frames, so raw bytes are buffered and sliced into 30ms frames;
+    a chunk counts as voiced if ANY of its frames is speech. A trailing
+    hangover (TRAILING_SILENCE_SEC, same as the energy gate) holds the gate
+    open across natural word-gaps and gives Kaldi the trailing silence its
+    endpointer expects. The ambient-floor estimate is still tracked (cheaply,
+    during confirmed silence) purely so the SNR reject downstream keeps a
+    number to compare against."""
+
+    def __init__(self, vad):
+        self.vad = vad
+        self.noise_floor = None
+        self.speaking_until = 0.0
+        self._buf = bytearray()
+
+    def _any_voiced(self, data):
+        """Feed DATA through the frame buffer; True if any complete 30ms frame
+        in it is classified as speech. Bad/short frames are skipped, never
+        fatal - a broken VAD read must not take STT down."""
+        self._buf.extend(data)
+        voiced = False
+        while len(self._buf) >= VAD_FRAME_BYTES:
+            frame = bytes(self._buf[:VAD_FRAME_BYTES])
+            del self._buf[:VAD_FRAME_BYTES]
+            try:
+                if self.vad.is_speech(frame, 16000):
+                    voiced = True
+            except Exception:
+                continue
+        return voiced
+
+    def process(self, data, rms, now):
+        if self.noise_floor is None:
+            self.noise_floor = rms
+        if self._any_voiced(data):
+            self.speaking_until = now + TRAILING_SILENCE_SEC
+        gate_open = now <= self.speaking_until
+        if not gate_open:
+            # Confirmed silence - let the floor track ambient for the SNR check.
+            self.noise_floor += NOISE_FLOOR_ALPHA * (rms - self.noise_floor)
+        if DEBUG_LEVELS:
+            print(f"Audio node: chunk rms={rms:.0f} floor={self.noise_floor:.0f} "
+                  f"vad={'open' if gate_open else 'closed'}")
+        return gate_open
+
+
+def _make_gate():
+    """The speech gate for this session: a webrtcvad-backed VadGate when VAD is
+    enabled and the library is importable, else the adaptive EnergyGate. Never
+    raises - any problem building the VAD falls back to the energy gate so the
+    mic pipeline always comes up."""
+    if not VAD_ENABLED:
+        print("Audio node: VAD disabled by config - using the adaptive energy gate.")
+        return EnergyGate()
+    try:
+        import webrtcvad
+        gate = VadGate(webrtcvad.Vad(VAD_AGGRESSIVENESS))
+        print(f"Audio node: voice-activity gate on (webrtcvad, aggressiveness "
+              f"{VAD_AGGRESSIVENESS}).")
+        return gate
+    except Exception as e:
+        print(f"Audio node: webrtcvad unavailable ({e}) - falling back to the "
+              f"adaptive energy gate. `pip install webrtcvad` to enable VAD.")
+        return EnergyGate()
+
 
 # Digital gain applied to every captured chunk before anything else
 # sees it - see the module docstring for why this exists. 1.0 = no
@@ -703,7 +792,7 @@ class AudioNode:
         # Start the microphone stream directly from the OS
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
 
-        gate = EnergyGate()
+        gate = _make_gate()
         voice_filter = VoiceBandFilter() if BANDPASS_ENABLED else _PassThrough()
         print(f"Audio node: voice-band filter {'on' if BANDPASS_ENABLED else 'off'} "
               f"({BANDPASS_HP_HZ:.0f}-{BANDPASS_LP_HZ:.0f} Hz)")
@@ -742,7 +831,7 @@ class AudioNode:
             data = _apply_gain(data, AUDIO_GAIN)
             rms = _chunk_rms(data)
 
-            if not gate.process(rms, now):
+            if not gate.process(data, rms, now):
                 # Confirmed silence. Because we stop feeding Kaldi during
                 # silence, its own endpointer never sees the trailing
                 # silence it needs to finalize - so on the FIRST silent

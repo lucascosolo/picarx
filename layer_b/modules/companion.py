@@ -73,6 +73,7 @@ import threading
 import queue
 import time
 import json
+import uuid
 from collections import deque
 
 HISTORY_TURNS = 20          # user+assistant messages kept for context
@@ -133,14 +134,21 @@ INTENT_MAX_TOKENS = 80
 #   incorrect -> DELETE the cached mapping (it taught the wrong thing),
 #                learn from a supplied correction, or - voice only - ask
 #                "what did you want?" and treat the next utterance as
-#                the answer. The answer executes through the normal
-#                heard pipeline on its own; here it's only LEARNED FROM:
-#                normalized onto a known command (allowlist first, one
-#                small LLM call only if it's fuzzy) and cached against
-#                the ORIGINAL phrasing, so next time it's on-board.
+#                the answer. The clarification is routed back by the dialog
+#                broker (dialog.py) on picarx/dialog/answer - it decides what
+#                counts as an answer, not a race on the raw heard stream. Here
+#                it's only LEARNED FROM: normalized onto a known command
+#                (allowlist first, one small LLM call only if it's fuzzy) and
+#                cached against the ORIGINAL phrasing, so next time it's on-board.
 # Motion stays out of the cache in every path, same invariant as ever.
 FEEDBACK_TOPIC = "picarx/intent/feedback"
 CORRECTION_WINDOW_SEC = 45.0     # how long "what did you want?" waits for an answer
+# Dialog broker protocol (dialog.py): register the "what did you want?"
+# question, and receive the routed clarification.
+DIALOG_ASK_TOPIC = "picarx/dialog/ask"
+DIALOG_ANSWER_TOPIC = "picarx/dialog/answer"
+DIALOG_CLEARED_TOPIC = "picarx/dialog/cleared"
+DIALOG_ASKER = "companion"
 
 # Commands the arbiter may emit. Deliberately EXCLUDES "explore",
 # "go to <place>" and any other movement: motion must only ever start
@@ -402,7 +410,9 @@ class Companion:
         # Latest vital stats from health_daemon (for the check_vital_stats tool)
         self.latest_health = None
         # Pending "what did you want me to do?" question, or None:
-        # {"utterance": <original misread phrasing>, "until": <deadline>}
+        # {"question_id": <id the dialog broker holds>, "utterance": <original
+        # misread phrasing>}. The broker owns the answer window/expiry; this is
+        # just what we need to learn from the routed clarification.
         self.awaiting_correction = None
         self._last_identify_at = 0.0      # throttles the cloud identify tier
 
@@ -568,22 +578,32 @@ class Companion:
             "reason": f"user judged the interpretation of: '{utterance}'",
             "ts": time.time()})
 
-    def on_heard(self, payload):
-        """Only consumed while a 'what did you want me to do?' question
-        is pending: the next human utterance is the answer, captured for
-        LEARNING. It also executes through field_agent's normal pipeline
-        on its own - this handler never dispatches anything."""
-        if payload.get("source") in ("intent_repair", "user_correction"):
-            return
-        text = (payload.get("text") or "").strip()
-        if not text or speech_match.parse_feedback(text):
+    def on_dialog_answer(self, payload):
+        """The dialog broker routed the clarification to our 'what did you want
+        me to do?' question. The broker already screened it (a real reply, not
+        a feedback verdict), so we just LEARN from it. The clarification still
+        executes through field_agent's normal pipeline on its own; this handler
+        never dispatches anything."""
+        if payload.get("asker") != DIALOG_ASKER:
             return
         with self.lock:
             awaiting = self.awaiting_correction
+            if not awaiting or payload.get("question_id") != awaiting["question_id"]:
+                return
             self.awaiting_correction = None
-        if not awaiting or time.time() > awaiting["until"]:
+        text = (payload.get("text") or "").strip()
+        if text:
+            self.work_queue.put(("learn", (awaiting["utterance"], text)))
+
+    def on_dialog_cleared(self, payload):
+        """Our correction question expired (or was replaced) with no answer -
+        just drop the pending record."""
+        if payload.get("asker") != DIALOG_ASKER:
             return
-        self.work_queue.put(("learn", (awaiting["utterance"], text)))
+        with self.lock:
+            awaiting = self.awaiting_correction
+            if awaiting and payload.get("question_id") == awaiting["question_id"]:
+                self.awaiting_correction = None
 
     def on_feedback(self, payload):
         verdict = payload.get("verdict")
@@ -629,9 +649,16 @@ class Companion:
             self.work_queue.put(("learn", (utterance, correction)))
         elif origin == "voice":
             if utterance:
+                question_id = uuid.uuid4().hex
                 with self.lock:
                     self.awaiting_correction = {
-                        "utterance": utterance, "until": now + CORRECTION_WINDOW_SEC}
+                        "question_id": question_id, "utterance": utterance}
+                # Register with the dialog broker BEFORE speaking, so the
+                # clarification always has somewhere to route.
+                self.bus.publish(DIALOG_ASK_TOPIC, {
+                    "asker": DIALOG_ASKER, "question_id": question_id,
+                    "kind": "correction", "ttl": CORRECTION_WINDOW_SEC,
+                    "prompt": "what did you want me to do?", "ts": now})
                 self._say("Sorry about that. What did you want me to do?")
             else:
                 self._say("Sorry about that.")
@@ -1152,7 +1179,8 @@ class Companion:
     def run(self):
         self.bus.subscribe("picarx/audio/unhandled", self.on_unhandled)
         self.bus.subscribe("picarx/audio/uncertain", self.on_uncertain)
-        self.bus.subscribe("picarx/audio/heard", self.on_heard)
+        self.bus.subscribe(DIALOG_ANSWER_TOPIC, self.on_dialog_answer)
+        self.bus.subscribe(DIALOG_CLEARED_TOPIC, self.on_dialog_cleared)
         self.bus.subscribe(FEEDBACK_TOPIC, self.on_feedback)
         self.bus.subscribe(VISION_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)

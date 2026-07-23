@@ -116,6 +116,12 @@ class CompanionTeacherTest(unittest.TestCase):
         self.assertEqual(self.c.awaiting_correction["utterance"], "hows your charge")
         speech = " ".join(p["text"] for p in self.c.bus.of("picarx/audio/speak"))
         self.assertIn("What did you want", speech)
+        # The correction question is registered with the dialog broker, which
+        # will route the clarification back on picarx/dialog/answer.
+        ask = self.c.bus.last("picarx/dialog/ask")
+        self.assertEqual(ask["asker"], "companion")
+        self.assertEqual(ask["kind"], "correction")
+        self.assertEqual(self.c.awaiting_correction["question_id"], ask["question_id"])
 
     def test_web_incorrect_with_correction_queues_learning(self):
         self.c.on_feedback({"verdict": "incorrect", "utterance": "hows your charge",
@@ -124,22 +130,34 @@ class CompanionTeacherTest(unittest.TestCase):
         self.assertEqual(kind, "learn")
         self.assertEqual(item, ("hows your charge", "battery"))
 
-    def test_answer_to_question_queues_learning(self):
-        self.c.awaiting_correction = {"utterance": "hows your charge",
-                                      "until": companion.time.time() + 30}
-        self.c.on_heard({"text": "i wanted the battery"})
+    def test_routed_answer_queues_learning(self):
+        # The broker screened it (a real reply, not a feedback verdict) and
+        # routes it on picarx/dialog/answer; companion just learns from it.
+        self.c.awaiting_correction = {"question_id": "q1",
+                                      "utterance": "hows your charge"}
+        self.c.on_dialog_answer({"asker": "companion", "question_id": "q1",
+                                 "text": "i wanted the battery"})
         kind, item = self.c.work_queue.get_nowait()
         self.assertEqual(kind, "learn")
         self.assertEqual(item, ("hows your charge", "i wanted the battery"))
         self.assertIsNone(self.c.awaiting_correction)
 
-    def test_answer_capture_ignores_repairs_and_feedback(self):
-        self.c.awaiting_correction = {"utterance": "x",
-                                      "until": companion.time.time() + 30}
-        self.c.on_heard({"text": "battery", "source": "intent_repair"})
-        self.c.on_heard({"text": "that's wrong"})
+    def test_answer_for_other_question_is_ignored(self):
+        # An answer for a different asker, or a stale question_id, must not be
+        # mistaken for our clarification.
+        self.c.awaiting_correction = {"question_id": "q1", "utterance": "x"}
+        self.c.on_dialog_answer({"asker": "companion", "question_id": "other",
+                                 "text": "battery"})
+        self.c.on_dialog_answer({"asker": "curiosity", "question_id": "q1",
+                                 "text": "battery"})
         self.assertTrue(self.c.work_queue.empty())
         self.assertIsNotNone(self.c.awaiting_correction)
+
+    def test_cleared_drops_pending_correction(self):
+        self.c.awaiting_correction = {"question_id": "q1", "utterance": "x"}
+        self.c.on_dialog_cleared({"asker": "companion", "question_id": "q1",
+                                  "reason": "expired"})
+        self.assertIsNone(self.c.awaiting_correction)
 
     def test_learn_clean_command_without_llm(self):
         ok = self.c._learn_correction("hows your charge", "battery")

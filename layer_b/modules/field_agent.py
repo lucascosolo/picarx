@@ -103,6 +103,7 @@ import robot_config
 from spatial_store import SpatialStore
 import person_memory
 import speech_match
+import attention
 
 # Smooth Ackermann steering controller (fail-soft: if it can't import,
 # the discrete _steer_away_angle law below keeps working unchanged).
@@ -138,7 +139,11 @@ INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
 # with one of these get forwarded to the LLM chat fallback at all -
 # hard commands (explore/stop/etc.) are unaffected and still work
 # with or without a wake phrase, since they're matched earlier above.
-WAKE_PHRASES = ("robot", "hey robot", "computer")
+# One knob (dialog.wake_phrases) is shared with the dialog broker so the
+# "addressed to me" wake word is defined in exactly one place.
+WAKE_PHRASES = attention.normalize_wake_phrases(robot_config.get(
+    "dialog", "wake_phrases", "robot,hey robot,computer",
+    env="DIALOG_WAKE_PHRASES"))
 
 # Utterances containing these are TOOL commands (tools_registry.py
 # routes them to their own modules). They must be ignored here so that
@@ -153,8 +158,11 @@ TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
 # After anyone has interacted with the robot (a command, or a wake-
 # phrase chat), keep treating unmatched speech as conversation for this
 # long - so a follow-up question doesn't need "robot ..." again. Kept
-# short: it's a reply window, not an always-open mic to the LLM.
-CONVERSATION_WINDOW_SEC = 45.0
+# short: it's a reply window, not an always-open mic to the LLM. Shares the
+# one dialog.conversation_window_sec knob with the dialog broker.
+CONVERSATION_WINDOW_SEC = float(robot_config.get(
+    "dialog", "conversation_window_sec", 45.0,
+    env="DIALOG_CONVERSATION_WINDOW_SEC"))
 
 # Person identity (person_memory.py, optional): greet a recognized person
 # by name, but not every time their face is re-confirmed - once per
@@ -1380,25 +1388,28 @@ class FieldAgent:
             self.announce("Hello! I am ready to chat and explore.", force=True)
             return
 
-        # Nothing above matched a hard command. Three ways it can still
-        # mean something, tried in order:
-        #   1. wake phrase -> LLM chat (as before);
+        # Nothing above matched a hard command. The shared attention model
+        # (attention.classify) decides whether this was addressed to us and
+        # why - the same three signals, now defined in one place:
+        #   1. wake phrase -> LLM chat (forward the stripped remainder);
         #   2. we're mid-conversation (someone addressed the robot within
         #      CONVERSATION_WINDOW_SEC) -> LLM chat without the wake word,
         #      so follow-ups don't need "robot ..." every single time;
-        #   3. it LOOKS like a garbled command (contains robot vocabulary
-        #      yet matched nothing) -> the LLM intent arbiter, which maps
-        #      it onto a known command if it can, and teaches the local
-        #      phrase cache so next time this stays fully on-board.
+        #   3. it LOOKS like a garbled command (robot vocabulary, or an
+        #      imperative shape like "take me to the kitchen") yet matched
+        #      nothing -> the LLM intent arbiter, which maps it onto a known
+        #      command if it can and teaches the local phrase cache.
         # Everything else is dropped, printed so the misses stay visible.
-        remainder = self._strip_wake_phrase(text)
-        if remainder is not None:
+        in_conversation = time.time() - self.last_interaction_at < CONVERSATION_WINDOW_SEC
+        addressing = attention.classify(text, canon, wake_phrases=WAKE_PHRASES,
+                                        in_conversation=in_conversation)
+        if addressing.reason == attention.WAKE:
             self._mark_interaction()
             self.bus.publish("picarx/audio/unhandled",
-                             {"text": remainder, "confidence": confidence})
+                             {"text": addressing.remainder, "confidence": confidence})
             return
 
-        if time.time() - self.last_interaction_at < CONVERSATION_WINDOW_SEC:
+        if addressing.reason == attention.CONVERSATION:
             # Deliberately does NOT re-mark the interaction: only wake
             # phrases and matched commands extend the window. If chatting
             # itself extended it, a talkative TV within 45s of one real
@@ -1410,15 +1421,10 @@ class FieldAgent:
             return
 
         # Loop guard: text the arbiter already repaired never re-escalates -
-        # if its best repair still matched nothing, it dies here.
-        # Two independent "this was probably meant for the robot" signals:
-        # robot vocabulary anywhere in it (looks_command_like), or an
-        # imperative sentence shape ("take me to the kitchen", "come with
-        # me") that contains no domain word at all (looks_directed_command).
-        # Either way the LLM arbiter makes the real intent call, and its
-        # phrase cache means each phrasing is only ever paid for once.
-        if not from_repair and (speech_match.looks_command_like(canon)
-                                or speech_match.looks_directed_command(text)):
+        # if its best repair still matched nothing, it dies here. The LLM
+        # arbiter makes the real intent call, and its phrase cache means each
+        # phrasing is only ever paid for once.
+        if addressing.reason == attention.COMMAND_SHAPE and not from_repair:
             print(f"(command-shaped but unmatched, escalating to arbiter): '{text}'")
             self.bus.publish("picarx/audio/uncertain", {
                 "text": text, "confidence": confidence, "from": SOURCE_NAME})
@@ -1430,20 +1436,6 @@ class FieldAgent:
         """Speech was clearly directed at the robot - keeps the
         no-wake-word conversation window (CONVERSATION_WINDOW_SEC) open."""
         self.last_interaction_at = time.time()
-
-    @staticmethod
-    def _strip_wake_phrase(text):
-        for phrase in WAKE_PHRASES:
-            if not text.startswith(phrase):
-                continue
-            # Whole-word match only: "robotics class was fun" starts with
-            # "robot" but was never addressed to the robot.
-            rest = text[len(phrase):]
-            if rest and rest[0].isalnum():
-                continue
-            remainder = rest.strip(" ,.:;-!?")
-            return remainder if remainder else "hello"
-        return None
 
     # ---------- spoken reports ----------
 

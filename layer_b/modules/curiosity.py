@@ -25,12 +25,17 @@ often is worse than staying quiet):
   - a global ASK_COOLDOWN between questions,
   - each object id is asked about at most once.
 
-The next thing the human says within ANSWER_WINDOW_SEC is taken as the
-answer (the same "capture the next utterance" pattern companion.py uses
-for spoken corrections). It is parsed into a label - one of the offered
-options, an affirmation of the guess, or a fresh noun - and published on
-picarx/perception/label. That utterance ALSO flows through the normal
-heard pipeline on its own; here it is only LEARNED FROM, never dispatched.
+Answers arrive through the central dialog broker (dialog.py), not by
+racing on the raw heard stream. When it asks, this module registers the
+question on picarx/dialog/ask (kind "label", its options, an
+ANSWER_WINDOW_SEC ttl); the broker decides whether a later utterance is
+genuinely an answer (vs. a command or a web-console button on the same
+heard topic - the bug the old looks_like_label_answer guard patched) and
+routes real answers back on picarx/dialog/answer. If the question expires
+unanswered the broker says so on picarx/dialog/cleared, which is what
+triggers the cloud-LLM escalation below. The answer is parsed into a label
+- one of the offered options, an affirmation of the guess, or a fresh noun
+- and published on picarx/perception/label.
 
 The web console feeds the SAME picarx/perception/label topic when someone
 relabels a sighting with the check / X buttons, so voice and console
@@ -44,16 +49,25 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import speech_match
+import attention
+# Answer classification + label parsing live in the shared attention model now;
+# re-exported here so curiosity.parse_label_answer / looks_like_label_answer
+# (and their unit tests) keep working against this module.
+from attention import parse_label_answer, looks_like_label_answer  # noqa: F401
 
-import re
 import threading
 import time
+import uuid
 
 OBJECTS_TOPIC = "picarx/vision/objects"
-HEARD_TOPIC = "picarx/audio/heard"
 SPEAK_TOPIC = "picarx/audio/speak"
 LABEL_TOPIC = "picarx/perception/label"
 MOVE_TOPIC = "picarx/intent/move"
+# Dialog broker protocol (dialog.py) - questions and their routed answers.
+ASK_TOPIC = "picarx/dialog/ask"
+ANSWER_TOPIC = "picarx/dialog/answer"
+CLEARED_TOPIC = "picarx/dialog/cleared"
+ASKER = "curiosity"
 # LAST-resort tier: when a spoken question goes unanswered, hand the object
 # to companion.py to identify with the cloud LLM. companion feeds the answer
 # back on LABEL_TOPIC, which trains the on-board memory - so the cloud is
@@ -76,73 +90,16 @@ LLM_COOLDOWN = 60.0          # min seconds between cloud identify escalations
 ATTENTION_PRIORITY = 7
 ATTENTION_PAUSE_SEC = 2.5
 
-# Words that aren't the noun in a spoken answer ("it's a speaker", "I think
-# that's a chair", "no, a mug") - stripped so what's left is the label.
-_ANSWER_FILLER = {
-    "it's", "its", "it", "is", "a", "an", "the", "that's", "thats", "that",
-    "this", "i", "think", "maybe", "looks", "look", "like", "actually", "no",
-    "not", "but", "sorry", "um", "uh", "well", "you", "mean", "meant", "of",
-    "course", "yeah", "yes", "nope", "just", "some", "kind", "sort",
-}
-
-
-# Words that mark an utterance as a COMMAND or QUESTION addressed to the robot
-# rather than a label answer. If any appears, "what is that?" must not swallow
-# it as a label - object labels are nouns and never contain these. Guards the
-# real bug: a command issued while a question is open (spoken, or a web-console
-# button, which publishes on the SAME heard topic - e.g. "who am I") was being
-# mis-stored as a label ("I'll remember that's a 'who am'").
-_NON_LABEL_WORDS = {
-    # interrogatives
-    "who", "whom", "whose", "whos", "what", "whats", "where", "when", "why",
-    "how", "which",
-    # question-leading auxiliaries ("are you...", "can you...", "do you...")
-    "are", "am", "do", "does", "did", "can", "could", "would", "will", "should",
-    # command verbs / motion the robot acts on
-    "stop", "halt", "go", "come", "follow", "wander", "explore", "turn", "move",
-    "drive", "spin", "find", "search", "play", "pause", "resume", "forward",
-    "backward", "left", "right",
-}
-
-
-def parse_label_answer(text, options):
-    """Extract the intended label from a spoken answer, or None.
-
-    An explicitly offered option named anywhere in the answer wins ("it's
-    the speaker" -> "speaker"); otherwise the answer's remaining non-filler
-    words become a fresh label ("that's a coffee mug" -> "coffee mug"). Pure
-    and hardware-free so it's unit-testable off the robot."""
-    low = text.lower()
-    for opt in options:
-        if opt and re.search(rf"\b{re.escape(opt)}\b", low):
-            return opt
-    words = [w for w in re.findall(r"[a-z']+", low) if w not in _ANSWER_FILLER]
-    return " ".join(words[:3]) if words else None
-
-
-def looks_like_label_answer(text, options):
-    """True if `text` could plausibly answer 'what is that?' - an affirmation or
-    negation, one of the offered options, or a plain noun label - and NOT a
-    command or question aimed at the robot. Pure/unit-testable. Keeps an
-    unrelated command from being mis-stored as a label when a question happens
-    to be open (see _NON_LABEL_WORDS)."""
-    low = (text or "").lower().strip()
-    if not low:
-        return False
-    if speech_match.parse_feedback(low) in ("correct", "incorrect"):
-        return True                      # "yes" / "no, a mug" - a real answer
-    tokens = re.findall(r"[a-z']+", low)
-    if any(t in _NON_LABEL_WORDS for t in tokens):
-        return False                     # a command/question, not a label
-    return True
-
-
 class Curiosity:
     def __init__(self):
         self.bus = Bus()
         self.lock = threading.Lock()
         self.asked = set()          # object ids already asked about
-        self.pending = None         # open question, or None (see _ask)
+        # Local record of the question the dialog broker is currently holding
+        # for us, or None: {question_id, object_id, guess, options}. The broker
+        # owns the answer window and expiry; we keep this only to resolve the
+        # routed answer (or escalate when the broker says it expired).
+        self.pending = None
         self.last_ask_at = 0.0
         self.last_llm_at = 0.0      # last cloud identify escalation
 
@@ -178,16 +135,9 @@ class Curiosity:
 
     def on_objects(self, payload):
         now = time.time()
-        expired = None
         with self.lock:
-            if self.pending and now > self.pending["until"]:
-                expired = self.pending   # question timed out with no answer
-                self.pending = None
-        if expired:
-            self._escalate_to_llm(expired, now)
-        with self.lock:
-            if self.pending and now <= self.pending["until"]:
-                return  # one open question at a time
+            if self.pending is not None:
+                return  # one open question at a time (broker owns its expiry)
             if now - self.last_ask_at < ASK_COOLDOWN:
                 return
         target = self._pick_uncertain(payload.get("objects") or [])
@@ -217,13 +167,20 @@ class Curiosity:
         else:
             options = [guess]
             text = f"I think I see a {guess}, but I'm not sure. What is that?"
+        question_id = uuid.uuid4().hex
         with self.lock:
             self.asked.add(target["id"])
             if len(self.asked) > ASKED_MEMORY:
                 self.asked = set(list(self.asked)[-ASKED_MEMORY:])
-            self.pending = {"object_id": target["id"], "guess": guess,
-                            "options": options, "until": now + ANSWER_WINDOW_SEC}
+            self.pending = {"question_id": question_id, "object_id": target["id"],
+                            "guess": guess, "options": options}
             self.last_ask_at = now
+        # Register the question with the dialog broker BEFORE speaking, so an
+        # answer that comes back quickly always has somewhere to route.
+        self.bus.publish(ASK_TOPIC, {
+            "asker": ASKER, "question_id": question_id, "kind": "label",
+            "options": options, "ttl": ANSWER_WINDOW_SEC, "prompt": text,
+            "ts": now})
         print(f"Curiosity: asking about {target['id']} - '{text}'")
         self._say(text, kind="question", label=guess, object_id=target["id"])
         self._pause_to_listen()
@@ -239,40 +196,36 @@ class Curiosity:
         except Exception as e:
             print(f"Curiosity: attention pause failed: {e}")
 
-    # ---------- answer capture ----------
+    # ---------- answer capture (via the dialog broker) ----------
 
-    def on_heard(self, payload):
-        """The next human utterance after a question is its answer. Repaired and
-        correction echoes are skipped (same guard companion uses); a stale or
-        absent question just clears; and an utterance that is really a COMMAND or
-        question addressed to the robot is left alone so it isn't mis-stored as a
-        label - the question stays open for a genuine answer. Never dispatches."""
-        if payload.get("source") in ("intent_repair", "user_correction"):
+    def on_answer(self, payload):
+        """The dialog broker routed a genuine answer to our open question. It
+        has already screened out commands / console buttons / stale utterances,
+        so we just resolve the label. Ignore answers for anyone else's
+        question, or a stale id (a newer question superseded this one)."""
+        if payload.get("asker") != ASKER:
             return
+        with self.lock:
+            pending = self.pending
+            if not pending or payload.get("question_id") != pending["question_id"]:
+                return
+            self.pending = None
         text = (payload.get("text") or "").strip()
-        if not text:
+        self._resolve_answer(pending, text, origin="voice")
+
+    def on_cleared(self, payload):
+        """The broker ended our question without an answer. On expiry, escalate
+        to the cloud LLM (last resort); a 'replaced' clear just drops it."""
+        if payload.get("asker") != ASKER:
             return
         now = time.time()
         with self.lock:
             pending = self.pending
-        if not pending:
-            return
-        if now > pending["until"]:
-            with self.lock:
-                if self.pending is pending:
-                    self.pending = None    # window closed - drop it, no answer
-            return
-        # Don't hijack a command/question meant for the robot (spoken, or a
-        # web-console button on this same heard topic) as a label answer. Leave
-        # the question open so a real answer within the window still lands.
-        if not looks_like_label_answer(text, pending["options"]):
-            print(f"Curiosity: '{text}' looks like a command, not a label "
-                  f"- leaving the question open")
-            return
-        with self.lock:
-            if self.pending is pending:
-                self.pending = None
-        self._resolve_answer(pending, text, origin="voice")
+            if not pending or payload.get("question_id") != pending["question_id"]:
+                return
+            self.pending = None
+        if payload.get("reason") == "expired":
+            self._escalate_to_llm(pending, now)
 
     def _resolve_answer(self, pending, text, origin):
         guess, options = pending["guess"], pending["options"]
@@ -305,7 +258,8 @@ class Curiosity:
 
     def run(self):
         self.bus.subscribe(OBJECTS_TOPIC, self.on_objects)
-        self.bus.subscribe(HEARD_TOPIC, self.on_heard)
+        self.bus.subscribe(ANSWER_TOPIC, self.on_answer)
+        self.bus.subscribe(CLEARED_TOPIC, self.on_cleared)
         print("Curiosity active - asking about ambiguous sightings "
               f"(cooldown {ASK_COOLDOWN:.0f}s, answer window {ANSWER_WINDOW_SEC:.0f}s)")
         while True:

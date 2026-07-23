@@ -127,6 +127,23 @@ KNOBS = [
     {"section": "audio", "key": "heard_min_snr", "type": "float",
      "default": 2.5, "env": "HEARD_MIN_SNR",
      "desc": "An utterance's peak level must exceed this multiple of the noise floor."},
+    {"section": "audio", "key": "vad", "type": "bool",
+     "default": True, "env": "AUDIO_VAD",
+     "desc": "Use webrtcvad as the speech gate (pip install webrtcvad); falls "
+             "back to the adaptive energy gate if the library is absent."},
+    {"section": "audio", "key": "vad_aggressiveness", "type": "int",
+     "default": 2, "env": "AUDIO_VAD_AGGRESSIVENESS",
+     "desc": "webrtcvad aggressiveness: 0 (loose, hears more) to 3 (strict, "
+             "rejects more non-speech)."},
+    # ---- dialog broker (dialog.py) + shared with field_agent forwarding ----
+    {"section": "dialog", "key": "wake_phrases", "type": "str",
+     "default": "robot,hey robot,computer", "env": "DIALOG_WAKE_PHRASES",
+     "desc": "Comma-separated phrases that address the robot ('robot ...', "
+             "'computer ...'); read by both field_agent and the dialog broker."},
+    {"section": "dialog", "key": "conversation_window_sec", "type": "float",
+     "default": 45.0, "env": "DIALOG_CONVERSATION_WINDOW_SEC",
+     "desc": "After a wake-word or command, how long follow-ups may skip the "
+             "wake word before it's needed again."},
     # ---- companion (companion.py) ----
     {"section": "companion", "key": "model", "type": "str",
      "default": "claude-sonnet-5", "env": "COMPANION_MODEL",
