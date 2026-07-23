@@ -1211,6 +1211,26 @@ class FieldAgent:
         label = (loc or {}).get("label") if loc else None
         return label.strip() if isinstance(label, str) and label.strip() else None
 
+    def _heartbeat_status(self):
+        """Compact self-reported detail folded into the module heartbeat (see
+        heartbeat.py): the drive state machine (CRUISING/SCANNING/EVADING/
+        COACHING/HYPOTHESIS), the operating mode, and where it thinks it is - so
+        the bus beacon shows what field_agent is DOING, not just that it's alive.
+        Cheap plain-attribute reads; the heartbeat guards any error."""
+        if self.rc_active:
+            mode = "rc"
+        elif self.explore_mode:
+            mode = "exploring"
+        else:
+            mode = "standby"
+        status = {"mode": mode, "state": self.state}
+        if self.given_up:
+            status["given_up"] = True
+        place = self._current_place_label()
+        if place:
+            status["place"] = place
+        return status
+
     def _location_context(self):
         """Compact {id,label,score} of where we are, or None."""
         with self.lock:
@@ -2723,6 +2743,7 @@ class FieldAgent:
         self.bus.subscribe("picarx/vision/person", self.on_person)
         self.bus.subscribe("picarx/tools/follow/state", self.on_follow_state)
         self.bus.subscribe("picarx/rc/mode", self.on_rc_mode)
+        self.bus.set_heartbeat_status(self._heartbeat_status)
 
         print("Field Agent active. Say 'explore', 'stop', 'status', 'objects', 'history', or 'battery'.")
         self.announce("Field agent online and standing by. Say explore when you want me to drive.", force=True)

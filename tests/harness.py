@@ -67,9 +67,15 @@ class FakeBus:
     def __init__(self, *args, **kwargs):
         self.published = []            # [(topic, payload_dict), ...]
         self.subscriptions = {}        # topic -> [callback, ...]
+        self.heartbeat_status_fn = None  # last fn passed to set_heartbeat_status
 
     def subscribe(self, topic, callback):
         self.subscriptions.setdefault(topic, []).append(callback)
+
+    def set_heartbeat_status(self, status_fn):
+        """Mirror Bus.set_heartbeat_status: record the module's status_fn so a
+        test can assert it was registered and exercise it directly."""
+        self.heartbeat_status_fn = status_fn
 
     def publish(self, topic, payload):
         self.published.append((topic, dict(payload)))

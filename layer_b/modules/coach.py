@@ -899,8 +899,22 @@ class Coach:
               f"{' (sim-trained arms held out)' if self.control else ''}"
               f"{'' if EXPERIMENT_ENABLED else ' (experiment disabled)'}")
 
+    def _heartbeat_status(self):
+        """Compact self-reported detail folded into the module heartbeat (see
+        heartbeat.py): this session's A/B condition (adopt vs control, the lever
+        the learning loop is measured on) and how many situations the policy has
+        learned - so the bus beacon shows the coach is not just alive but which
+        experiment arm is live. Cheap; the heartbeat guards any error."""
+        status = {"condition": self.experiment_condition}
+        if self.control:
+            status["arms_held_out"] = True    # sim-trained arms not selectable this session
+        with self.lock:
+            status["situations"] = len(self.policy)
+        return status
+
     def run(self):
         self._begin_experiment_session()
+        self.bus.set_heartbeat_status(self._heartbeat_status)
         self.bus.subscribe("picarx/coach/query", self.on_query)
         self.bus.subscribe("picarx/coach/outcome", self.on_outcome)
         self.bus.subscribe("picarx/rc/demonstration", self.on_demonstration)

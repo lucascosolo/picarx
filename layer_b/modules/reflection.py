@@ -171,6 +171,10 @@ class Reflection:
         self.last_activity = time.time()
         self._client = None
         self._warned_no_key = False
+        # Last-run summaries for the heartbeat beacon (in-memory so the status_fn
+        # never has to touch semantic.db): (ts, count) or None until each first runs.
+        self._last_reflection = None   # (ts, facts_stored) of the last LLM reflection
+        self._last_analysis = None     # (ts, patterns_mined) of the last offline analysis
 
     # ---------- activity tracking (anything here means "not idle") ----------
 
@@ -628,6 +632,7 @@ class Reflection:
 
         self.store.set_meta("last_analysis_at", now)
         self.store.set_meta("last_analyzed_event_id", max_event_id)
+        self._last_analysis = (now, len(patterns))
         if patterns or connectivity or self_facts:
             print(f"Reflection: offline analysis stored {len(patterns)} patterns, "
                   f"{connectivity} connectivity facts, {len(self_facts)} self-facts")
@@ -707,10 +712,36 @@ class Reflection:
 
         self.store.set_meta("last_reflected_event_id", max_id)
         self.store.set_meta("last_reflection_at", now)
+        self._last_reflection = (now, stored)
         print(f"Reflection: digested {n_lines} events into {stored} facts "
               f"({superseded} superseding, {episodes} episode) "
               f"({self.store.fact_count()} total known)")
         return True
+
+    # ---------- heartbeat ----------
+
+    def _heartbeat_status(self, now=None):
+        """Compact self-reported detail folded into the module heartbeat (see
+        heartbeat.py): how long the robot has been idle (reflection only runs
+        idle) and how long ago each of the two passes last ran + what it produced
+        - so the bus beacon shows whether reflection is actually consolidating,
+        not just alive. The last-run summaries are in-memory; fact_count() is one
+        cheap COUNT on the store reflection already owns. Heartbeat guards any
+        error."""
+        now = now if now is not None else time.time()
+        with self.lock:
+            idle_for = now - self.last_activity
+            last_reflection = self._last_reflection
+            last_analysis = self._last_analysis
+        status = {"idle_sec": round(idle_for, 1),
+                  "facts_known": self.store.fact_count()}
+        if last_reflection:
+            status["reflected_sec_ago"] = round(now - last_reflection[0], 1)
+            status["reflected_facts"] = last_reflection[1]
+        if last_analysis:
+            status["analyzed_sec_ago"] = round(now - last_analysis[0], 1)
+            status["mined_patterns"] = last_analysis[1]
+        return status
 
     # ---------- main loop ----------
 
@@ -721,6 +752,7 @@ class Reflection:
         self.bus.subscribe("picarx/perception/label", self.on_label)
         self.bus.subscribe("picarx/memory/note", self.on_note)
         self.bus.subscribe("picarx/memory/pattern", self.on_pattern)
+        self.bus.set_heartbeat_status(self._heartbeat_status)
 
         print(f"Reflection active ({self.store.fact_count()} facts known), "
               f"reflecting when idle {IDLE_AFTER_SEC:.0f}s+, analyzing when idle "
