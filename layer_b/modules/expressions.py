@@ -57,6 +57,14 @@ between expressions and does one thing at a time. Disable it in
 module_registry.json and the robot loses only its idle charm; every task
 behaviour is untouched.
 
+The ONE deliberate exception is a strong frustration spike: because frustration
+builds during a repeated-veto loop - exactly when the robot is moving and the
+head is busy - a head gesture would land late, so a strong spike is also voiced
+as a short spoken tag (no camera servo) in real time. That speaker-only cue lifts
+only the "we're moving" half of the deference; it still never talks over a
+person, drains a low battery, or fights a human at the wheel. See
+_maybe_voice_frustration.
+
 The decision helpers (is_busy / choose_context_acts / pick_idle_acts) are pure
 - no hardware, no bus - and unit-tested off-robot; the class is just their
 throttled dispatcher.
@@ -169,6 +177,16 @@ AFFECT_EXPRESS_THRESHOLD = 0.4     # a mood must reach this to be worth expressi
 AFFECT_CONSUME_FACTOR = 0.25       # fraction of a mood left after expressing it
 EMOTE_TAG_CHANCE = 0.5             # chance an emote also gets a short spoken tag
 
+# Real-time frustration. The head-gesture emote defers while the robot is
+# actively driving (the head is busy), but frustration builds precisely DURING a
+# repeated-veto loop - so an "ugh" only lands once the robot settles, late. A
+# strong frustration spike is therefore ALSO voiced on the speaker (no camera
+# servo needed), legible the moment it happens, on its own short cooldown. It
+# still never talks over a person, drains a low battery, or fights a human at the
+# wheel - only the "we're moving" half of the deference is lifted for it.
+FRUSTRATION_VOICE_THRESHOLD = 0.6   # a frustration spike this strong is voiced mid-loop
+FRUSTRATION_VOICE_COOLDOWN = 15.0   # min seconds between real-time frustration cues
+
 # What each internal-state event does to which mood, and by how much. A single
 # veto barely registers; a burst of them (the actual "stuck in a loop" signal)
 # accumulates into real frustration before it decays away.
@@ -219,11 +237,13 @@ def _is_moving(world, now):
     return direction == "turn" and bool(action.get("angle"))
 
 
-def is_busy(world, now, rc_active, last_speak_at):
-    """Whether expressions should stay completely quiet right now. Any one of:
-    a human has the wheel, low/critical battery (conserve), the robot spoke or
-    a human spoke very recently (a conversation is live - don't talk over it),
-    or the robot is moving."""
+def _quiet_required(world, now, rc_active, last_speak_at):
+    """Whether the robot must stay QUIET right now for reasons OTHER than its own
+    motion: a human has the wheel, low/critical battery (conserve), or a live
+    conversation (the robot spoke, or a human spoke, very recently - don't talk
+    over it). Split out from is_busy so a real-time frustration cue can be voiced
+    WHILE DRIVING - motion alone shouldn't muzzle it - yet still never talk over
+    a person, drain a flat battery, or fight a human at the wheel."""
     if rc_active:
         return True
     battery = (world or {}).get("battery") or {}
@@ -236,7 +256,17 @@ def is_busy(world, now, rc_active, last_speak_at):
     if heard_at is not None and not heard.get("stale") \
             and (now - heard_at) < HEARD_QUIET_SEC:
         return True
-    return _is_moving(world, now)
+    return False
+
+
+def is_busy(world, now, rc_active, last_speak_at):
+    """Whether expressions should stay completely quiet AND still right now: any
+    of the quiet-required conditions (see _quiet_required), or the robot is
+    actively driving (the head is needed and a gesture would compete). This gates
+    the head-using expressions; the speaker-only frustration cue uses just the
+    _quiet_required half so it can fire mid-loop."""
+    return (_quiet_required(world, now, rc_active, last_speak_at)
+            or _is_moving(world, now))
 
 
 def _pan_dir(offset):
@@ -458,6 +488,7 @@ class Expressions:
         self.last_activity_at = time.time()   # last heard/moved/expressed
         self.last_speak_at = 0.0              # last speech on the bus (any source)
         self.last_foreign_look_at = 0.0       # last head move by another module
+        self.last_frustration_voice_at = 0.0  # last real-time (mid-drive) frustration cue
         self.reacted_objects = {}             # label -> when we last remarked
         self.greeted_people = {}              # name  -> when we last greeted
         self.affect = AffectState()           # curiosity/frustration/satisfaction
@@ -609,6 +640,30 @@ class Expressions:
             self.affect.consume(mood, now)
         self._dispatch(pick_emote_acts(mood, self.rng), now, {})
 
+    def _maybe_voice_frustration(self):
+        """Make a frustration SPIKE audible in real time, even while the robot is
+        driving and the head is busy - so the "ugh" of a repeated-veto loop lands
+        WHILE it's stuck, not after it finally settles. A short spoken tag on the
+        speaker needs no camera servo, so `is_busy`'s "we're moving" deference
+        doesn't apply; it still stays quiet for a live conversation / low battery
+        / a human at the wheel (_quiet_required), and has its own short cooldown
+        so it doesn't nag. Consumes the mood so it doesn't repeat every tick."""
+        now = time.time()
+        with self.lock:
+            world = self.latest_world
+            rc_active = self.rc_active
+            last_speak_at = self.last_speak_at
+            cooled = (now - self.last_frustration_voice_at) >= FRUSTRATION_VOICE_COOLDOWN
+            mood, level = self.affect.dominant(now)
+        if mood != "frustration" or level < FRUSTRATION_VOICE_THRESHOLD or not cooled:
+            return
+        if _quiet_required(world, now, rc_active, last_speak_at):
+            return
+        with self.lock:
+            self.affect.consume("frustration", now)
+            self.last_frustration_voice_at = now
+        self._speak(self.rng.choice(EMOTE_TAGS["frustration"]))
+
     # ---------- dispatch ----------
 
     def _dispatch(self, acts, now, updates):
@@ -730,6 +785,7 @@ class Expressions:
               f"(cooldown {EXPRESSION_COOLDOWN:.0f}s, ambient after "
               f"{IDLE_BEFORE_AMBIENT:.0f}s idle)")
         while True:
+            self._maybe_voice_frustration()  # audible mid-loop, even while driving
             self._maybe_emote()        # express internal state (mood) first
             self._maybe_idle_express()
             time.sleep(IDLE_TICK_SEC)

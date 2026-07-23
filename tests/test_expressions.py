@@ -560,5 +560,86 @@ class MaybeEmoteTest(unittest.TestCase):
         self.assertEqual(self.e.bus.of(expressions.LOOK_TOPIC), [])
 
 
+class QuietRequiredTest(unittest.TestCase):
+    """_quiet_required is is_busy minus the 'we're moving' half - so a moving
+    (but conversation-free) robot is is_busy yet NOT quiet-required."""
+
+    def test_moving_alone_is_busy_but_not_quiet_required(self):
+        w = _world(last_action={"action": {"direction": "forward", "speed": 20},
+                                "updated_at": 1000.0})
+        self.assertTrue(expressions.is_busy(w, 1000.5, False, 0.0))
+        self.assertFalse(expressions._quiet_required(w, 1000.5, False, 0.0))
+
+    def test_conversation_and_power_still_require_quiet(self):
+        self.assertTrue(expressions._quiet_required(_world(), 1000.0, True, 0.0))  # rc
+        self.assertTrue(expressions._quiet_required(
+            _world(battery={"low": True, "critical": False}), 1000.0, False, 0.0))
+        self.assertTrue(expressions._quiet_required(  # we just spoke
+            _world(), 1000.0, False, 1000.0 - 1))
+        w = _world(last_heard={"text": "hi", "updated_at": 1000.0 - 2, "stale": False})
+        self.assertTrue(expressions._quiet_required(w, 1000.0, False, 0.0))  # human spoke
+
+
+class VoiceFrustrationTest(unittest.TestCase):
+    """The real-time frustration cue: audible on the speaker WHILE driving (when
+    the head-gesture emote would defer), but still deferential to conversation /
+    power / a human driver, and on its own cooldown."""
+
+    def setUp(self):
+        self.e = expressions.Expressions()
+        self.e.rng = random.Random(0)
+        # A world where the robot is actively driving (head-emote would defer).
+        self.driving = _world(last_action={
+            "action": {"direction": "forward", "speed": 20}, "updated_at": time.time()})
+        self.e.latest_world = self.driving
+
+    def _frustrate(self):
+        for _ in range(3):        # ~0.62, past FRUSTRATION_VOICE_THRESHOLD
+            self.e.on_action_result({"result": {"status": "vetoed"}})
+
+    def _tags(self):
+        return [p["text"] for p in self.e.bus.of(expressions.SPEAK_TOPIC)]
+
+    def test_frustration_is_voiced_while_driving(self):
+        self._frustrate()
+        self.assertTrue(expressions.is_busy(self.driving, time.time(), False, 0.0))
+        self.e._maybe_voice_frustration()
+        self.assertIn(self._tags()[-1], expressions.EMOTE_TAGS["frustration"])
+
+    def test_consumed_so_it_does_not_repeat_next_tick(self):
+        self._frustrate()
+        self.e._maybe_voice_frustration()
+        self.e.bus.clear()
+        self.e.last_frustration_voice_at = 0.0     # ignore the cooldown for this probe
+        self.e._maybe_voice_frustration()          # mood was consumed below threshold
+        self.assertEqual(self._tags(), [])
+
+    def test_own_cooldown_blocks_a_rapid_second_cue(self):
+        self._frustrate()
+        self.e._maybe_voice_frustration()
+        self.e.bus.clear()
+        self._frustrate()                          # frustration spikes again immediately
+        self.e._maybe_voice_frustration()          # ...but the cooldown holds it
+        self.assertEqual(self._tags(), [])
+
+    def test_defers_to_a_live_conversation(self):
+        self._frustrate()
+        self.e.latest_world = _world(
+            last_action=self.driving["last_action"],
+            last_heard={"text": "hello", "updated_at": time.time(), "stale": False})
+        self.e._maybe_voice_frustration()
+        self.assertEqual(self._tags(), [])
+
+    def test_calm_robot_stays_silent(self):
+        self.e._maybe_voice_frustration()
+        self.assertEqual(self._tags(), [])
+
+    def test_satisfaction_spike_is_not_voiced(self):
+        for _ in range(2):
+            self.e.on_goal_progress({"status": "reached"})   # strong satisfaction
+        self.e._maybe_voice_frustration()
+        self.assertEqual(self._tags(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
