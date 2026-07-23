@@ -310,6 +310,18 @@ AVOID_SPEED = 20              # ease off (from cruise 25) while maneuvering arou
 # lateral room; a dead-ahead object with nowhere to go still reverses.
 STEER_COMMIT_CM = 30.0        # steer around above this; reverse when closer
 AVOID_MIN_COMMIT_DEG = 8.0    # a real turn, not a token wiggle, to commit to an arc
+# Two cases the vision steer-around can't pick a side for on its own still used
+# to drive dead straight into the reverse reflex: a DEAD-CENTER object (no side
+# to prefer - _steer_away_angle/the controller both abstain) and a FEATURELESS
+# ultrasonic-only obstacle (a blank wall or an untracked box - no tracked object
+# to arc around at all). For both, lean toward whichever side the last head scan
+# found clearer (preferred_escape_angle) and keep rolling, so the heading starts
+# swinging away BEFORE the reverse trigger. The ultrasonic case only applies in a
+# band just beyond OBSTACLE_DISTANCE_CM: past that (a fresh, confident reading) an
+# early lean has room to help; closer than the reverse threshold is still the
+# emergency reflex's call. Fail-soft everywhere: no scan asymmetry -> unchanged
+# straight-then-reverse behavior.
+STEER_BAND_FAR_CM = 45.0      # ultrasonic-only steer band: OBSTACLE_DISTANCE_CM..this
 
 
 def _steer_away_angle(snapshot):
@@ -2310,6 +2322,51 @@ class FieldAgent:
         self.avoid_active_angle = None
         return False
 
+    def _scan_biased_arc_tick(self, snap, now):
+        """Fallback arc for the obstacles neither the vision steer-around nor
+        the escape reflex can pick a side for: a DEAD-CENTER object (no side to
+        prefer) and a FEATURELESS ultrasonic-only obstacle (no tracked object
+        to arc around at all). Lean toward whichever side the last head scan
+        found clearer (preferred_escape_angle) and keep rolling, so the robot
+        starts flowing away before the reverse trigger instead of driving dead
+        straight into the stop-and-back-out reflex. Returns True if it steered
+        (caller should return), False when the last scan gave no asymmetry to
+        lean on (caller falls through to its normal reverse / cruise path).
+
+        Shares _steer_around_tick's one-primitive-per-tick alternation and
+        timed-reset arming (steering_active_until), so it composes with the
+        arbiter's single-intent-per-source channel and the automatic
+        wheel-straightening reset exactly as the vision arc does."""
+        bias = self.preferred_escape_angle
+        if not bias:
+            return False
+        # Scale the scan's +/-30 side hint into the smooth-avoidance range so
+        # this stays a flowing arc, short of the +/-30 emergency reflexes.
+        angle = float(max(-AVOID_MAX_ANGLE, min(AVOID_MAX_ANGLE, bias)))
+        if self.avoid_active_angle is None:
+            self.publish_decision(
+                "steer_around", {"angle": round(angle, 1), "source": "scan_bias"},
+                f"nothing off-center to arc around, leaning toward the "
+                f"{'right' if angle > 0 else 'left'} side the last scan found clearer")
+        self.steering_active_until = now + AVOID_HOLD_SEC
+        # One primitive per tick (see the __init__ note): steer on the tick the
+        # angle first moves, drive on the rest. The scan bias is a fixed side,
+        # so after the initial turn this settles into steady forward on the arc.
+        steer_tick = (not self._avoid_turn_last_tick
+                      and (self.avoid_active_angle is None
+                           or abs(angle - self._avoid_sent_angle) >= AVOID_SEND_DEADBAND))
+        self.avoid_active_angle = angle
+        if steer_tick:
+            self._avoid_turn_last_tick = True
+            self._avoid_sent_angle = angle
+            self.publish_intent({"direction": "turn", "angle": angle})
+            return True
+        self._avoid_turn_last_tick = False
+        if self._note_forward_and_check_stuck(now, snap):
+            return True
+        self.publish_intent({"direction": "forward", "speed": AVOID_SPEED})
+        return True
+
     def explore_tick(self):
         now = time.time()
 
@@ -2448,11 +2505,17 @@ class FieldAgent:
                 # FRESH, confident distance beyond STEER_COMMIT_CM: an unknown or
                 # stale reading is genuine emergency territory (reverse), and so
                 # is a dead-ahead object with no committed arc.
-                if (distance is not None and not distance_stale
-                        and distance > STEER_COMMIT_CM
-                        and self._steer_around_tick(
-                            snap, now, min_commit_deg=AVOID_MIN_COMMIT_DEG)):
-                    return
+                if distance is not None and not distance_stale \
+                        and distance > STEER_COMMIT_CM:
+                    if self._steer_around_tick(
+                            snap, now, min_commit_deg=AVOID_MIN_COMMIT_DEG):
+                        return
+                    # Dead-center / symmetric obstacle: the vision law found no
+                    # side to arc toward. Break the tie toward the clearer
+                    # scanned side and flow around it, keeping reverse as the
+                    # last resort rather than the reflex for a head-on wall.
+                    if self._scan_biased_arc_tick(snap, now):
+                        return
                 label = vision_obstacle.get("label", "something")
                 if label == "something":
                     self.announce("Something's right in front of me, backing away.")
@@ -2490,6 +2553,19 @@ class FieldAgent:
                 return
             self.announce("Obstacle ahead, backing away.")
             self._begin_evasion("ultrasonic")
+            return
+
+        # --- Ultrasonic steer band: start arcing BEFORE the reverse trigger ---
+        # Past the reverse check above, so `distance` is a fresh, trustworthy
+        # reading in [OBSTACLE_DISTANCE_CM, STEER_BAND_FAR_CM). A featureless
+        # obstacle here (a blank wall, an untracked box) gives the vision
+        # steer-around below nothing to work with, so without this the robot
+        # drives dead straight from this point into the reverse reflex. Lean
+        # toward the clearer scanned side now, ahead of it. (Vision obstacles in
+        # this band were already handled-and-returned above, so this only ever
+        # fires for the ultrasonic-only case.) Fail-soft: no scan asymmetry ->
+        # falls through to the normal cruise/wander path below.
+        if distance < STEER_BAND_FAR_CM and self._scan_biased_arc_tick(snap, now):
             return
 
         # --- Veto-prone location hypothesis ---

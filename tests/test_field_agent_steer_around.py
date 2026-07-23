@@ -225,5 +225,83 @@ class EscapeSideHintTest(unittest.TestCase):
         self.assertIsNone(self.fa.evade_away_hint)
 
 
+class ScanBiasedArcTest(unittest.TestCase):
+    """The two cases the vision steer-around can't pick a side for - a
+    dead-center object and a featureless ultrasonic-only obstacle - lean
+    toward the clearer scanned side and keep rolling, instead of driving
+    dead straight into the reverse reflex. Still reverse with no scan bias
+    to lean on, and still reverse point-blank regardless."""
+
+    def setUp(self):
+        self.fa = field_agent.FieldAgent()
+        self.fa.state = "CRUISING"
+        self.fa.last_scan_at = time.time()
+        self.fa.last_wander = time.time()
+
+    def _drive(self, world):
+        self.fa.latest_world = world
+        self.fa.explore_tick()
+
+    def _turns(self):
+        return [p["action"] for p in self.fa.bus.of("picarx/intent/move")
+                if p["action"].get("direction") == "turn"]
+
+    # ---- dead-center visible obstacle ----
+
+    def test_dead_center_object_arcs_toward_clearer_side(self):
+        # Head-on object (offset 0) beyond STEER_COMMIT_CM: vision has no side
+        # to prefer, but the last scan found the left clearer -> arc left, no
+        # reverse.
+        self.fa.preferred_escape_angle = -30
+        self._drive(_world([_obj(area=0.4, offset=0, approaching=True)],
+                           distance=40, distance_stale=False))
+        self.assertEqual(self.fa.state, "CRUISING")           # arced, not EVADING
+        turns = self._turns()
+        self.assertTrue(turns and turns[-1]["angle"] < 0)     # toward the clear (left) side
+        self.assertGreaterEqual(turns[-1]["angle"], -field_agent.AVOID_MAX_ANGLE)
+
+    def test_dead_center_object_without_scan_bias_still_reverses(self):
+        # No scan asymmetry to lean on -> the head-on wall still reverses.
+        self.fa.preferred_escape_angle = None
+        self._drive(_world([_obj(area=0.4, offset=0, approaching=True)],
+                           distance=40, distance_stale=False))
+        self.assertEqual(self.fa.state, "EVADING")
+
+    # ---- featureless ultrasonic-only obstacle ----
+
+    def test_ultrasonic_only_obstacle_in_band_arcs(self):
+        # Nothing visible, ultrasonic reads inside the steer band -> lean
+        # toward the clearer scanned side before the reverse trigger.
+        self.fa.preferred_escape_angle = 30
+        self._drive(_world([], distance=35, distance_stale=False))
+        self.assertEqual(self.fa.state, "CRUISING")
+        turns = self._turns()
+        self.assertTrue(turns and turns[-1]["angle"] > 0)     # toward the clear (right) side
+
+    def test_ultrasonic_only_obstacle_without_bias_drives_straight(self):
+        # No scan bias -> unchanged behavior: no bias turn, keep cruising
+        # forward (it'll reverse later if it crosses the threshold).
+        self.fa.preferred_escape_angle = None
+        self._drive(_world([], distance=35, distance_stale=False))
+        self.assertEqual(self.fa.state, "CRUISING")
+        self.assertEqual(self._turns(), [])
+        forwards = [p["action"] for p in self.fa.bus.of("picarx/intent/move")
+                    if p["action"].get("direction") == "forward"]
+        self.assertTrue(forwards)
+
+    def test_ultrasonic_point_blank_still_reverses_despite_bias(self):
+        # Below the reverse threshold is the emergency reflex's call, bias or not.
+        self.fa.preferred_escape_angle = 30
+        self._drive(_world([], distance=15, distance_stale=False))
+        self.assertEqual(self.fa.state, "EVADING")
+
+    def test_clear_of_band_does_not_arc_on_bias(self):
+        # Well beyond the band with an empty scene: the scan bias must NOT
+        # steer (that would be a phantom turn on open floor); ordinary cruise.
+        self.fa.preferred_escape_angle = 30
+        self._drive(_world([], distance=120, distance_stale=False))
+        self.assertEqual(self._turns(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
