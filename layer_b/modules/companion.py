@@ -29,7 +29,17 @@ output" holds - the model chooses a behaviour, not a maneuver.
 Each reply is grounded with a short snapshot of picarx/state/world
 (face/objects/distance/battery) folded into the prompt, so it can
 answer naturally ("are you doing okay?", "what's that thing you're
-looking at?") without needing its own sensor access. Conversation
+looking at?") without needing its own sensor access. The snapshot also
+carries the robot's own recent EXPERIENCE - whether it's moving or being
+lifted, a bump/pickup it just felt (picarx/sensors/imu/event), what it
+did earlier today (reflection.py's episodic diary), and what it learned
+from an idle self-training run (picarx/self_trainer/status) - so it can
+talk about itself in the first person ("someone just picked me up", "I
+got stuck in the corner earlier"). All of that is fail-soft: the IMU is
+optional and currently flaky, so a stale/absent reading simply drops the
+motion and bump notes (vision's scene_motion is the moving-vs-still
+fallback), never blocking a reply. Its personality (system prompt) is
+separately grounded in the self-model facts reflection.py writes. Conversation
 history is a rolling window (HISTORY_TURNS messages) persisted to
 disk (COMPANION_MEMORY_PATH) after every turn, so a restart doesn't
 erase who it was just talking to - it picks the same conversation
@@ -247,6 +257,19 @@ BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 HEALTH_STATE_TOPIC = "picarx/health/state"
 LOWPOWER_REQUEST_TOPIC = "picarx/tools/lowpower/request"
 
+# ---------- talking about its own experience ----------
+# Beyond what it sees and who it's with, the companion grounds replies in the
+# robot's own recent PHYSICAL experience so it can say "I just got picked up"
+# or "I felt a bump", and in what it LEARNED from an idle self-training run.
+# All fail-soft: the IMU is optional (and currently flaky), so a stale/absent
+# imu block just drops these notes - the fallback is vision's scene_motion.
+IMU_EVENT_TOPIC = "picarx/sensors/imu/event"          # edge-triggered bump/pickup
+SELF_TRAINER_STATUS_TOPIC = "picarx/self_trainer/status"
+PHYSICAL_EVENT_MEMORY_SEC = 90.0    # how long a bump/pickup stays "recent" to mention
+BODY_TILT_LIFTED_DEG = 25.0         # body tilt above this reads as tilted/lifted
+TRAINING_REPORT_TTL_SEC = 1800.0    # how long a finished-practice result stays fresh to mention
+TRAINING_ANNOUNCE_COOLDOWN = 60.0   # min seconds between spoken practice-result reports
+
 TOOLS = [
     {"name": "schedule_reminder",
      "description": "Set a spoken reminder for the person for later. Use when they "
@@ -359,6 +382,13 @@ battery 7.4V]", followed by what the person actually said. Use that snapshot nat
 when it's relevant to the conversation, but don't recite it like a status report unless
 asked directly what you see/sense.
 
+The snapshot can also include your own recent EXPERIENCE: whether you're moving or
+sitting still or being lifted, a bump or pickup you just felt, what you got up to
+earlier today, and anything you learned from a practice session. Talk about these in
+the first person, like your own memories - "someone just picked me up", "I got stuck
+in the corner earlier", "I practised avoiding obstacles and picked up a new trick".
+Only mention them when they fit the conversation; don't list them off.
+
 You do NOT control your own motors from this conversation - a separate, instant,
 safety-critical command system handles "explore", "stop", "status", "objects",
 "history", "battery", "go to <place>", "where is <object>", "call this place
@@ -415,6 +445,14 @@ class Companion:
         # just what we need to learn from the routed clarification.
         self.awaiting_correction = None
         self._last_identify_at = 0.0      # throttles the cloud identify tier
+        # Recent physical experience (from picarx/sensors/imu/event): a short
+        # rolling memory of bumps/pickups so it can mention "I just felt a bump".
+        # Empty and harmless when the IMU is unavailable.
+        self.recent_physical_events = deque(maxlen=8)
+        # Last idle self-training result worth mentioning, or None:
+        # {"scenario", "notes", "patterns", "adopted", "ts"}.
+        self.latest_training = None
+        self._last_training_announce_at = 0.0
 
     # ---------- memory persistence ----------
 
@@ -565,6 +603,58 @@ class Companion:
         if not parts:
             return "My vital stats are unavailable right now."
         return "; ".join(parts) + "."
+
+    # ---------- its own physical experience ----------
+
+    def on_imu_event(self, payload):
+        """A bump or a pickup/tilt from imu.py (edge-triggered). Remembered
+        briefly so the model can reference it ("someone just picked me up").
+        Fail-soft: with the IMU down, no events arrive and this stays empty."""
+        kind = payload.get("kind")
+        if kind not in ("impact", "tilted"):
+            return
+        with self.lock:
+            self.recent_physical_events.append(
+                {"kind": kind, "ts": payload.get("ts") or time.time()})
+
+    def on_self_trainer_status(self, payload):
+        """Idle self-training lifecycle. On a 'published' result (a session
+        that actually produced learning), remember it so chat can mention what
+        was learned, and report it out loud once - the robot narrating its own
+        practice. Other states are ignored here."""
+        if payload.get("state") != "published":
+            return
+        now = time.time()
+        result = {
+            "scenario": payload.get("scenario"),
+            "notes": payload.get("notes") or 0,
+            "patterns": payload.get("patterns") or 0,
+            "adopted": bool(payload.get("adopted")),
+            "ts": now,
+        }
+        with self.lock:
+            self.latest_training = result
+            announce = now - self._last_training_announce_at > TRAINING_ANNOUNCE_COOLDOWN
+            if announce:
+                self._last_training_announce_at = now
+        if announce:
+            self._say(self._training_report(result, spoken=True))
+
+    @staticmethod
+    def _training_report(result, spoken=False):
+        """A short sentence about what a practice session produced. `spoken` adds
+        a friendly lead-in for the proactive announcement."""
+        scenario = result.get("scenario")
+        where = f" on {scenario}" if scenario else ""
+        bits = []
+        notes = result.get("notes") or 0
+        if notes:
+            bits.append(f"{notes} new note{'s' if notes != 1 else ''}")
+        if result.get("adopted"):
+            bits.append("a new driving tactic")
+        learned = " and ".join(bits) if bits else "a little more about how I drive"
+        lead = "I just finished practising" if spoken else "I recently practised"
+        return f"{lead}{where}. I picked up {learned}."
 
     # ---------- intent feedback ----------
 
@@ -778,7 +868,65 @@ class Companion:
             remembered = "; ".join(f"{f['subject']}: {f['fact']}" for f in facts)
             parts.append(f"long-term memory notes: {remembered}")
 
+        # Its own recent EXPERIENCE: how it's moving/being handled right now,
+        # a bump/pickup it just felt, what it did earlier today, and anything it
+        # learned from practising. All fail-soft (see _experience_notes).
+        parts.extend(self._experience_notes(time.time(), snap))
+
         return "; ".join(parts)
+
+    def _experience_notes(self, now, snap):
+        """First-person notes about the robot's own recent experience, folded
+        into the per-turn context so it can talk about itself naturally. Every
+        source is optional and fail-soft - a broken/absent IMU just drops the
+        motion and bump notes (vision's scene_motion is the fallback for
+        moving-vs-still), an empty diary drops the 'earlier today' line."""
+        notes = []
+
+        # Live motion / orientation. Prefer the IMU; fall back to vision motion.
+        imu = snap.get("imu") or {}
+        if not imu.get("stale", True):
+            body_tilt = imu.get("body_tilt_deg") or 0
+            if imu.get("tilted") or body_tilt >= BODY_TILT_LIFTED_DEG:
+                notes.append("I'm being tilted or lifted right now")
+            elif imu.get("moving"):
+                notes.append("I'm moving")
+            else:
+                notes.append("I'm sitting still")
+        else:
+            scene_motion = (snap.get("objects") or {}).get("scene_motion")
+            if scene_motion is not None:
+                notes.append("I seem to be moving" if scene_motion >= 3.0
+                             else "I'm sitting still")
+
+        # A bump or pickup felt recently (edge-triggered IMU events).
+        with self.lock:
+            events = [e for e in self.recent_physical_events
+                      if now - e["ts"] <= PHYSICAL_EVENT_MEMORY_SEC]
+            training = dict(self.latest_training) if self.latest_training else None
+        if events:
+            last = events[-1]
+            what = ("was picked up or tilted" if last["kind"] == "tilted"
+                    else "felt a bump")
+            notes.append(f"a moment ago I {what} ({_spoken_age(now - last['ts'])})")
+
+        # What it did earlier today (reflection.py's episodic diary).
+        try:
+            episodes = self.semantic.facts_for(
+                f"episode:{time.strftime('%Y-%m-%d')}", limit=1)
+        except Exception:
+            episodes = []
+        if episodes:
+            diary = episodes[0]["fact"]
+            if len(diary) > 200:
+                diary = diary[:200].rstrip() + "..."
+            notes.append(f"earlier today: {diary}")
+
+        # What it learned from a recent idle self-training session.
+        if training and now - training["ts"] <= TRAINING_REPORT_TTL_SEC:
+            notes.append(self._training_report(training))
+
+        return notes
 
     def _self_model_notes(self):
         """The robot's current self-model - first-person facts under
@@ -1186,6 +1334,8 @@ class Companion:
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
+        self.bus.subscribe(IMU_EVENT_TOPIC, self.on_imu_event)
+        self.bus.subscribe(SELF_TRAINER_STATUS_TOPIC, self.on_self_trainer_status)
 
         for _ in range(WORKER_THREADS):
             threading.Thread(target=self._worker_loop, daemon=True).start()
