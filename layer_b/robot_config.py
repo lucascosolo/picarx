@@ -153,6 +153,16 @@ KNOBS = [
      "default": 10.0, "env": "PICARX_HEARTBEAT_INTERVAL",
      "desc": "Seconds between module heartbeats (a module is flagged silent "
              "after ~3x this with no beat)."},
+    # ---- experiment / learning-loop A/B (experiment.py, coach, behavior_metrics) ----
+    {"section": "experiment", "key": "enabled", "type": "bool",
+     "default": True, "env": "EXPERIMENT_ENABLED",
+     "desc": "A/B the self-trainer->coach round-trip: alternate sessions "
+             "adopt (trained arms in play) vs control (held out). Set false to "
+             "always adopt once the round-trip is trusted."},
+    {"section": "experiment", "key": "checkpoint_sec", "type": "float",
+     "default": 30.0, "env": "EXPERIMENT_CHECKPOINT_SEC",
+     "desc": "How often behavior_metrics writes a session checkpoint of "
+             "collision/veto counts to behavior_metrics.jsonl."},
     # ---- companion (companion.py) ----
     {"section": "companion", "key": "model", "type": "str",
      "default": "claude-sonnet-5", "env": "COMPANION_MODEL",

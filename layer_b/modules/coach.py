@@ -96,6 +96,15 @@ import queue
 DATA_DIR = robot_config.data_path()
 COACH_POLICY_PATH = f"{DATA_DIR}/coach_policy.json"
 
+# A/B experiment (experiment.py): a "control" session holds out the sim-trained
+# arms so the round-trip can be measured against the pre-adoption baseline. The
+# chosen condition is published so behavior_metrics.py can tag the session.
+import experiment  # noqa: E402  (local module; kept with the other coach deps)
+EXPERIMENT_STATE_PATH = f"{DATA_DIR}/experiment_state.json"
+EXPERIMENT_TOPIC = "picarx/experiment/condition"
+EXPERIMENT_ENABLED = robot_config.get_bool(
+    "experiment", "enabled", True, env="EXPERIMENT_ENABLED")
+
 MIN_ARMS_BEFORE_EXPLOIT = 2   # always ask the LLM until a situation has this many tried arms
 MAX_ARMS_PER_SITUATION = 6    # stop growing new arms past this many (room for richer,
                               # multi-step repositioning tactics, not just a couple reverses)
@@ -223,6 +232,10 @@ class Coach:
         self.work_queue = queue.Queue()
         self._client = None
         self._warned_no_key = False
+        # A/B experiment condition for this session (see experiment.py). Default
+        # "adopt" (trained arms in play); run() may flip it to "control".
+        self.experiment_condition = experiment.ADOPT
+        self.control = False
 
     # ---------- policy cache persistence ----------
 
@@ -327,6 +340,12 @@ class Coach:
         """Returns an arm signature to exploit, or None to signal 'ask the LLM'."""
         entry = self.policy.get(situation_key)
         arms = entry["arms"] if entry else {}
+        # A/B control session: hold out the sim-trained arms so this session runs
+        # the pre-adoption baseline. The arms stay STORED (on_adopt still folds
+        # them) - they're just not selectable here - so adopt sessions and the
+        # offline metrics can compare against them fairly.
+        if self.control and arms:
+            arms = {sig: a for sig, a in arms.items() if not a.get("trained_in_sim")}
         if not arms or len(arms) < MIN_ARMS_BEFORE_EXPLOIT:
             return None
         if len(arms) < MAX_ARMS_PER_SITUATION and random.random() < NEW_ARM_EXPLORE_RATE:
@@ -861,7 +880,27 @@ class Coach:
 
     # ---------- main loop ----------
 
+    def _begin_experiment_session(self):
+        """Pick this session's A/B condition and announce it on the bus so
+        behavior_metrics can tag the session. When the experiment is disabled we
+        always adopt (learning fully on), but still publish the tag so metrics
+        stay labelled. Fail-soft."""
+        session_id = time.time()
+        if EXPERIMENT_ENABLED:
+            condition, counter = experiment.rotate(EXPERIMENT_STATE_PATH)
+        else:
+            condition, counter = experiment.ADOPT, None
+        self.experiment_condition = condition
+        self.control = (condition == experiment.CONTROL)
+        self.bus.publish(EXPERIMENT_TOPIC, {
+            "condition": condition, "session_id": session_id,
+            "counter": counter, "enabled": EXPERIMENT_ENABLED, "ts": session_id})
+        print(f"Coach: A/B session condition = {condition}"
+              f"{' (sim-trained arms held out)' if self.control else ''}"
+              f"{'' if EXPERIMENT_ENABLED else ' (experiment disabled)'}")
+
     def run(self):
+        self._begin_experiment_session()
         self.bus.subscribe("picarx/coach/query", self.on_query)
         self.bus.subscribe("picarx/coach/outcome", self.on_outcome)
         self.bus.subscribe("picarx/rc/demonstration", self.on_demonstration)
