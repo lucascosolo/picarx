@@ -7,6 +7,7 @@ import os
 import random
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -399,6 +400,164 @@ class ReflectionNoteTest(unittest.TestCase):
         self.r.on_note(payload)
         self.r.on_note(payload)
         self.assertEqual(len(self.r.store.facts_for("guitar", limit=5)), 1)
+
+
+class AffectStateTest(unittest.TestCase):
+    """The pure mood model: nudges raise a feeling, time decays it, the
+    strongest past threshold is the one to express."""
+
+    def setUp(self):
+        self.a = expressions.AffectState(half_life=100.0)
+
+    def test_nudges_accumulate_and_cross_threshold(self):
+        t = 1000.0
+        self.assertEqual(self.a.dominant(t), (None, 0.0))   # calm at rest
+        for _ in range(3):
+            self.a.nudge("frustration", 0.22, t)            # a burst of vetoes
+        mood, level = self.a.dominant(t)
+        self.assertEqual(mood, "frustration")
+        self.assertAlmostEqual(level, 0.66, places=3)
+
+    def test_level_is_clamped_to_one(self):
+        t = 1000.0
+        for _ in range(10):
+            self.a.nudge("satisfaction", 0.5, t)
+        self.assertLessEqual(self.a.levels["satisfaction"], 1.0)
+
+    def test_decays_over_time(self):
+        t = 1000.0
+        self.a.nudge("curiosity", 0.8, t)
+        self.a.dominant(t + 100.0)                          # one half-life later
+        self.assertAlmostEqual(self.a.levels["curiosity"], 0.4, places=3)
+
+    def test_decayed_below_threshold_is_not_dominant(self):
+        t = 1000.0
+        self.a.nudge("curiosity", 0.5, t)
+        self.assertEqual(self.a.dominant(t + 200.0)[0], None)   # faded away
+
+    def test_strongest_mood_wins(self):
+        t = 1000.0
+        self.a.nudge("curiosity", 0.5, t)
+        self.a.nudge("satisfaction", 0.9, t)
+        self.assertEqual(self.a.dominant(t)[0], "satisfaction")
+
+    def test_consume_damps_the_expressed_mood(self):
+        t = 1000.0
+        self.a.nudge("satisfaction", 0.8, t)
+        self.a.consume("satisfaction", t)
+        self.assertEqual(self.a.dominant(t)[0], None)       # no longer expressible
+
+
+class PickEmoteActsTest(unittest.TestCase):
+    def test_always_has_a_gesture(self):
+        for mood in ("curiosity", "frustration", "satisfaction"):
+            acts = expressions.pick_emote_acts(mood, random.Random(0))
+            self.assertEqual(acts[0], {"tool": "emote_gesture", "mood": mood})
+
+    def test_tag_is_from_the_moods_repertoire_when_present(self):
+        # rng seed that yields a tag; the spoken tag must match the mood.
+        acts = expressions.pick_emote_acts("frustration", random.Random(2))
+        speaks = [a for a in acts if a["tool"] == "speak"]
+        for s in speaks:
+            self.assertIn(s["text"], expressions.EMOTE_TAGS["frustration"])
+
+
+class AffectSignalTest(unittest.TestCase):
+    """Internal-state bus events nudge the right moods."""
+
+    def setUp(self):
+        self.e = expressions.Expressions()
+
+    def _mood(self, name):
+        return self.e.affect.levels[name]
+
+    def test_veto_builds_frustration(self):
+        for _ in range(3):
+            self.e.on_action_result({"result": {"status": "vetoed"}})
+        self.assertGreater(self._mood("frustration"), 0.4)
+
+    def test_non_veto_result_is_ignored(self):
+        self.e.on_action_result({"result": {"status": "ok"}})
+        self.assertEqual(self._mood("frustration"), 0.0)
+
+    def test_cleared_path_is_satisfying(self):
+        self.e.on_hypothesis({"resolution": "phantom_reading"})
+        self.assertGreater(self._mood("satisfaction"), 0.0)
+
+    def test_still_blocked_is_frustrating(self):
+        self.e.on_hypothesis({"resolution": "still_blocked"})
+        self.assertGreater(self._mood("frustration"), 0.0)
+
+    def test_goal_reached_is_very_satisfying(self):
+        self.e.on_goal_progress({"status": "reached"})
+        self.assertGreaterEqual(self._mood("satisfaction"),
+                                expressions.AFFECT_EXPRESS_THRESHOLD)
+
+    def test_new_place_sparks_curiosity(self):
+        self.e.on_location_change({"is_new": True})
+        self.assertGreater(self._mood("curiosity"), 0.0)
+
+    def test_known_place_does_not(self):
+        self.e.on_location_change({"is_new": False})
+        self.assertEqual(self._mood("curiosity"), 0.0)
+
+    def test_learning_a_label_satisfies_and_stays_curious(self):
+        self.e.on_label({"correct_label": "mug"})
+        self.assertGreater(self._mood("satisfaction"), 0.0)
+        self.assertGreater(self._mood("curiosity"), 0.0)
+
+    def test_training_published_satisfies(self):
+        self.e.on_self_trainer_status({"state": "published"})
+        self.assertGreater(self._mood("satisfaction"), 0.0)
+        self.e.affect.levels["satisfaction"] = 0.0
+        self.e.on_self_trainer_status({"state": "training"})   # non-published ignored
+        self.assertEqual(self._mood("satisfaction"), 0.0)
+
+
+class MaybeEmoteTest(unittest.TestCase):
+    """The gated dispatch: a strong mood becomes a legible gesture, but only
+    when deference allows, and it's consumed so it doesn't loop."""
+
+    def setUp(self):
+        self.e = expressions.Expressions()
+        self.e.rng = random.Random(0)
+        self.e._spawn = lambda fn: fn()
+        self.e._sleep = lambda *_a, **_k: None
+        self.e.latest_world = _world()
+        self.e.last_expression_at = 0.0        # past the cooldown
+        self.e.last_foreign_look_at = 0.0      # head free
+
+    def _frustrate(self):
+        for _ in range(3):
+            self.e.on_action_result({"result": {"status": "vetoed"}})
+
+    def test_strong_mood_emits_a_gesture_and_consumes_it(self):
+        self._frustrate()
+        self.e._maybe_emote()
+        looks = self.e.bus.of(expressions.LOOK_TOPIC)
+        self.assertTrue(looks)
+        self.assertEqual(looks[-1]["action"]["pan"], 0)     # ends centred
+        # Consumed: an immediate second attempt does nothing new.
+        self.e.bus.clear()
+        self.e.last_expression_at = 0.0
+        self.e._maybe_emote()
+        self.assertEqual(self.e.bus.of(expressions.LOOK_TOPIC), [])
+
+    def test_defers_while_busy(self):
+        self._frustrate()
+        self.e.latest_world = _world(battery={"low": True, "critical": False})
+        self.e._maybe_emote()
+        self.assertEqual(self.e.bus.of(expressions.LOOK_TOPIC), [])
+
+    def test_defers_while_head_in_use(self):
+        self._frustrate()
+        self.e.last_foreign_look_at = time.time()   # someone else just moved the head
+        self.e._maybe_emote()
+        self.assertEqual(self.e.bus.of(expressions.LOOK_TOPIC), [])
+
+    def test_calm_robot_does_not_emote(self):
+        self.e._maybe_emote()
+        self.assertEqual(self.e.bus.of(expressions.LOOK_TOPIC), [])
 
 
 if __name__ == "__main__":

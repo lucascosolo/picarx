@@ -1202,6 +1202,15 @@ class FieldAgent:
             self.active_goal = payload if payload.get("location_id") is not None else None
             self.goal_bias_angle = None  # re-derived from the next scan
 
+    def _current_place_label(self):
+        """The label of where the robot currently believes it is, or None -
+        for narrating intent ("exploring the kitchen"). Fail-soft: no spatial
+        modules / not localized yet just yields None."""
+        with self.lock:
+            loc = self.current_location
+        label = (loc or {}).get("label") if loc else None
+        return label.strip() if isinstance(label, str) and label.strip() else None
+
     def _location_context(self):
         """Compact {id,label,score} of where we are, or None."""
         with self.lock:
@@ -1297,7 +1306,12 @@ class FieldAgent:
                 # Look around before rolling: sweep the camera across
                 # the room and take stock of what's where first.
                 self._enter_scanning(time.time(), startup=True)
-                self.announce("Starting exploration. Let me take a look around first.", force=True)
+                # Narrate intent with the place when we know where we are, so
+                # it reads as "exploring the kitchen" rather than a generic
+                # start. Fail-soft: unknown location -> the plain announcement.
+                where = self._current_place_label()
+                lead = f"Exploring {where}." if where else "Starting exploration."
+                self.announce(f"{lead} Let me take a look around first.", force=True)
             return
 
         if "stop" in toks or "halt" in toks:

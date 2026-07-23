@@ -11,7 +11,7 @@ and then commits something worth keeping to memory. This module supplies that
 connective tissue and nothing more.
 
 It NEVER drives the wheels and never competes for the movement channel. It
-dispatches only four gentle "tools", all fail-soft and all heavily throttled
+dispatches only a few gentle "tools", all fail-soft and all heavily throttled
 because they share ONE speaker and ONE camera head with the whole system:
 
   - speak         -> picarx/audio/speak   (plain, untagged speech)
@@ -20,9 +20,12 @@ because they share ONE speaker and ONE camera head with the whole system:
                                            for an IDENTIFIED subject it then
                                            holds and follows it briefly instead
                                            of snapping straight back to centre)
+  - emote gesture -> picarx/intent/look   (a mood made legible WITHOUT words:
+                                           a curious cock, a satisfied nod, a
+                                           frustrated shake - see AffectState)
   - remember      -> picarx/memory/note   (reflection persists it as a fact)
 
-Two ways an expression fires:
+Three ways an expression fires:
 
   * CONTEXT-BASED - a reaction to picarx/state/world: a familiar person
     arrives (greet + turn the head toward them + remember the meeting), a
@@ -31,6 +34,16 @@ Two ways an expression fires:
     (a small startled remark). It stays out of curiosity.py's lane: genuinely
     AMBIGUOUS sightings belong to the question-asker, so expressions reacts
     only to confident, novel labels.
+
+  * INTERNAL-STATE / AFFECT - the robot has moods (curiosity, frustration,
+    satisfaction) that build from its OWN experience on the bus: it gets
+    curious at novelty (a new place/object), frustrated when it keeps getting
+    vetoed/stuck in a loop, satisfied when something finally works (a spot it
+    probed turns out clear, a goal is reached, it learns a label, a practice
+    run pays off). Those levels decay over time; the strongest past a threshold
+    is expressed as a head gesture (occasionally with a short spoken tag), so
+    the robot's internal state is legible even when it says nothing. See
+    AffectState and _maybe_emote.
 
   * RANDOM / AMBIENT - when nothing has happened for a while, an occasional
     self-directed musing or an idle look-around drawn from a small repertoire.
@@ -143,6 +156,50 @@ CLOSE_REMARKS = (
     "Oh, hello there. That's right in my face.",
     "Something's right in front of me.",
 )
+
+# --- Affect: expressive behaviour tied to INTERNAL state ---
+# The robot has moods that build from its own recent experience and make its
+# internal state legible WITHOUT words: a curious head-cock at novelty, a
+# frustrated head-shake when it keeps getting stuck, a satisfied nod when
+# something finally works. Moods are scalar levels in [0,1] that DECAY over
+# time; the strongest one past a threshold is expressed, then consumed so it
+# doesn't loop. Same deference/cooldown/head-free gates as everything else.
+AFFECT_HALF_LIFE = 90.0            # seconds for a mood to fade to half
+AFFECT_EXPRESS_THRESHOLD = 0.4     # a mood must reach this to be worth expressing
+AFFECT_CONSUME_FACTOR = 0.25       # fraction of a mood left after expressing it
+EMOTE_TAG_CHANCE = 0.5             # chance an emote also gets a short spoken tag
+
+# What each internal-state event does to which mood, and by how much. A single
+# veto barely registers; a burst of them (the actual "stuck in a loop" signal)
+# accumulates into real frustration before it decays away.
+AFFECT_NUDGES = {
+    "veto":           ("frustration", 0.22),   # a safety veto: something's in the way
+    "still_blocked":  ("frustration", 0.40),   # a probed spot is STILL blocked
+    "real_obstacle":  ("frustration", 0.25),
+    "goal_abandoned": ("frustration", 0.35),
+    "path_cleared":   ("satisfaction", 0.50),  # phantom reading / spot turned out clear
+    "goal_reached":   ("satisfaction", 0.80),
+    "learned_label":  ("satisfaction", 0.40),
+    "trained":        ("satisfaction", 0.70),
+    "greeted":        ("satisfaction", 0.30),
+    "new_place":      ("curiosity", 0.55),
+    "novel_object":   ("curiosity", 0.35),
+}
+
+# Legible-without-words head gestures per mood: (pan, tilt) step sequences that
+# always end centred - a cock for curiosity, a nod for satisfaction, a shake for
+# frustration. The safety daemon clamps these angles again.
+EMOTE_GESTURES = {
+    "curiosity":    [(CURIOUS_PAN, CURIOUS_TILT), (0, 0)],
+    "satisfaction": [(0, -12), (0, 10), (0, -6), (0, 0)],
+    "frustration":  [(-22, 0), (22, 0), (-14, 0), (0, 0)],
+}
+EMOTE_DWELL = {"curiosity": 1.2, "satisfaction": 0.3, "frustration": 0.3}
+EMOTE_TAGS = {
+    "curiosity":    ("Hm?", "Ooh.", "What's this?"),
+    "satisfaction": ("There we go.", "Nice.", "Got it."),
+    "frustration":  ("Hmph.", "Ugh.", "Not again."),
+}
 
 
 # ---------- pure decision helpers (no bus, no hardware) ----------
@@ -332,6 +389,64 @@ def pick_idle_acts(rng):
             {"tool": "speak", "text": rng.choice(IDLE_CURIOUS_MUSINGS)}]
 
 
+class AffectState:
+    """The robot's current mood as decaying scalar levels per feeling. Pure and
+    hardware-free: the Expressions dispatcher owns the clock and the lock and
+    calls in. Levels rise on internal-state events (nudge) and fade with time
+    (decay), so a mood reflects RECENT experience, not all of history."""
+
+    MOODS = ("curiosity", "frustration", "satisfaction")
+
+    def __init__(self, half_life=AFFECT_HALF_LIFE):
+        self.half_life = half_life
+        self.levels = {m: 0.0 for m in self.MOODS}
+        self.updated_at = None
+
+    def _decay_to(self, now):
+        if self.updated_at is None:
+            self.updated_at = now
+            return
+        dt = now - self.updated_at
+        if dt > 0:
+            factor = 0.5 ** (dt / self.half_life)
+            for m in self.levels:
+                self.levels[m] *= factor
+            self.updated_at = now
+
+    def nudge(self, mood, amount, now):
+        """Raise a mood by `amount` (clamped to 1.0), after decaying to `now`."""
+        if mood not in self.levels:
+            return
+        self._decay_to(now)
+        self.levels[mood] = min(1.0, self.levels[mood] + amount)
+
+    def dominant(self, now, threshold=AFFECT_EXPRESS_THRESHOLD):
+        """The strongest current mood past `threshold` as (mood, level), else
+        (None, 0.0). Ties break by MOODS order."""
+        self._decay_to(now)
+        mood = max(self.MOODS, key=lambda m: self.levels[m])
+        level = self.levels[mood]
+        return (mood, level) if level >= threshold else (None, 0.0)
+
+    def consume(self, mood, now, factor=AFFECT_CONSUME_FACTOR):
+        """Damp a mood after it's been expressed, so it doesn't fire again on
+        the very next tick but a still-elevated feeling can re-surface."""
+        self._decay_to(now)
+        if mood in self.levels:
+            self.levels[mood] *= factor
+
+
+def pick_emote_acts(mood, rng):
+    """A legible expression of `mood`: the head gesture, and - sometimes - a
+    short spoken tag. Pure; the caller gates it on deference and supplies rng."""
+    acts = [{"tool": "emote_gesture", "mood": mood}]
+    if rng.random() < EMOTE_TAG_CHANCE:
+        tags = EMOTE_TAGS.get(mood)
+        if tags:
+            acts.append({"tool": "speak", "text": rng.choice(tags)})
+    return acts
+
+
 class Expressions:
     def __init__(self):
         self.bus = Bus()
@@ -345,6 +460,7 @@ class Expressions:
         self.last_foreign_look_at = 0.0       # last head move by another module
         self.reacted_objects = {}             # label -> when we last remarked
         self.greeted_people = {}              # name  -> when we last greeted
+        self.affect = AffectState()           # curiosity/frustration/satisfaction
         # Seams so head gestures (which sleep between servo steps) run in a
         # background thread on-robot but synchronously and instantly in tests.
         self._spawn = lambda fn: threading.Thread(target=fn, daemon=True).start()
@@ -368,8 +484,63 @@ class Expressions:
             reacted = dict(self.reacted_objects)
             greeted = dict(self.greeted_people)
         acts, updates = choose_context_acts(payload, now, reacted, greeted, self.rng)
+        # Perceiving something novel or a friend nudges mood too, so the affect
+        # layer feels curious/pleased even when the context reaction itself is
+        # throttled off.
+        if updates.get("reacted_object"):
+            self._nudge("novel_object", now)
+        if updates.get("greeted"):
+            self._nudge("greeted", now)
         if acts:
             self._dispatch(acts, now, updates)
+
+    # ---------- inbound: internal-state signals feed the affect layer ----------
+
+    def _nudge(self, kind, now=None):
+        """Map an internal-state event to a mood bump (see AFFECT_NUDGES)."""
+        spec = AFFECT_NUDGES.get(kind)
+        if not spec:
+            return
+        mood, amount = spec
+        with self.lock:
+            self.affect.nudge(mood, amount, now or time.time())
+
+    def on_hypothesis(self, payload):
+        """A physical hypothesis resolved: relief when a spot turns out clear,
+        a touch of frustration when it's confirmed blocked."""
+        kind = {"phantom_reading": "path_cleared", "maybe_clear": "path_cleared",
+                "still_blocked": "still_blocked",
+                "real_obstacle": "real_obstacle"}.get(payload.get("resolution"))
+        if kind:
+            self._nudge(kind)
+
+    def on_action_result(self, payload):
+        """A safety-daemon veto: something got in the way. A burst of these
+        (the real 'stuck in a loop' signal) accumulates into frustration."""
+        if (payload.get("result") or {}).get("status") == "vetoed":
+            self._nudge("veto")
+
+    def on_label(self, payload):
+        """Learned what something is - a small satisfaction, and it keeps the
+        curiosity warm."""
+        now = time.time()
+        with self.lock:
+            self.affect.nudge("satisfaction", 0.4, now)
+            self.affect.nudge("curiosity", 0.2, now)
+
+    def on_location_change(self, payload):
+        if payload.get("is_new"):
+            self._nudge("new_place")
+
+    def on_goal_progress(self, payload):
+        kind = {"reached": "goal_reached",
+                "abandoned": "goal_abandoned"}.get(payload.get("status"))
+        if kind:
+            self._nudge(kind)
+
+    def on_self_trainer_status(self, payload):
+        if payload.get("state") == "published":
+            self._nudge("trained")
 
     def on_heard(self, payload):
         # A human spoke: a conversation is live. Mark activity so the ambient
@@ -413,6 +584,31 @@ class Expressions:
             return
         self._dispatch(pick_idle_acts(self.rng), now, {})
 
+    # ---------- affect (internal-state) path ----------
+
+    def _maybe_emote(self):
+        """Express the strongest current mood as a legible gesture, if one is
+        past threshold and deference allows. Checked before the ambient path so
+        an actual feeling wins over a generic musing; consumes the mood so it
+        doesn't repeat every tick."""
+        now = time.time()
+        with self.lock:
+            world = self.latest_world
+            rc_active = self.rc_active
+            last_speak_at = self.last_speak_at
+            cooled = (now - self.last_expression_at) >= EXPRESSION_COOLDOWN
+            head_free = (now - self.last_foreign_look_at) >= FOREIGN_LOOK_QUIET_SEC
+            mood, _level = self.affect.dominant(now)
+        # A mood expressed WITHOUT the head gesture isn't legible, so wait for
+        # the head to be free rather than blurt a bare tag over a busy sweep.
+        if mood is None or not cooled or not head_free:
+            return
+        if is_busy(world, now, rc_active, last_speak_at):
+            return
+        with self.lock:
+            self.affect.consume(mood, now)
+        self._dispatch(pick_emote_acts(mood, self.rng), now, {})
+
     # ---------- dispatch ----------
 
     def _dispatch(self, acts, now, updates):
@@ -430,11 +626,13 @@ class Expressions:
                 self._speak(act["text"])
             elif tool == "remember":
                 self._remember(act["subject"], act["fact"], act.get("confidence", 0.5))
-            elif tool in ("look_around", "curious_tilt") and head_free:
+            elif tool in ("look_around", "curious_tilt", "emote_gesture") and head_free:
                 if tool == "look_around":
                     self._look_around()
-                else:
+                elif tool == "curious_tilt":
                     self._curious_tilt(act.get("pan_dir", 0), act.get("track"))
+                else:
+                    self._emote_gesture(act["mood"])
 
     def _speak(self, text):
         self.bus.publish(SPEAK_TOPIC, {"text": text, "ts": time.time()})
@@ -458,6 +656,18 @@ class Expressions:
     def _curious_tilt(self, pan_dir, track=None):
         pan = CURIOUS_PAN * pan_dir
         self._spawn(lambda: self._curious_worker(pan, CURIOUS_TILT, track))
+
+    def _emote_gesture(self, mood):
+        self._spawn(lambda: self._emote_worker(mood))
+
+    def _emote_worker(self, mood):
+        """Play a mood's head-gesture sequence, ending centred. Legible without
+        words: a cock, a nod, a shake."""
+        seq = EMOTE_GESTURES.get(mood) or [(0, 0)]
+        dwell = EMOTE_DWELL.get(mood, LOOK_STEP_SEC)
+        for pan, tilt in seq:
+            self._publish_look(pan, tilt)
+            self._sleep(dwell)
 
     def _sweep_worker(self, pans, tilt):
         for pan in pans:
@@ -509,10 +719,18 @@ class Expressions:
         self.bus.subscribe(SPEAK_TOPIC, self.on_speak)
         self.bus.subscribe(LOOK_TOPIC, self.on_look)
         self.bus.subscribe(RC_MODE_TOPIC, self.on_rc_mode)
-        print(f"Expressions active - ambient personality "
+        # Internal-state signals that drive the affect layer (all optional).
+        self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
+        self.bus.subscribe("picarx/action/result", self.on_action_result)
+        self.bus.subscribe("picarx/perception/label", self.on_label)
+        self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
+        self.bus.subscribe("picarx/exploration/goal_progress", self.on_goal_progress)
+        self.bus.subscribe("picarx/self_trainer/status", self.on_self_trainer_status)
+        print(f"Expressions active - ambient personality + affect "
               f"(cooldown {EXPRESSION_COOLDOWN:.0f}s, ambient after "
               f"{IDLE_BEFORE_AMBIENT:.0f}s idle)")
         while True:
+            self._maybe_emote()        # express internal state (mood) first
             self._maybe_idle_express()
             time.sleep(IDLE_TICK_SEC)
 
