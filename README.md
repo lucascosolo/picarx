@@ -22,17 +22,17 @@ about.
 
 ```mermaid
 flowchart LR
-  HW[("motors · steering · camera head<br/>ultrasonic · grayscale · mic · speaker")]
+  HW[("motors · steering · camera head<br/>ultrasonic · grayscale · IMU · mic · speaker")]
 
   subgraph A["Layer A — reflexes  (safety/)"]
-    SD["safety_daemon<br/><i>hardcoded veto · smooth motion<br/>servo clamps · battery monitor</i>"]
+    SD["safety_daemon<br/><i>hardcoded veto · smooth motion<br/>servo clamps · battery · sensor reads</i>"]
   end
 
   subgraph B["Layer B — behaviour  (layer_b/modules/)"]
-    PER["perception<br/><i>vision · audio · distance · person</i>"]
+    PER["perception<br/><i>vision · audio · distance · person · imu</i>"]
     WS["world_state<br/><i>one coherent snapshot</i>"]
     COG["cognition & memory<br/><i>field_agent · coach · reflection<br/>explorer · goals · location graph</i>"]
-    INT["interaction<br/><i>companion · curiosity · expressions</i>"]
+    INT["interaction<br/><i>companion · curiosity · expressions<br/>dialog broker · affect</i>"]
     ARB["arbiter<br/><i>priority intent → safety</i>"]
   end
 
@@ -52,14 +52,17 @@ flowchart LR
   INT -.->|only when needed| LLM
 ```
 
-- **Layer A — reflexes (`safety/safety_daemon.py`).** The sole owner of the
-  drive motors and steering. It ramps motion smoothly, clamps the camera
-  servos to their physical range, watches the battery, and **vetoes** any
-  commanded action it deems unsafe (obstacle too close, cliff detected,
-  sustained blind reverse). It speaks a Unix socket, not the bus, and its veto
-  authority is never delegated upward. Everything above it is advisory.
+- **Layer A — reflexes (`safety/safety_daemon.py`).** The sole owner of *all*
+  hardware — drive motors, steering, and every sensor on the HAT. It ramps
+  motion smoothly, clamps the camera servos to their physical range, watches the
+  battery, and **vetoes** any commanded action it deems unsafe (obstacle too
+  close, cliff detected, sustained blind reverse). It also *serves* raw sensor
+  reads (ultrasonic distance, the I2C IMU) back over its socket, so no Layer B
+  module ever touches `robot_hat` directly. It speaks a Unix socket, not the
+  bus, and its veto authority is never delegated upward. Everything above it is
+  advisory.
 
-- **Layer B — behaviour (`layer_b/modules/`).** ~25 small Python processes,
+- **Layer B — behaviour (`layer_b/modules/`).** ~27 small Python processes,
   each an independent MQTT participant: perception, world modelling, autonomous
   driving, memory, dialogue, tools, and a web console. This is where almost all
   the code lives.
@@ -107,27 +110,34 @@ separate channel so a glance never competes with driving.
 
 | Area | Modules | What happens |
 |---|---|---|
-| **Perception** | `vision_basic`, `person_memory`, `distance_sensor`, `audio_nodes` | Motion-gated SSD object detection + tracking and Haar faces from the camera; on-board visual memory relabels uncertain sightings; recognises known people; ultrasonic range; mic → speech-to-text (Vosk) and text-to-speech (eSpeak), with a band-pass noise filter and a mic kill-switch. |
+| **Perception** | `vision_basic`, `person_memory`, `distance_sensor`, `imu`, `audio_nodes` | Motion-gated SSD object detection + tracking and Haar faces from the camera; on-board visual memory relabels uncertain sightings; recognises known people; ultrasonic range; a head-mounted MPU-6050 IMU for body motion / bumps / pickups (read *through* the safety daemon, frame-independent, fail-soft when absent); mic → speech-to-text (Vosk) and text-to-speech (eSpeak), with a band-pass noise filter and a mic kill-switch. |
 | **World model** | `world_state`, `event_logger` | One timestamped, staleness-flagged snapshot of everything the robot knows (`picarx/state/world`); an append-only telemetry log in SQLite. |
-| **Autonomy & motion** | `field_agent`, `arbiter`, `steering_controller` | Curiosity-driven wandering, smooth pure-pursuit obstacle avoidance, active hypothesis probes, look-around room scans, and passive learning from human demonstrations. |
+| **Autonomy & motion** | `field_agent`, `arbiter`, `steering_controller` | Curiosity-driven wandering, smooth pure-pursuit obstacle avoidance (now flowing around dead-center and featureless obstacles before reversing), active hypothesis probes, look-around room scans, and passive learning from human demonstrations. |
 | **Memory & reflection** | `reflection`, `location_graph`, `explorer`, `goal_manager`, `pattern_miner` | A topological map of places from head-sweep fingerprints; per-place uncertainty that steers exploration; long-horizon advisory goals; idle-time reflection and pure-Python temporal pattern mining that distil experience into durable facts. |
-| **Interaction & personality** | `companion`, `curiosity`, `expressions` | Spoken conversation via Claude; questions about genuinely ambiguous sightings ("is that a chair or a speaker?"); and ambient personality — idle musings, curious head-tilts, greetings, and notes-to-self. |
+| **Attention & dialogue** | `dialog`, `attention` | One central turn-taking broker answers "is this utterance addressed to me, and is it the answer to my open question?" so a command, a web-console button, or one module's answer can't be swallowed by another. `attention.py` is the shared, pure model (wake-word / conversation-window / command-shape classification). |
+| **Interaction & personality** | `companion`, `curiosity`, `expressions` | Spoken conversation via Claude, now grounded in the robot's *own* recent experience so it speaks in the first person ("someone just picked me up", "I got stuck in the corner earlier"); questions about genuinely ambiguous sightings ("is that a chair or a speaker?"); and ambient personality — idle musings, curious head-tilts, greetings, notes-to-self, and an **affect layer** (decaying curiosity / frustration / satisfaction moods made legible as head gestures). |
+| **Observability** | `debug_monitor`, `heartbeat`, `behavior_metrics` | A unified per-module liveness heartbeat on one bus topic; an always-on `/proc`-based per-process CPU/telemetry log; and real-world collision/veto-rate instrumentation that (with the A/B experiment scaffolding) proves whether the self-training loop actually helps. |
 | **Practical tools** | `tools_registry`, `radio`, `reminder_daemon`, `follow_daemon`, `bluetooth_daemon`, `health_daemon`, `web_console` | A voice→topic command router, internet radio, reminders, person-following, Bluetooth, homeostatic low-power self-preservation, and a multi-page phone/laptop web console (dashboard, live camera + RC driving, object-training, people & places, audio/radio, and a browser-editable config page). |
 
 Two of these deserve a note because they define the robot's character:
 
 - **`curiosity`** turns the vision detector's *uncertainty* into cheap, human-
   labelled ground truth: when it isn't sure what it sees, it asks, and the one-
-  word answer is written straight to memory.
+  word answer is written straight to memory. It no longer races for "the next
+  utterance" — it registers its question with the `dialog` broker, which routes
+  back only a genuine answer (and tells it to fall back to the LLM if the
+  question expires unanswered).
 - **`expressions`** supplies the "alive when idle" connective tissue. It
-  dispatches four gentle tools — **speak**, **look around**, **tilt the head
-  with curiosity**, and **remember something important** — both *randomly*
-  (occasional musings and glances in quiet moments) and in *reaction to
-  context* (greet a returning person, cock its head at a confidently-new
-  object, note the moment to memory). It never drives, defers completely while
-  the robot is busy or being spoken to, and shares the one speaker and one
-  camera head under strict cooldowns. Its notes flow to `picarx/memory/note`,
-  which `reflection` — the sole writer to the memory database — persists.
+  dispatches a handful of gentle tools — **speak**, **look around**, **tilt the
+  head with curiosity**, an **emote gesture** (a mood made legible as a head
+  cock / nod / shake), and **remember something important** — both *randomly*
+  (occasional musings and glances in quiet moments), in *reaction to context*
+  (greet a returning person, cock its head at a confidently-new object), and
+  from its own *internal state* (the affect layer's decaying moods). It never
+  drives, defers completely while the robot is busy or being spoken to, and
+  shares the one speaker and one camera head under strict cooldowns. Its notes
+  flow to `picarx/memory/note`, which `reflection` — the sole writer to the
+  memory database — persists.
 
 For the full history of how these capabilities were built, see
 [`ROADMAP_STATUS.md`](ROADMAP_STATUS.md).
@@ -202,6 +212,25 @@ house, so place-specific memories and the spatial map stay out of the pack, and
 the robot rebuilds those from real sensors. Restart the orchestrator afterwards
 so the modules reload the combined files.
 
+### Closing the loop — and proving it helps
+
+`self_trainer` (disabled by default) closes that round-trip on the robot itself:
+while genuinely idle it snapshots its own learning stores, refines them in the
+sibling simulator as a `nice`-d subprocess, and folds the result back in *through
+the same online intakes the owning modules expose* — never becoming a second
+writer of `coach_policy.json` or `semantic.db`. Any real activity instantly
+SIGTERMs the session; a missing sibling repo just means "no self-training this
+window."
+
+Because a self-improvement loop is a *hypothesis* until it's measured, the loop
+is instrumented rather than trusted. `experiment.py` assigns each session an A/B
+condition (even → **adopt**: sim-trained coach arms in play; odd → **control**:
+those arms held out, so the session runs the pre-adoption baseline);
+`behavior_metrics.py` records the real-world veto/impact/fail-loop rates tagged
+with that condition; and `ab_report.py` compares adopt vs control offline,
+refusing to over-claim below a minimum number of sessions per condition. Set
+`experiment.enabled=false` once the round-trip has earned its keep.
+
 ---
 
 ## Running it
@@ -239,7 +268,9 @@ in the file. Without it, the LLM-backed modules quietly stand down.
 
 Raspberry Pi + SunFounder PiCar-X: Robot HAT, 2× 18650 Li-ion (≈8.4 V full),
 DC drive motors, an Ackermann steering servo, a pan/tilt camera head, an
-ultrasonic range finder, and grayscale line/cliff sensors. Vision uses
+ultrasonic range finder, and grayscale line/cliff sensors. An optional
+head-mounted MPU-6050 IMU adds body-motion / bump / pickup sensing; the whole
+stack runs without it (it degrades to vision + ultrasonic). Vision uses
 `picamera2` + OpenCV; speech uses Vosk (STT) and eSpeak/MBROLA (TTS). Internet
 radio needs `mpv` (optional).
 
@@ -277,19 +308,25 @@ safety/                 Layer A — the hardcoded safety daemon (owns the wheels
 layer_b/
   orchestrator.py       Layer B supervisor: subprocess per module, hot reload
   module_registry.json  Which modules run (name → entrypoint → enabled)
-  broker_client.py      The MQTT Bus wrapper every module uses
+  broker_client.py      The MQTT Bus wrapper every module uses (+ heartbeat)
   config.json           All tunables, at their defaults
   robot_config.py       env > config.json > default resolution
+  attention.py          pure turn-taking model (addressed? answer to my question?)
+  heartbeat.py          the unified per-module liveness beacon
+  experiment.py         A/B condition rotation (adopt vs control)
+  ab_report.py          offline adopt-vs-control learning-loop report
   semantic_store.py     facts / patterns / self-model  (semantic.db)
   spatial_store.py      the topological place graph      (spatial.db)
   import_training.py    combine a picarx-training knowledge pack into data/ (merge|adopt)
   embedding_util.py     on-board text embeddings (MiniLM/ONNX)
-  modules/              the ~25 Layer B behaviours
+  modules/              the ~27 Layer B behaviours
     tools/              utility daemons (health, reminders, follow, bluetooth)
-    vision_basic.py  audio_nodes.py  world_state.py  arbiter.py
-    field_agent.py   coach.py  reflection.py  companion.py
-    curiosity.py     expressions.py  location_graph.py  explorer.py …
-  web_ui/               the web console front-end
+    vision_basic.py  audio_nodes.py  imu.py  world_state.py  arbiter.py
+    field_agent.py   coach.py  reflection.py  companion.py  dialog.py
+    curiosity.py     expressions.py  behavior_metrics.py  debug_monitor.py
+    location_graph.py  explorer.py …
+  web_ui/               the web console front-end (dashboard / drive / people /
+                        training / audio / config pages)
 tests/                  off-robot unittest suite + shared harness
 tools/                  developer tools (e.g. steering simulator)
 ROADMAP_STATUS.md       detailed build log of every capability

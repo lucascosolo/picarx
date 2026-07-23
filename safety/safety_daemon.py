@@ -343,10 +343,19 @@ def is_safe(action):
             return False, "reverse time limit (no rear sensor)"
         return True, "ok"
 
-    # Any non-reverse command ends the current continuous-reverse run.
+    # A camera "look" moves only the pan/tilt servos - it is NOT a drive
+    # command, so it must not touch the continuous-reverse backstop. Handle it
+    # before the reset below: otherwise a head glance interleaved during a
+    # sustained reverse (looks and drive share this one socket) silently re-arms
+    # the timer and lets the blind reverse run past its bound.
+    if direction == "look":
+        return True, "ok"
+
+    # Any non-reverse DRIVE command (stop/turn/forward) ends the current
+    # continuous-reverse run.
     _reverse_state["since"] = None
 
-    if direction in ("stop", "turn", "look"):
+    if direction in ("stop", "turn"):
         return True, "ok"
 
     with hardware_lock:

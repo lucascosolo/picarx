@@ -110,6 +110,71 @@ class MotionSmootherTest(unittest.TestCase):
         self.assertIn(("stop",), px.calls)
 
 
+class _FakeSensors:
+    """px stand-in for is_safe's non-hardware branches: a clear ultrasonic
+    reading and non-cliff grayscale, so the forward path returns 'ok' without a
+    real HAT."""
+    class _Ultrasonic:
+        @staticmethod
+        def read():
+            return 100.0
+
+    ultrasonic = _Ultrasonic()
+
+    @staticmethod
+    def get_grayscale_data():
+        return [1000, 1000, 1000]
+
+
+class ReverseBackstopTest(unittest.TestCase):
+    """The no-rear-sensor continuous-reverse backstop, and the fix that a
+    camera 'look' (pan/tilt only, not a drive command) must NOT re-arm it."""
+
+    def setUp(self):
+        self._real_time = safety_daemon.time.time
+        self._real_px = safety_daemon.px
+        self._now = 1000.0
+        safety_daemon.time.time = lambda: self._now
+        safety_daemon.px = _FakeSensors()
+        safety_daemon._reverse_state["since"] = None
+
+    def tearDown(self):
+        safety_daemon.time.time = self._real_time
+        safety_daemon.px = self._real_px
+        safety_daemon._reverse_state["since"] = None
+
+    def _reverse(self):
+        return safety_daemon.is_safe({"direction": "backward"})
+
+    def test_sustained_reverse_is_vetoed_past_the_limit(self):
+        self.assertEqual(self._reverse(), (True, "ok"))       # arms the timer
+        self._now += safety_daemon.MAX_CONTINUOUS_REVERSE_SEC + 0.1
+        safe, reason = self._reverse()
+        self.assertFalse(safe)
+        self.assertIn("reverse", reason)
+
+    def test_look_does_not_reset_the_reverse_timer(self):
+        # A head glance interleaved during a sustained reverse must not re-arm
+        # the backstop - a look moves only the camera servos.
+        self._reverse()                                       # arms at t=1000
+        self._now += 1.0
+        self.assertEqual(safety_daemon.is_safe({"direction": "look",
+                                                "pan": 20, "tilt": 0}), (True, "ok"))
+        self._now += safety_daemon.MAX_CONTINUOUS_REVERSE_SEC - 0.5   # total > limit
+        safe, _ = self._reverse()
+        self.assertFalse(safe)                                # still bounded
+
+    def test_a_drive_command_does_reset_the_reverse_timer(self):
+        # stop/turn/forward ARE real reverse interrupters and clear the run.
+        self._reverse()
+        self._now += 1.0
+        self.assertEqual(safety_daemon.is_safe({"direction": "turn", "angle": 10}),
+                         (True, "ok"))
+        self.assertIsNone(safety_daemon._reverse_state["since"])
+        self._now += safety_daemon.MAX_CONTINUOUS_REVERSE_SEC - 0.5
+        self.assertEqual(self._reverse(), (True, "ok"))       # fresh window
+
+
 class _FakeI2C:
     """robot_hat.I2C stand-in: write([reg,...]) sets the register pointer from
     the first byte; read(n) returns n bytes from a reg->byte map."""
