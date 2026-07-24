@@ -46,13 +46,16 @@ Voice commands understood (see handle_voice_command):
   "battery" / "charge" / "level" -> report battery voltage
   "hello" / "hi"                 -> greet
 
-Anything that doesn't match one of the above only gets forwarded for
-free-form conversation (via picarx/audio/unhandled, to companion.py,
-if running) when it starts with a wake phrase - see WAKE_PHRASES
-below, e.g. "hey pi, what do you think of the weather". Without a
-wake phrase it's just dropped (and printed to stdout), so STT
-mis-hearing background noise doesn't burn an API call on every false
-transcription. Hard commands above are unaffected either way.
+Anything that doesn't match one of the above is handed to the dialog
+broker (dialog.py) on picarx/audio/directed - it is the single owner of
+turn-taking, so IT decides whether the utterance was addressed to the
+robot (wake phrase / open conversation window / bare command shape) and
+routes it onward to free-form chat (picarx/audio/unhandled, companion.py)
+or the LLM intent arbiter (picarx/audio/uncertain), or drops it. This
+module no longer classifies that itself; it just forwards its misses and,
+via _mark_interaction, tells the broker when a command WAS matched so the
+no-wake-word conversation window stays open. Hard commands above are
+unaffected either way.
 
 You can also just watch stdout - every decision this module makes is
 printed, not just spoken, so you can test without a working mic/speaker.
@@ -103,7 +106,6 @@ import robot_config
 from spatial_store import SpatialStore
 import person_memory
 import speech_match
-import attention
 
 # Smooth Ackermann steering controller (fail-soft: if it can't import,
 # the discrete _steer_away_angle law below keeps working unchanged).
@@ -125,6 +127,12 @@ from collections import deque
 
 SOURCE_NAME = "field_agent"
 
+# Command-misses go here for the dialog broker (dialog.py) to classify and
+# route - the broker is the single owner of "is this addressed to me?" and the
+# no-wake-word conversation window, so the wake phrases and that window now live
+# there, not in this module.
+DIRECTED_TOPIC = "picarx/audio/directed"
+
 # Must match event_logger.py's DB_PATH - this module only ever opens
 # it read-only and never writes.
 DB_PATH = robot_config.data_path("events.db")
@@ -132,18 +140,6 @@ DB_PATH = robot_config.data_path("events.db")
 EXPLORE_PRIORITY = 5
 EXPLORE_TICK_HZ = 5
 INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
-
-# STT will constantly transcribe background noise/TV/conversation into
-# text; without a wake phrase, every one of those would silently burn
-# an Anthropic API call in companion.py. Only utterances that start
-# with one of these get forwarded to the LLM chat fallback at all -
-# hard commands (explore/stop/etc.) are unaffected and still work
-# with or without a wake phrase, since they're matched earlier above.
-# One knob (dialog.wake_phrases) is shared with the dialog broker so the
-# "addressed to me" wake word is defined in exactly one place.
-WAKE_PHRASES = attention.normalize_wake_phrases(robot_config.get(
-    "dialog", "wake_phrases", "robot,hey robot,computer",
-    env="DIALOG_WAKE_PHRASES"))
 
 # Utterances containing these are TOOL commands (tools_registry.py
 # routes them to their own modules). They must be ignored here so that
@@ -154,15 +150,6 @@ WAKE_PHRASES = attention.normalize_wake_phrases(robot_config.get(
 # without them here both modules would escalate the same text twice.
 TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
                  "music", "song")
-
-# After anyone has interacted with the robot (a command, or a wake-
-# phrase chat), keep treating unmatched speech as conversation for this
-# long - so a follow-up question doesn't need "robot ..." again. Kept
-# short: it's a reply window, not an always-open mic to the LLM. Shares the
-# one dialog.conversation_window_sec knob with the dialog broker.
-CONVERSATION_WINDOW_SEC = float(robot_config.get(
-    "dialog", "conversation_window_sec", 45.0,
-    env="DIALOG_CONVERSATION_WINDOW_SEC"))
 
 # Person identity (person_memory.py, optional): greet a recognized person
 # by name, but not every time their face is re-confirmed - once per
@@ -1422,54 +1409,26 @@ class FieldAgent:
             self.announce("Hello! I am ready to chat and explore.", force=True)
             return
 
-        # Nothing above matched a hard command. The shared attention model
-        # (attention.classify) decides whether this was addressed to us and
-        # why - the same three signals, now defined in one place:
-        #   1. wake phrase -> LLM chat (forward the stripped remainder);
-        #   2. we're mid-conversation (someone addressed the robot within
-        #      CONVERSATION_WINDOW_SEC) -> LLM chat without the wake word,
-        #      so follow-ups don't need "robot ..." every single time;
-        #   3. it LOOKS like a garbled command (robot vocabulary, or an
-        #      imperative shape like "take me to the kitchen") yet matched
-        #      nothing -> the LLM intent arbiter, which maps it onto a known
-        #      command if it can and teaches the local phrase cache.
-        # Everything else is dropped, printed so the misses stay visible.
-        in_conversation = time.time() - self.last_interaction_at < CONVERSATION_WINDOW_SEC
-        addressing = attention.classify(text, canon, wake_phrases=WAKE_PHRASES,
-                                        in_conversation=in_conversation)
-        if addressing.reason == attention.WAKE:
-            self._mark_interaction()
-            self.bus.publish("picarx/audio/unhandled",
-                             {"text": addressing.remainder, "confidence": confidence})
-            return
-
-        if addressing.reason == attention.CONVERSATION:
-            # Deliberately does NOT re-mark the interaction: only wake
-            # phrases and matched commands extend the window. If chatting
-            # itself extended it, a talkative TV within 45s of one real
-            # command would hold the window open (and burn API calls)
-            # indefinitely.
-            print(f"(in-conversation, forwarding without wake phrase): '{text}'")
-            self.bus.publish("picarx/audio/unhandled",
-                             {"text": text, "confidence": confidence})
-            return
-
-        # Loop guard: text the arbiter already repaired never re-escalates -
-        # if its best repair still matched nothing, it dies here. The LLM
-        # arbiter makes the real intent call, and its phrase cache means each
-        # phrasing is only ever paid for once.
-        if addressing.reason == attention.COMMAND_SHAPE and not from_repair:
-            print(f"(command-shaped but unmatched, escalating to arbiter): '{text}'")
-            self.bus.publish("picarx/audio/uncertain", {
-                "text": text, "confidence": confidence, "from": SOURCE_NAME})
-            return
-
-        print(f"(no wake phrase, not forwarding to chat): '{text}'")
+        # Nothing above matched a hard command. Hand the utterance to the
+        # dialog broker, the single owner of turn-taking: IT decides whether
+        # this was addressed to the robot (wake phrase / open conversation
+        # window / bare command shape) and routes it to chat or the intent
+        # arbiter, or drops it. `from_repair` rides along so the broker keeps
+        # the loop guard (repaired-but-still-unmatched text never re-escalates).
+        # This module no longer classifies addressing itself.
+        self.bus.publish(DIRECTED_TOPIC, {
+            "text": text, "confidence": confidence,
+            "from_repair": from_repair, "ts": time.time()})
 
     def _mark_interaction(self):
-        """Speech was clearly directed at the robot - keeps the
-        no-wake-word conversation window (CONVERSATION_WINDOW_SEC) open."""
-        self.last_interaction_at = time.time()
+        """Speech was clearly directed at the robot (a matched command, report,
+        or feedback). Tell the dialog broker so it holds the no-wake-word
+        conversation window open - the broker owns that window now, so a
+        wake-less follow-up ("and what's over there?") is still treated as
+        directed. Sent as a `handled` directed event (nothing to forward)."""
+        now = time.time()
+        self.last_interaction_at = now
+        self.bus.publish(DIRECTED_TOPIC, {"handled": True, "ts": now})
 
     # ---------- spoken reports ----------
 

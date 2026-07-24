@@ -15,6 +15,8 @@ import dialog  # noqa: E402
 
 ANSWER = "picarx/dialog/answer"
 CLEARED = "picarx/dialog/cleared"
+UNHANDLED = "picarx/audio/unhandled"
+UNCERTAIN = "picarx/audio/uncertain"
 
 
 class DialogBrokerTest(unittest.TestCase):
@@ -119,6 +121,69 @@ class DialogBrokerTest(unittest.TestCase):
         self.d._sweep_once(time.time() + 10_000)
         self.assertIsNone(self.d.bus.last(CLEARED))
         self.assertIsNotNone(self.d.question)
+
+
+class DirectedRoutingTest(unittest.TestCase):
+    """on_directed: the addressing half of turn-taking, moved here from
+    field_agent. field_agent forwards its command-misses; the broker decides
+    chat vs the intent arbiter vs drop, and owns the conversation window."""
+
+    def setUp(self):
+        self.d = dialog.DialogBroker()   # fresh: conversation window closed
+
+    def _directed(self, **payload):
+        self.d.on_directed(payload)
+
+    def test_wake_addressed_miss_goes_to_chat_stripped(self):
+        self._directed(text="robot what do you think", confidence=0.8)
+        msg = self.d.bus.last(UNHANDLED)
+        self.assertEqual(msg["text"], "what do you think")   # wake phrase stripped
+        self.assertEqual(msg["confidence"], 0.8)
+
+    def test_command_shaped_miss_goes_to_the_intent_arbiter(self):
+        self._directed(text="take me to the kitchen")
+        msg = self.d.bus.last(UNCERTAIN)
+        self.assertEqual(msg["text"], "take me to the kitchen")
+        self.assertEqual(msg["from"], "field_agent")
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+
+    def test_repaired_command_shaped_miss_is_dropped(self):
+        # Loop guard: a repair that still matched nothing must not re-escalate.
+        self._directed(text="take me to the kitchen", from_repair=True)
+        self.assertIsNone(self.d.bus.last(UNCERTAIN))
+
+    def test_plain_chatter_is_dropped_when_the_window_is_closed(self):
+        self._directed(text="the weather is nice today")
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+        self.assertIsNone(self.d.bus.last(UNCERTAIN))
+
+    def test_handled_command_opens_the_conversation_window(self):
+        # A matched command (handled ping) keeps a wake-less follow-up directed:
+        # plain chatter that would be dropped is now forwarded as conversation.
+        self._directed(handled=True)
+        self._directed(text="the weather is nice today")
+        self.assertEqual(self.d.bus.last(UNHANDLED)["text"], "the weather is nice today")
+        self.assertIsNone(self.d.bus.last(UNCERTAIN))   # chat, not a command
+
+    def test_wake_opens_the_window_for_a_following_plain_utterance(self):
+        self._directed(text="robot hello there")               # wake -> opens window
+        self.d.bus.clear()
+        self._directed(text="the weather is nice today")       # now in-conversation
+        self.assertEqual(self.d.bus.last(UNHANDLED)["text"], "the weather is nice today")
+
+    def test_command_shaped_miss_does_not_open_the_window(self):
+        # A bare command-shaped miss escalates but must NOT hold the window open
+        # (matching the old field_agent rule), so a later plain utterance drops.
+        self._directed(text="take me to the kitchen")
+        self.d.bus.clear()
+        self._directed(text="the weather is nice today")
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+
+    def test_empty_or_missing_text_is_a_noop(self):
+        self._directed(text="   ")
+        self._directed(confidence=0.5)
+        self.assertEqual(self.d.bus.of(UNHANDLED), [])
+        self.assertEqual(self.d.bus.of(UNCERTAIN), [])
 
 
 if __name__ == "__main__":

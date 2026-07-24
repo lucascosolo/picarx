@@ -34,34 +34,46 @@ class DirectedCommandShapeTest(unittest.TestCase):
             self.assertFalse(speech_match.looks_directed_command(text), text)
 
 
-class EscalationGateTest(unittest.TestCase):
-    """Unmatched command-shaped speech must reach the intent arbiter
-    instead of being dropped - by vocabulary OR by sentence shape."""
+class ForwardsMissesToBrokerTest(unittest.TestCase):
+    """field_agent no longer classifies addressing itself: it hands every
+    command-miss to the dialog broker on picarx/audio/directed, and the broker
+    decides chat vs intent-arbiter vs drop (see test_dialog). Here we only check
+    field_agent forwards the right thing."""
 
     def setUp(self):
-        self.fa = field_agent.FieldAgent()  # fresh: conversation window closed
+        self.fa = field_agent.FieldAgent()
 
-    def _uncertain(self):
-        return self.fa.bus.of("picarx/audio/uncertain")
+    def _misses(self):
+        return [m for m in self.fa.bus.of("picarx/audio/directed")
+                if not m.get("handled")]
 
-    def test_paraphrase_without_domain_words_escalates(self):
+    def test_unmatched_speech_is_forwarded_to_the_broker(self):
         self.fa.handle_voice_command("take me to the kitchen")
-        self.assertTrue(self._uncertain())
-        self.assertEqual(self._uncertain()[-1]["from"], "field_agent")
+        self.assertTrue(self._misses())
+        self.assertEqual(self._misses()[-1]["text"], "take me to the kitchen")
+        self.assertFalse(self._misses()[-1]["from_repair"])
 
-    def test_domain_vocabulary_still_escalates(self):
+    def test_domain_vocabulary_is_also_forwarded(self):
         self.fa.handle_voice_command("how's your charge holding up")
-        self.assertTrue(self._uncertain())
+        self.assertTrue(self._misses())
 
-    def test_plain_chatter_still_dropped(self):
+    def test_plain_chatter_is_forwarded_for_the_broker_to_judge(self):
+        # field_agent no longer drops locally; the broker classifies and drops.
         self.fa.handle_voice_command("the weather is nice today")
-        self.assertEqual(self._uncertain(), [])
-        self.assertEqual(self.fa.bus.of("picarx/audio/unhandled"), [])
+        self.assertEqual(self._misses()[-1]["text"], "the weather is nice today")
 
-    def test_repaired_text_never_reescalates(self):
+    def test_repaired_miss_carries_the_repair_flag(self):
+        # The broker reads this to keep the loop guard (no re-escalation).
         self.fa.handle_voice_command("take me to the kitchen",
                                      source="intent_repair")
-        self.assertEqual(self._uncertain(), [])
+        self.assertTrue(self._misses()[-1]["from_repair"])
+
+    def test_matched_command_is_not_forwarded_as_a_miss(self):
+        self.fa.handle_voice_command("battery")
+        self.assertEqual(self._misses(), [])
+        # ...but it tells the broker a command WAS handled (holds the window).
+        self.assertTrue(any(m.get("handled")
+                            for m in self.fa.bus.of("picarx/audio/directed")))
 
 
 class TokenPrecisionTest(unittest.TestCase):
@@ -85,9 +97,10 @@ class TokenPrecisionTest(unittest.TestCase):
         self.fa.handle_voice_command("who's in charge here")
         speech = " ".join(p["text"] for p in self.fa.bus.of("picarx/audio/speak"))
         self.assertNotIn("battery", speech.lower())
-        # ...but it does escalate (contains domain vocabulary), so the
-        # arbiter can still decide it was noise or chat.
-        self.assertTrue(self.fa.bus.of("picarx/audio/uncertain"))
+        # ...but it IS forwarded to the broker (which escalates command-shaped
+        # misses to the intent arbiter) rather than acted on locally.
+        self.assertTrue([m for m in self.fa.bus.of("picarx/audio/directed")
+                         if not m.get("handled")])
 
     def test_battery_token_still_reports(self):
         self.fa.handle_voice_command("battery")
