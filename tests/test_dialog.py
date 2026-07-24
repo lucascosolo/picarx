@@ -185,6 +185,41 @@ class DirectedRoutingTest(unittest.TestCase):
         self.assertEqual(self.d.bus.of(UNHANDLED), [])
         self.assertEqual(self.d.bus.of(UNCERTAIN), [])
 
+    # ---- dedup: an answer is not ALSO re-forwarded as chat ----
+
+    def _open_label_question(self):
+        self.d.on_ask({"asker": "curiosity", "question_id": "q1", "kind": "label",
+                       "options": ["chair", "speaker"], "ttl": 12.0})
+        self._directed(handled=True)      # open the window so a follow-up would forward
+
+    def test_a_routed_answer_is_not_re_forwarded_to_chat(self):
+        self._open_label_question()
+        self.d.on_heard({"text": "it's a speaker"})       # routed to curiosity
+        self.assertIsNotNone(self.d.bus.last(ANSWER))
+        self._directed(text="it's a speaker")             # field_agent's echo of the same
+        self.assertIsNone(self.d.bus.last(UNHANDLED))     # ...suppressed
+        self.assertIsNone(self.d.bus.last(UNCERTAIN))
+
+    def test_dedup_is_case_insensitive(self):
+        self._open_label_question()
+        self.d.on_heard({"text": "It's A Speaker"})        # on_heard preserves case
+        self._directed(text="it's a speaker")              # field_agent lowercases
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+
+    def test_a_different_utterance_after_an_answer_still_forwards(self):
+        self._open_label_question()
+        self.d.on_heard({"text": "it's a speaker"})
+        self._directed(text="the weather is nice today")   # a real follow-up, not the answer
+        self.assertEqual(self.d.bus.last(UNHANDLED)["text"], "the weather is nice today")
+
+    def test_dedup_expires_so_a_later_repeat_is_not_swallowed(self):
+        self._open_label_question()
+        self.d.on_heard({"text": "it's a speaker"})
+        self.d._answered = ("it's a speaker",
+                            time.time() - dialog.ANSWER_SUPPRESS_SEC - 1)  # age it out
+        self._directed(text="it's a speaker")
+        self.assertEqual(self.d.bus.last(UNHANDLED)["text"], "it's a speaker")
+
 
 if __name__ == "__main__":
     unittest.main()

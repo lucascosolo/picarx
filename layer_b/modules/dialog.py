@@ -92,6 +92,11 @@ UNCERTAIN_TOPIC = "picarx/audio/uncertain"    # -> companion LLM intent arbiter
 CONVERSATION_WINDOW_SEC = float(robot_config.get(
     "dialog", "conversation_window_sec", 45.0, env="DIALOG_CONVERSATION_WINDOW_SEC"))
 EXPIRY_SWEEP_SEC = 1.0   # how often the background sweeper checks the live deadline
+# When an utterance is routed as an answer, field_agent (which also sees it on
+# the raw heard stream) forwards its own copy on the directed stream a beat
+# later. Suppress that echo for this long so an answer is never ALSO re-forwarded
+# to chat - the dedup the single-authority broker makes possible.
+ANSWER_SUPPRESS_SEC = 3.0
 
 
 WAKE_PHRASES = attention.normalize_wake_phrases(robot_config.get(
@@ -105,6 +110,7 @@ class DialogBroker:
         self.lock = threading.Lock()
         self.question = None            # the single live attention.Question, or None
         self.last_directed_at = 0.0     # last wake/command-shaped utterance (window base)
+        self._answered = None           # (text_lower, ts) of the last routed answer
 
     # ---------- question registry ----------
 
@@ -175,6 +181,9 @@ class DialogBroker:
         with self.lock:
             if self.question is q:
                 self.question = None
+            # Remember it so field_agent's directed echo of the same utterance
+            # isn't ALSO forwarded to chat (see on_directed).
+            self._answered = (text.lower(), now)
         self.bus.publish(ANSWER_TOPIC, {
             "question_id": q.id, "asker": q.asker, "text": text,
             "confidence": payload.get("confidence"),
@@ -202,7 +211,9 @@ class DialogBroker:
               bare command shape -> the LLM intent arbiter (UNCERTAIN_TOPIC),
                                     UNLESS it is already a repair (loop guard);
               not addressed      -> dropped.
-        Fail-soft and stdlib-only, same as the rest of the broker."""
+        An utterance just routed as an ANSWER to an open question (on_heard) is
+        also dropped here, so it reaches its asker only and isn't re-forwarded to
+        chat. Fail-soft and stdlib-only, same as the rest of the broker."""
         now = time.time()
         if payload.get("handled"):
             with self.lock:
@@ -213,6 +224,14 @@ class DialogBroker:
             return
         with self.lock:
             in_conversation = (now - self.last_directed_at) < CONVERSATION_WINDOW_SEC
+            answered = self._answered
+        # Already routed as an answer a beat ago -> it reached its asker; don't
+        # also forward it to chat (the dedup only the single-authority broker can
+        # do - the old split forwarder never saw the answer routing).
+        if answered and answered[0] == text.lower() \
+                and (now - answered[1]) < ANSWER_SUPPRESS_SEC:
+            print(f"Dialog: '{text}' already routed as an answer, not re-forwarding")
+            return
         confidence = payload.get("confidence")
         from_repair = bool(payload.get("from_repair"))
         addressing = attention.classify(
