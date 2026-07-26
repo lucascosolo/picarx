@@ -140,8 +140,14 @@ class LocationConfidenceTest(unittest.TestCase):
             {"labels": ["l:sofa", "r:lamp"], "range": "mid"}, now=1.0)
         result = self.w.match_or_create({"labels": ["l:sofa"], "range": "mid"}, now=2.0)
         self.assertTrue(first["resolved"])
+        self.assertEqual(first["candidate_scores"], [])
         self.assertFalse(result["resolved"])
         self.assertEqual(result["reason"], "insufficient_landmarks")
+        self.assertEqual(result["candidate_scores"], [{
+            "location_id": 1, "similarity": fingerprint_similarity(
+                {"labels": ["l:sofa"], "range": "mid"},
+                first["fingerprint"]),
+        }])
         self.assertEqual(self.w.location_count(), 1)
 
     def test_near_tied_known_places_remain_unlocalized(self):
@@ -151,7 +157,39 @@ class LocationConfidenceTest(unittest.TestCase):
             {"labels": ["l:sofa", "r:lamp", "r:table"], "range": "mid"}, now=3.0)
         self.assertFalse(result["resolved"])
         self.assertEqual(result["reason"], "ambiguous_match")
+        self.assertEqual(
+            [candidate["location_id"] for candidate in result["candidate_scores"]],
+            [1, 2])
+        self.assertEqual(
+            result["candidate_scores"],
+            sorted(result["candidate_scores"],
+                   key=lambda candidate: (-candidate["similarity"],
+                                          candidate["location_id"])))
         self.assertEqual(self.w.location_count(), 2)
+
+    def test_resolved_result_has_bounded_ordered_candidate_scores(self):
+        fingerprints = [
+            {"labels": ["l:sofa", "r:lamp"], "range": "mid"},
+            {"labels": ["l:sofa", "r:table"], "range": "mid"},
+            {"labels": ["l:chair", "r:plant"], "range": "far"},
+            {"labels": ["l:book", "r:cup"], "range": "near"},
+        ]
+        for index, fingerprint in enumerate(fingerprints):
+            self.w.match_or_create(fingerprint, now=float(index + 1))
+
+        result = self.w.match_or_create(fingerprints[0], now=10.0)
+
+        self.assertTrue(result["resolved"])
+        self.assertEqual(result["reason"], "matched")
+        self.assertLessEqual(len(result["candidate_scores"]), 3)
+        self.assertEqual(
+            [set(candidate) for candidate in result["candidate_scores"]],
+            [{"location_id", "similarity"}] * 3)
+        self.assertEqual(
+            result["candidate_scores"],
+            sorted(result["candidate_scores"],
+                   key=lambda candidate: (-candidate["similarity"],
+                                          candidate["location_id"])))
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ MIN_DISTINCT_LANDMARKS = 2
 # location but doesn't count as a new "visit" (one wander session
 # re-scanning every 25s isn't ten visits).
 REVISIT_GAP_SEC = 120.0
+MAX_CANDIDATE_SCORES = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS locations (
@@ -548,7 +549,8 @@ class SpatialStore:
         """Resolve a scan fingerprint to a location, creating one if
         nothing known is similar enough. Returns the location dict plus
         'is_new' (just discovered) and 'new_visit' (revisit after being
-        away, vs. a same-session re-scan)."""
+        away, vs. a same-session re-scan), and a bounded ranked
+        ``candidate_scores`` list for telemetry."""
         self._assert_writer()
         now = now if now is not None else time.time()
         # Do not turn a nearly empty sweep into either a false recognition
@@ -559,16 +561,20 @@ class SpatialStore:
         # identify an already-known place.  It is a hypothesis until a later,
         # richer scan confirms it.
         known_locations = self.all_locations()
+        candidates = sorted(
+            ((fingerprint_similarity(fingerprint, loc["fingerprint"]), loc)
+             for loc in known_locations),
+            key=lambda item: (-item[0], item[1]["id"]))
+        candidate_scores = [
+            {"location_id": loc["id"], "similarity": similarity}
+            for similarity, loc in candidates[:MAX_CANDIDATE_SCORES]
+        ]
         if not fingerprint_is_distinctive(fingerprint) and known_locations:
             return {"id": None, "label": None, "fingerprint": fingerprint,
                     "is_new": False, "new_visit": False, "similarity": None,
                     "resolved": False, "reason": "insufficient_landmarks",
-                    "ambiguity": None}
+                    "ambiguity": None, "candidate_scores": candidate_scores}
 
-        candidates = sorted(
-            ((fingerprint_similarity(fingerprint, loc["fingerprint"]), loc)
-             for loc in known_locations),
-            key=lambda item: item[0], reverse=True)
         best_sim, best = candidates[0] if candidates else (None, None)
         second_sim = candidates[1][0] if len(candidates) > 1 else None
         # Two known places that explain this scan almost equally well are an
@@ -581,7 +587,8 @@ class SpatialStore:
                     "resolved": False, "reason": "ambiguous_match",
                     "ambiguity": {"best_location_id": best["id"],
                                   "second_location_id": candidates[1][1]["id"],
-                                  "margin": best_sim - second_sim}}
+                                  "margin": best_sim - second_sim},
+                    "candidate_scores": candidate_scores}
         if best is not None and best_sim >= MATCH_THRESHOLD:
             new_visit = (now - best["last_visited_at"]) > REVISIT_GAP_SEC
             self.conn.execute(
@@ -592,7 +599,8 @@ class SpatialStore:
                         visit_count=best["visit_count"] + (1 if new_visit else 0))
             return {**best, "is_new": False, "new_visit": new_visit,
                     "similarity": best_sim, "resolved": True,
-                    "reason": "matched", "ambiguity": None}
+                    "reason": "matched", "ambiguity": None,
+                    "candidate_scores": candidate_scores}
 
         cur = self.conn.execute(
             "INSERT INTO locations (label, fingerprint_json, discovered_at, last_visited_at)"
@@ -607,7 +615,7 @@ class SpatialStore:
                 "veto_count": 0, "coach_wins": 0, "coach_losses": 0,
                 "is_new": True, "new_visit": True, "similarity": None,
                 "resolved": True, "reason": "new_distinctive_place",
-                "ambiguity": None}
+                "ambiguity": None, "candidate_scores": candidate_scores}
 
     def note_edge(self, a, b, now=None):
         self._assert_writer()
