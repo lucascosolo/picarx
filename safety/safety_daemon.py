@@ -13,6 +13,7 @@ import time
 import json
 import threading
 import importlib
+import math
 
 # Fix for os.getlogin() failing under systemd (no controling TTY)
 os.getlogin = getpass.getuser
@@ -34,6 +35,22 @@ CLIFF_THRESHOLD = 200
 # independently bounded. Not a substitute for a real rear sensor.
 MAX_CONTINUOUS_REVERSE_SEC = 2.0
 _reverse_state = {"since": None}
+
+# Layer B normally refreshes the selected drive intent at 10 Hz.  Holding a
+# motor target indefinitely after the arbiter, broker, or socket client dies is
+# unsafe, so Layer A treats every accepted drive command as a short lease.  A
+# look is deliberately not a lease: it must not keep an old drive target alive.
+DRIVE_COMMAND_TIMEOUT_SEC = 0.75
+WATCHDOG_TICK_SEC = 0.10
+_drive_lease = {"expires_at": 0.0}
+
+# These are hardware limits, enforced at the only process that talks to the
+# HAT.  Upstream code may request gentler values, but never a value outside
+# this envelope.
+MAX_DRIVE_SPEED = 100.0
+STEERING_RANGE = (-30.0, 30.0)
+DRIVE_DIRECTIONS = frozenset(("forward", "backward", "stop", "turn"))
+ALL_DIRECTIONS = DRIVE_DIRECTIONS | frozenset(("look",))
 
 # Battery monitoring thresholds
 BATTERY_ADC_CHANNEL = "A4"
@@ -314,6 +331,67 @@ def check_battery():
     except Exception as e:
         print(f"Battery read error: {e}")
 
+
+def _number(value, name):
+    """Return a finite numeric command value, rejecting bools and strings."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    return value
+
+
+def normalize_action(action):
+    """Validate an untrusted movement command and clamp it to HAT limits.
+
+    This runs before both safety checks and execution.  Rejecting unknown
+    directions instead of silently doing nothing makes malformed commands a
+    fail-closed event, and the returned copy prevents callers from mutating a
+    command after validation.
+    """
+    if not isinstance(action, dict):
+        raise ValueError("action must be an object")
+    direction = action.get("direction")
+    if direction not in ALL_DIRECTIONS:
+        raise ValueError("unknown movement direction")
+    normalized = dict(action)
+    if direction in ("forward", "backward"):
+        speed = _number(action.get("speed", 30), "speed")
+        normalized["speed"] = max(0.0, min(MAX_DRIVE_SPEED, speed))
+    elif direction == "turn":
+        angle = _number(action.get("angle", 0), "angle")
+        normalized["angle"] = max(STEERING_RANGE[0], min(STEERING_RANGE[1], angle))
+    elif direction == "look":
+        normalized["pan"] = max(CAM_PAN_RANGE[0], min(CAM_PAN_RANGE[1],
+            int(_number(action.get("pan", 0), "pan"))))
+        normalized["tilt"] = max(CAM_TILT_RANGE[0], min(CAM_TILT_RANGE[1],
+            int(_number(action.get("tilt", 0), "tilt"))))
+    return normalized
+
+
+def refresh_drive_lease(action, now=None):
+    """Record a fresh liveness lease for an accepted drive/steering command."""
+    if action.get("direction") in DRIVE_DIRECTIONS:
+        now = time.time() if now is None else now
+        _drive_lease["expires_at"] = now + DRIVE_COMMAND_TIMEOUT_SEC
+
+
+def enforce_drive_watchdog(now=None):
+    """Stop motion once the last Layer-B drive lease expires.
+
+    This is intentionally safe to call often; after the first expiry it clears
+    the lease so it does not repeatedly hammer the motor controller.
+    """
+    now = time.time() if now is None else now
+    expires_at = _drive_lease["expires_at"]
+    if expires_at and now >= expires_at:
+        _drive_lease["expires_at"] = 0.0
+        motion.emergency_stop()
+        print("DRIVE WATCHDOG: stale command lease; emergency stop")
+        return True
+    return False
+
 def is_safe(action):
     direction = action.get("direction")
 
@@ -351,18 +429,24 @@ def is_safe(action):
     if direction == "look":
         return True, "ok"
 
-    # Any non-reverse DRIVE command (stop/turn/forward) ends the current
-    # continuous-reverse run.
-    _reverse_state["since"] = None
+    # Only commands that alter the drive direction end a continuous reverse.
+    # A turn only moves the steering servo while the wheels can still be
+    # reversing, so it must not silently grant another reverse window.
+    if direction in ("stop", "forward"):
+        _reverse_state["since"] = None
 
     if direction in ("stop", "turn"):
         return True, "ok"
 
-    with hardware_lock:
-        distance = px.ultrasonic.read()
+    try:
+        with hardware_lock:
+            distance = px.ultrasonic.read()
+        if (isinstance(distance, bool) or not isinstance(distance, (int, float))
+                or not math.isfinite(distance) or distance <= 0):
+            return False, "sensor error: invalid ultrasonic distance"
 
-    if direction == "forward" and (0 < distance < SAFE_DISTANCE_CM):
-        return False, f"obstacle at {distance}cm"
+        if direction == "forward" and distance < SAFE_DISTANCE_CM:
+            return False, f"obstacle at {distance}cm"
 
     # Grayscale/cliff sensors are IR reflectance sensors, not true
     # depth sensors - they infer "cliff" from how much light bounces
@@ -374,25 +458,33 @@ def is_safe(action):
     # Take a few quick samples and require most of them to agree
     # before treating it as a real cliff, to filter out that noise
     # without weakening protection against an actual edge.
-    CLIFF_SAMPLES = 3
-    CLIFF_SAMPLES_REQUIRED = 2  # majority of CLIFF_SAMPLES must agree
-    samples_taken = []
-    low_readings = 0
-    for _ in range(CLIFF_SAMPLES):
-        with hardware_lock:
-            grayscale = px.get_grayscale_data()
-        samples_taken.append(grayscale)
-        if min(grayscale) < CLIFF_THRESHOLD:
-            low_readings += 1
-        time.sleep(0.01)
+        CLIFF_SAMPLES = 3
+        CLIFF_SAMPLES_REQUIRED = 2  # majority of CLIFF_SAMPLES must agree
+        samples_taken = []
+        low_readings = 0
+        for _ in range(CLIFF_SAMPLES):
+            with hardware_lock:
+                grayscale = px.get_grayscale_data()
+            if (not isinstance(grayscale, (list, tuple)) or len(grayscale) != 3
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                           or not math.isfinite(v) for v in grayscale)):
+                return False, "sensor error: invalid grayscale reading"
+            samples_taken.append(grayscale)
+            if min(grayscale) < CLIFF_THRESHOLD:
+                low_readings += 1
+            time.sleep(0.01)
 
-    if low_readings >= CLIFF_SAMPLES_REQUIRED:
+        if low_readings >= CLIFF_SAMPLES_REQUIRED:
         # Log the actual raw readings that caused this veto - this is
         # the real evidence needed to tell a genuine edge apart from
         # sensor/electrical noise, captured at the moment it happens
         # rather than inferred from a separate stationary test.
-        print(f"CLIFF VETO - samples: {samples_taken}, threshold: {CLIFF_THRESHOLD}")
-        return False, "cliff detected"
+            print(f"CLIFF VETO - samples: {samples_taken}, threshold: {CLIFF_THRESHOLD}")
+            return False, "cliff detected"
+    except Exception as e:
+        # A failed forward safety check must never leave the last motor target
+        # active.  The caller turns this veto into an immediate hardware stop.
+        return False, f"sensor error: {e}"
 
     return True, "ok"
 
@@ -419,8 +511,8 @@ def execute(action):
     elif d == "look":
         # Camera pan/tilt only - never touches drive motors or
         # steering, so it doesn't go through the MotionSmoother.
-        pan = max(CAM_PAN_RANGE[0], min(CAM_PAN_RANGE[1], int(action.get("pan", 0))))
-        tilt = max(CAM_TILT_RANGE[0], min(CAM_TILT_RANGE[1], int(action.get("tilt", 0))))
+        pan = action["pan"]
+        tilt = action["tilt"]
         with hardware_lock:
             px.set_cam_pan_angle(pan)
             px.set_cam_tilt_angle(tilt)
@@ -432,9 +524,15 @@ def main():
         
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
-    os.chmod(SOCKET_PATH, 0o666)
+    # Same-user Layer B access remains seamless, while unrelated local users
+    # can no longer inject movement commands.  Deployments that split Layer A
+    # and Layer B accounts should put both in a dedicated group and retain 660.
+    os.chmod(SOCKET_PATH, 0o660)
     server.listen(5)
-    server.settimeout(2.0)
+    # Wake frequently enough to enforce the drive lease even when no client is
+    # connected.  The old two-second accept timeout could leave a stale motor
+    # target active well beyond the intended safety timeout.
+    server.settimeout(WATCHDOG_TICK_SEC)
     
     # Start the background smoothing thread
     motion.start()
@@ -448,17 +546,24 @@ def main():
         if now - last_battery_check > BATTERY_CHECK_INTERVAL:
             check_battery()
             last_battery_check = now
+        enforce_drive_watchdog(now)
 
         try:
             conn, _ = server.accept()
         except socket.timeout:
+            enforce_drive_watchdog(now)
             continue
 
         try:
+            # A client that connects but never sends a complete command must
+            # not prevent the daemon from returning to its watchdog loop.
+            conn.settimeout(WATCHDOG_TICK_SEC)
             data = conn.recv(1024)
             if not data:
                 continue
             action = json.loads(data.decode())
+            if not isinstance(action, dict):
+                raise ValueError("socket payload must be a JSON object")
 
             # --- Queries ---
             if action.get("query") == "battery_status":
@@ -514,9 +619,11 @@ def main():
             # ---------------
 
             # --- Movements ---
+            action = normalize_action(action)
             safe, reason = is_safe(action)
             if safe:
                 execute(action)
+                refresh_drive_lease(action)
                 try:
                     conn.sendall(json.dumps({"status": "executed"}).encode())
                 except Exception as se:
@@ -531,6 +638,7 @@ def main():
                 code = ("obstacle" if reason.startswith("obstacle")
                         else "cliff" if "cliff" in reason
                         else "reverse_limit" if "reverse" in reason
+                        else "sensor_fault" if reason.startswith("sensor error")
                         else "unknown")
                 try:
                     conn.sendall(json.dumps({"status": "vetoed", "reason": reason,
@@ -539,6 +647,11 @@ def main():
                     print(f"Socket reply error (vetoed): {se}")
                     
         except Exception as e:
+            # Any malformed/failed movement transaction is fail-closed.  The
+            # previous target might otherwise keep driving after a safety
+            # check or command parser failed.
+            motion.emergency_stop()
+            _drive_lease["expires_at"] = 0.0
             print(f"Daemon process handling error: {e}")
             try:
                 conn.sendall(json.dumps({"status": "error", "detail": str(e)}).encode())
