@@ -110,6 +110,7 @@ class FieldAgentMemoryCommandTest(unittest.TestCase):
         self.assertEqual(req["location_id"], self.loc["id"])
         self.assertTrue(self.fa.explore_mode)
         self.assertEqual(self.fa.state, "SCANNING")
+        self.assertIn("search for kitchen", self._spoken())
 
     def test_go_to_unknown_place_does_not_move(self):
         self.fa.handle_voice_command("go to the moon")
@@ -153,6 +154,14 @@ class GoalRequestTest(unittest.TestCase):
         self.assertIsNotNone(self.gm.active)
         goal = self.gm.bus.last("picarx/exploration/active_goal")
         self.assertEqual(goal["location_id"], self.loc["id"])
+        self.assertEqual(goal["arrival_requires"], "confident_localization")
+
+    def test_uncertain_location_never_completes_a_goal(self):
+        self.gm.active = {"goal_id": "goal", "location_id": self.loc["id"],
+                          "label": "place", "started_at": time.time(),
+                          "deadline": time.time() + 100}
+        self.gm.on_location_change({"location_id": self.loc["id"], "localized": False})
+        self.assertIsNotNone(self.gm.active)
 
     def test_user_goal_supersedes_active_goal(self):
         self.gm.active = {"goal_id": "old", "location_id": 999, "label": "elsewhere",

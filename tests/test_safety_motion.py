@@ -164,15 +164,89 @@ class ReverseBackstopTest(unittest.TestCase):
         safe, _ = self._reverse()
         self.assertFalse(safe)                                # still bounded
 
-    def test_a_drive_command_does_reset_the_reverse_timer(self):
-        # stop/turn/forward ARE real reverse interrupters and clear the run.
+    def test_steering_does_not_reset_the_reverse_timer(self):
+        # Turning only moves the steering servo; the wheels may still be
+        # reversing, so it must not grant another blind-reverse window.
         self._reverse()
         self._now += 1.0
         self.assertEqual(safety_daemon.is_safe({"direction": "turn", "angle": 10}),
                          (True, "ok"))
+        self.assertEqual(safety_daemon._reverse_state["since"], 1000.0)
+        self._now += safety_daemon.MAX_CONTINUOUS_REVERSE_SEC - 0.5
+        self.assertFalse(self._reverse()[0])
+
+    def test_stop_or_forward_resets_the_reverse_timer(self):
+        self._reverse()
+        self._now += 1.0
+        self.assertEqual(safety_daemon.is_safe({"direction": "stop"}), (True, "ok"))
         self.assertIsNone(safety_daemon._reverse_state["since"])
         self._now += safety_daemon.MAX_CONTINUOUS_REVERSE_SEC - 0.5
-        self.assertEqual(self._reverse(), (True, "ok"))       # fresh window
+        self.assertEqual(self._reverse(), (True, "ok"))
+
+
+class _FakeMotion:
+    def __init__(self):
+        self.stops = 0
+
+    def emergency_stop(self):
+        self.stops += 1
+
+
+class CommandSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self._real_motion = safety_daemon.motion
+        self._fake_motion = _FakeMotion()
+        safety_daemon.motion = self._fake_motion
+        safety_daemon._drive_lease["expires_at"] = 0.0
+
+    def tearDown(self):
+        safety_daemon.motion = self._real_motion
+        safety_daemon._drive_lease["expires_at"] = 0.0
+
+    def test_drive_lease_expiry_stops_once(self):
+        safety_daemon.refresh_drive_lease({"direction": "forward"}, now=10.0)
+        self.assertFalse(safety_daemon.enforce_drive_watchdog(now=10.5))
+        self.assertTrue(safety_daemon.enforce_drive_watchdog(now=10.8))
+        self.assertEqual(self._fake_motion.stops, 1)
+        self.assertFalse(safety_daemon.enforce_drive_watchdog(now=11.0))
+        self.assertEqual(self._fake_motion.stops, 1)
+
+    def test_look_does_not_refresh_drive_lease(self):
+        safety_daemon.refresh_drive_lease({"direction": "forward"}, now=10.0)
+        safety_daemon.refresh_drive_lease({"direction": "look"}, now=10.7)
+        self.assertTrue(safety_daemon.enforce_drive_watchdog(now=10.8))
+
+    def test_command_values_are_clamped_at_hardware_boundary(self):
+        self.assertEqual(safety_daemon.normalize_action(
+            {"direction": "forward", "speed": 999})["speed"], 100.0)
+        self.assertEqual(safety_daemon.normalize_action(
+            {"direction": "turn", "angle": -999})["angle"], -30.0)
+        self.assertEqual(safety_daemon.normalize_action(
+            {"direction": "look", "pan": 999, "tilt": -999})["pan"], 80)
+
+    def test_unknown_or_nonfinite_commands_are_rejected(self):
+        with self.assertRaises(ValueError):
+            safety_daemon.normalize_action({"direction": "teleport"})
+        with self.assertRaises(ValueError):
+            safety_daemon.normalize_action({"direction": "forward", "speed": float("nan")})
+
+    def test_sensor_exception_is_a_fail_closed_veto(self):
+        real_px = safety_daemon.px
+
+        class BrokenSensors:
+            class _Ultrasonic:
+                @staticmethod
+                def read():
+                    raise OSError("I2C failure")
+            ultrasonic = _Ultrasonic()
+
+        safety_daemon.px = BrokenSensors()
+        try:
+            safe, reason = safety_daemon.is_safe({"direction": "forward"})
+        finally:
+            safety_daemon.px = real_px
+        self.assertFalse(safe)
+        self.assertTrue(reason.startswith("sensor error:"))
 
 
 class _FakeI2C:
