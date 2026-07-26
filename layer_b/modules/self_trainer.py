@@ -3,9 +3,9 @@
 """
 Idle self-trainer (Layer B) - practises in the sibling picarx-training
 simulator while the robot is idle, refining its OWN learning, and folds the
-result back in through the owning modules. Disabled by default
-(module_registry.json); enable it only on a robot with picarx-training checked
-out alongside.
+result back in through the owning modules. Disabled by default in the tracked
+module registry; enable it through module_registry.local.json only on a robot
+with picarx-training checked out alongside.
 
 The round-trip, once per eligible idle window:
 

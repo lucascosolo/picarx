@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import json
 import os
 import subprocess
 import time
@@ -7,8 +6,10 @@ import signal
 import sys
 
 import robot_config
+from module_registry import load_registry as read_registry
 
 REGISTRY_PATH = robot_config.base_path("module_registry.json")
+LOCAL_REGISTRY_PATH = robot_config.base_path("module_registry.local.json")
 MODULES_DIR = robot_config.base_path("modules")
 
 running_processes = {}
@@ -28,14 +29,9 @@ last_good_registry = None
 def load_registry():
     global last_good_registry
     try:
-        with open(REGISTRY_PATH) as f:
-            registry = json.load(f)
-        if not isinstance(registry, list) or not all(
-            isinstance(e, dict) and e.get("name") and e.get("entrypoint") for e in registry
-        ):
-            raise ValueError("registry must be a list of {name, entrypoint, ...} entries")
+        registry = read_registry(REGISTRY_PATH, LOCAL_REGISTRY_PATH)
         last_good_registry = registry
-    except (OSError, json.JSONDecodeError, ValueError) as e:
+    except (OSError, ValueError) as e:
         print(f"Orchestrator: could not load {REGISTRY_PATH} ({e}) - "
               f"keeping last good registry ({0 if last_good_registry is None else len(last_good_registry)} entries)")
     return last_good_registry or []

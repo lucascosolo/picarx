@@ -6,18 +6,19 @@ in modules/ and adding an entry to module_registry.json - no core
 process restart required, since load_all_enabled() can be re-invoked
 at runtime after the registry changes.
 """
-import json
 import importlib.util
 import os
 
 import robot_config
+from module_registry import load_registry as _load_registry
 
 REGISTRY_PATH = robot_config.base_path("module_registry.json")
+LOCAL_REGISTRY_PATH = robot_config.base_path("module_registry.local.json")
 MODULES_DIR = robot_config.base_path("modules")
 
+
 def load_registry():
-  with open(REGISTRY_PATH) as f:
-    return json.load(f)
+  return _load_registry(REGISTRY_PATH, LOCAL_REGISTRY_PATH)
 
 def load_module(entry):
   path = os.path.join(MODULES_DIR, entry["entrypoint"])
@@ -40,4 +41,3 @@ def load_all_enabled():
 if __name__ == "__main__":
   modules = load_all_enabled()
   print(f"Active modules: {list(modules.keys())}")
-

@@ -184,7 +184,7 @@ KNOBS = [
     {"section": "reflection", "key": "model", "type": "str",
      "default": "claude-haiku-4-5-20251001", "env": "REFLECTION_MODEL",
      "desc": "Claude model for idle-time reflection."},
-    # ---- self-trainer (self_trainer.py) - disabled in module_registry.json ----
+    # ---- self-trainer (self_trainer.py) - disabled in the tracked registry ----
     {"section": "self_trainer", "key": "idle_after_sec", "type": "float",
      "default": 600.0, "env": "SELF_TRAIN_IDLE_AFTER",
      "desc": "Idle seconds (no movement/speech/coach activity) before an idle "

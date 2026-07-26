@@ -1,5 +1,6 @@
 layer_b/__pycache__/*
 layer_b/config.json
+layer_b/module_registry.local.json
 *.pyc
 *.onnx
 layer_b/modules/models/

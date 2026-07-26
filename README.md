@@ -252,8 +252,18 @@ python3 safety/safety_daemon.py
 python3 layer_b/orchestrator.py
 ```
 
-Enable or disable any behaviour by flipping `"enabled"` in
-[`module_registry.json`](layer_b/module_registry.json).
+Enable or disable the versioned default set in
+[`module_registry.json`](layer_b/module_registry.json). For robot-specific
+choices, create the ignored `layer_b/module_registry.local.json` instead; it
+is merged on top of the defaults and will not interfere with future pulls.
+The compact form only needs the setting you are changing, for example:
+
+```json
+{"self_trainer": {"enabled": true}}
+```
+
+The local overlay is intentionally not committed. Keep the self-trainer
+disabled unless the sibling `picarx-training` checkout is present.
 
 ### Configuration
 
