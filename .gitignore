@@ -24,3 +24,4 @@ radioplaybackfix.patch
 robot-hat/
 vilib/
 *.patch
+.claude/
