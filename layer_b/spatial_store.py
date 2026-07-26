@@ -6,12 +6,12 @@ as opposed to WHAT it has learned (semantic.db) or the raw event
 stream (events.db).
 
 There is no odometry or SLAM on this platform, so a "location" is a
-*perceptual fingerprint*, not a coordinate: the set of object labels a
-look-around head sweep saw, plus a coarse open-space bucket from the
-ultrasonic. Two sweeps that see the same things are treated as the
-same place. That is honest about the hardware - it can be fooled by
-two identical-looking corners, but it can never claim centimeter
-positions it doesn't have.
+*perceptual fingerprint*, not a coordinate: the object labels and stable
+detector features a look-around head sweep saw, plus a coarse open-space
+bucket from the ultrasonic. Two sweeps that see the same things in the same
+relative arrangement are treated as the same place. That is honest about
+the hardware - it can be fooled by two identical-looking corners, but it
+can never claim centimeter positions it doesn't have.
 
 Ownership rules (mirrors semantic_store.py's convention):
   - location_graph.py is the SOLE writer to spatial.db. It opens the
@@ -83,19 +83,190 @@ CREATE TABLE IF NOT EXISTS sightings (
 
 # ---------- pure fingerprint logic (no DB, unit-testable) ----------
 
-def fingerprint_from_scan(sightings, distance_cm=None):
-    """Collapse a room_scan payload into a comparable fingerprint.
-    labels: which object labels were visible and on which side
-    (left/center/right by pan sign) - side matters, "sofa on the left"
-    and "sofa on the right" are different corners of the room.
-    range: coarse forward open-space bucket from the ultrasonic."""
+def _clamp01(value, default=0.0):
+    """Return a finite confidence/area value in the JSON-safe 0..1 range."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if value != value:  # NaN
+        return default
+    return max(0.0, min(1.0, value))
+
+
+def _lateral_bin(sighting):
+    """Quantize a sighting's lateral position to left/centre/right.
+
+    The scan code historically supplied pan angles in degrees.  Newer
+    producers may provide a normalized ``center_offset`` (or an explicit
+    ``bin``); accepting all three keeps this function useful to old logs and
+    makes the resulting fingerprint deterministic across camera resolutions.
+    """
+    explicit = sighting.get("bin", sighting.get("lateral_bin"))
+    if isinstance(explicit, str):
+        side = explicit.strip().lower()
+        if side in ("l", "left", "-1"):
+            return -1
+        if side in ("r", "right", "+1", "1"):
+            return 1
+        if side in ("c", "center", "centre", "0"):
+            return 0
+    try:
+        if explicit is not None:
+            return -1 if float(explicit) < 0 else (1 if float(explicit) > 0 else 0)
+    except (TypeError, ValueError):
+        pass
+
+    value = sighting.get("center_offset", sighting.get("normalized_offset"))
+    if value is None:
+        value = sighting.get("pan", 0)
+        # The stock scan has a +/-70 degree mechanical range.  Dividing by
+        # 70 makes the quantizer independent of the actual angle used by a
+        # quick or a full sweep.  Values already in [-1, 1] are normalized.
+        try:
+            value = float(value)
+            if abs(value) > 1.0:
+                value /= 70.0
+        except (TypeError, ValueError):
+            value = 0.0
+    else:
+        try:
+            value = float(value)
+            # Pixel offsets are normalized when frame width is available.
+            width = sighting.get("frame_width")
+            if width and abs(value) > 1.0:
+                value /= (float(width) / 2.0)
+        except (TypeError, ValueError):
+            value = 0.0
+    # Keep the sign semantics of the historical side tag: centre is the
+    # optical axis, while any measurable left/right offset remains useful
+    # evidence for distinguishing two otherwise similar corners.
+    return -1 if value < 0 else (1 if value > 0 else 0)
+
+
+def _scan_imu_delta(sightings, imu_delta):
+    """Find an optional short-term pose delta without requiring a new caller."""
+    if imu_delta is not None:
+        return _normalize_imu(imu_delta)
+    for sighting in sightings or []:
+        if not isinstance(sighting, dict):
+            continue
+        for key in ("imu_delta", "pose_delta", "imu"):
+            if sighting.get(key) is not None:
+                return _normalize_imu(sighting[key])
+    return None
+
+
+def _normalize_imu(value):
+    """Make a pose delta compact, JSON-safe, and order-independent."""
+    if isinstance(value, dict):
+        out = {}
+        for key in sorted(value, key=str):
+            item = value[key]
+            try:
+                item = float(item)
+            except (TypeError, ValueError):
+                if isinstance(item, (dict, list, tuple)):
+                    item = _normalize_imu(item)
+            out[str(key)] = item
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_normalize_imu(item) for item in value]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def fingerprint_from_scan(sightings, distance_cm=None, imu_delta=None):
+    """Collapse a room scan into a backwards-compatible rich fingerprint.
+
+    ``labels`` remains the historical list of side-tagged strings.  The
+    ``metadata`` member carries stable matching features: confidence, a
+    quantized lateral bin, apparent object area, and an optional short-term
+    IMU/pose delta.  Inputs may contain either the old ``labels: ["chair"]``
+    form or detector records (``{"name": ..., "confidence": ...}``).
+    """
+    sightings = list(sightings or [])
     labels = set()
-    for s in sightings or []:
-        pan = s.get("pan", 0)
-        side = "l" if pan < 0 else ("r" if pan > 0 else "c")
-        for label in s.get("labels") or []:
-            labels.add(f"{side}:{label}")
-    if distance_cm is None or distance_cm <= 0:
+    rich_labels = []
+    for sighting in sightings:
+        if not isinstance(sighting, dict):
+            continue
+        lateral = _lateral_bin(sighting)
+        # Preserve the exact historical pan-sign label tag.  Matching uses
+        # the quantized bin below, but consumers that display/parse ``labels``
+        # should see the same l:/c:/r: value they saw before this refactor.
+        try:
+            pan = float(sighting.get("pan", 0))
+        except (TypeError, ValueError):
+            pan = 0.0
+        legacy_side = "l" if pan < 0 else ("r" if pan > 0 else "c")
+        # A detector-rich producer generally calls these ``objects``; a
+        # lightweight scan supplies ``labels``.  Prefer objects when present
+        # so confidence and area are not discarded by a parallel label list.
+        raw_labels = sighting.get("objects")
+        if not raw_labels:
+            raw_labels = sighting.get("labels")
+        if raw_labels is None and sighting.get("label") is not None:
+            raw_labels = [sighting.get("label")]
+        if raw_labels is None:
+            raw_labels = []
+        if isinstance(raw_labels, (str, dict)):
+            raw_labels = [raw_labels]
+        for raw in raw_labels:
+            if isinstance(raw, dict):
+                name = raw.get("name", raw.get("label"))
+                conf = raw.get("conf", raw.get(
+                    "confidence", raw.get("score", sighting.get(
+                        "conf", sighting.get("confidence", sighting.get(
+                            "confidences", 1.0))))))
+                area = raw.get("area", raw.get(
+                    "area_ratio", sighting.get("area", sighting.get(
+                        "area_ratio", sighting.get("areas", sighting.get(
+                            "area_ratios", 0.0))))))
+                item_bin = raw.get("bin", raw.get("lateral_bin", lateral))
+                # Reuse the quantizer for explicit object-level offsets.
+                if item_bin != lateral:
+                    item_bin = _lateral_bin({**sighting, **raw})
+            else:
+                name = raw
+                conf = sighting.get("conf", sighting.get("confidence",
+                                      sighting.get("confidences", 1.0)))
+                area = sighting.get("area", sighting.get("area_ratio",
+                                      sighting.get("areas", sighting.get("area_ratios", 0.0))))
+                item_bin = lateral
+            # Some scan adapters retain per-label values in a mapping rather
+            # than converting each label into an object record.
+            if isinstance(conf, dict):
+                conf = conf.get(name, conf.get(str(name), 1.0))
+            if isinstance(area, dict):
+                area = area.get(name, area.get(str(name), 0.0))
+            if name is None:
+                continue
+            name = str(name).strip()
+            if not name:
+                continue
+            try:
+                item_bin = float(item_bin)
+            except (TypeError, ValueError):
+                item_bin = lateral
+            item_bin = -1 if item_bin < 0 else (1 if item_bin > 0 else 0)
+            conf = _clamp01(conf, 1.0)
+            area = _clamp01(area, 0.0)
+            labels.add(f"{legacy_side}:{name}")
+            rich_labels.append({"name": name, "conf": conf,
+                                "bin": item_bin, "area": area})
+
+    # Sorting makes the JSON fingerprint stable even when detector/tracker
+    # iteration order changes (or a scan's sightings arrive rotated/reordered).
+    rich_labels.sort(key=lambda item: (item["name"], item["bin"],
+                                       item["conf"], item["area"]))
+    try:
+        distance_cm = float(distance_cm)
+    except (TypeError, ValueError):
+        distance_cm = None
+    if distance_cm is None or distance_cm <= 0 or distance_cm != distance_cm:
         rng = "unknown"
     elif distance_cm < 50:
         rng = "near"
@@ -103,35 +274,160 @@ def fingerprint_from_scan(sightings, distance_cm=None):
         rng = "mid"
     else:
         rng = "far"
-    return {"labels": sorted(labels), "range": rng}
+    imu = _scan_imu_delta(sightings, imu_delta)
+    return {"labels": sorted(labels), "range": rng,
+            # Keep the pose delta at the top level as a convenient read-only
+            # alias for callers using the compact fingerprint shape; matching
+            # consumes the copy in metadata so all new features stay grouped.
+            "imu_delta": imu,
+            "metadata": {"labels": rich_labels, "imu_delta": imu}}
+
+
+def _fingerprint_records(fp):
+    """Return rich label records, upgrading legacy side-tagged labels."""
+    def record_bin(record):
+        value = record.get("bin", record.get("lateral_bin", 0))
+        if isinstance(value, str):
+            value = {"left": -1, "l": -1, "center": 0, "centre": 0,
+                     "c": 0, "right": 1, "r": 1}.get(value.lower(), value)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0
+        return -1 if value < 0 else (1 if value > 0 else 0)
+
+    metadata = fp.get("metadata") or fp.get("meta") or {}
+    records = metadata.get("labels") if isinstance(metadata, dict) else None
+    if records:
+        out = []
+        for record in records:
+            if not isinstance(record, dict) or not record.get("name"):
+                continue
+            out.append({"name": str(record["name"]),
+                        "conf": _clamp01(record.get("conf", record.get("confidence", 1.0)), 1.0),
+                        "bin": record_bin(record),
+                        "area": _clamp01(record.get("area", record.get("area_ratio", 0.0)))})
+        if out:
+            return out
+    out = []
+    for label in fp.get("labels") or []:
+        if isinstance(label, dict):
+            name = label.get("name", label.get("label"))
+            if name:
+                out.append({"name": str(name), "conf": _clamp01(label.get("conf", 1.0), 1.0),
+                            "bin": record_bin(label), "area": _clamp01(label.get("area", 0.0))})
+            continue
+        text = str(label)
+        side, sep, name = text.partition(":")
+        if not sep:
+            side, name = "c", text
+        out.append({"name": name, "conf": 1.0,
+                    "bin": -1 if side == "l" else (1 if side == "r" else 0),
+                    "area": 0.0})
+    return out
+
+
+def _imu_similarity(fp_a, fp_b):
+    metadata_a = fp_a.get("metadata") or fp_a.get("meta") or {}
+    metadata_b = fp_b.get("metadata") or fp_b.get("meta") or {}
+    a = metadata_a.get("imu_delta") if isinstance(metadata_a, dict) else None
+    b = metadata_b.get("imu_delta") if isinstance(metadata_b, dict) else None
+    if a is None:
+        a = fp_a.get("imu_delta")
+    if b is None:
+        b = fp_b.get("imu_delta")
+    if a is None or b is None:
+        return None
+    if isinstance(a, dict) and isinstance(b, dict):
+        keys = sorted(set(a) & set(b), key=str)
+        try:
+            delta = sum((float(a[k]) - float(b[k])) ** 2 for k in keys) ** 0.5
+        except (TypeError, ValueError):
+            return 1.0 if a == b else 0.0
+    else:
+        try:
+            va = list(a) if isinstance(a, (list, tuple)) else [float(a)]
+            vb = list(b) if isinstance(b, (list, tuple)) else [float(b)]
+            n = min(len(va), len(vb))
+            delta = sum((float(va[i]) - float(vb[i])) ** 2 for i in range(n)) ** 0.5
+        except (TypeError, ValueError):
+            return 1.0 if a == b else 0.0
+    return 1.0 / (1.0 + delta)
 
 
 def fingerprint_similarity(fp_a, fp_b):
-    """0..1. Jaccard over side-tagged labels, with the open-space
-    bucket as a weighted tie-breaker so featureless scans (empty label
-    sets - very common with the SSD seeing nothing) still separate a
-    tight corner from open floor instead of all collapsing into one
-    giant 'nowhere' node."""
-    a, b = set(fp_a.get("labels") or []), set(fp_b.get("labels") or [])
-    if a or b:
-        jaccard = len(a & b) / len(a | b)
+    """Return a weighted 0..1 similarity for two perceptual fingerprints.
+
+    Matching labels contribute their average confidence, an exact lateral-bin
+    match, and (when known) a similar apparent area.  Legacy fingerprints are
+    upgraded on the fly, so maps written before the richer metadata existed
+    remain readable.
+    """
+    a, b = _fingerprint_records(fp_a), _fingerprint_records(fp_b)
+    if not a and not b:
+        label_similarity = 1.0
+    elif not a or not b:
+        label_similarity = 0.0
     else:
-        jaccard = 1.0  # both featureless - rely on the range bucket
+        # Greedy one-to-one pairing avoids duplicate labels inflating a score.
+        pairs = []
+        for ia, left in enumerate(a):
+            for ib, right in enumerate(b):
+                if left["name"] != right["name"]:
+                    continue
+                pos = (1.0 if left["bin"] == right["bin"] else
+                       0.5 if abs(left["bin"] - right["bin"]) == 1 else 0.0)
+                if left["area"] and right["area"]:
+                    area = max(0.0, 1.0 - abs(left["area"] - right["area"]) /
+                               max(left["area"], right["area"]))
+                else:
+                    area = 1.0  # old records have no area feature
+                score = ((left["conf"] + right["conf"]) / 2.0) * pos * area
+                pairs.append((score, ia, ib))
+        matched = 0.0
+        used_a, used_b = set(), set()
+        for score, ia, ib in sorted(pairs, reverse=True):
+            if ia not in used_a and ib not in used_b:
+                used_a.add(ia)
+                used_b.add(ib)
+                matched += score
+        total = max(sum(item["conf"] for item in a),
+                    sum(item["conf"] for item in b))
+        label_similarity = matched / total if total else 0.0
+
     range_match = 1.0 if fp_a.get("range") == fp_b.get("range") else 0.0
-    return 0.8 * jaccard + 0.2 * range_match
+    imu_match = _imu_similarity(fp_a, fp_b)
+    if imu_match is None:
+        # Range is deliberately strong enough that otherwise-identical scans
+        # in near versus far space do not merge into one location.
+        return 0.65 * label_similarity + 0.35 * range_match
+    return 0.55 * label_similarity + 0.25 * range_match + 0.20 * imu_match
 
 
 def fingerprint_is_distinctive(fingerprint):
     """Whether a scan contains enough independent visual evidence to name
     a place.  Range alone, and one common detector label, are useful hints
     but are far too easy to alias in a house."""
-    landmarks = {entry.split(":", 1)[-1]
-                 for entry in (fingerprint.get("labels") or [])}
+    landmarks = {name for name in
+                 ((entry.get("name") if isinstance(entry, dict)
+                   else str(entry).split(":", 1)[-1])
+                  for entry in (fingerprint.get("labels") or []))
+                 if name}
+    if not landmarks:
+        landmarks = {entry["name"] for entry in _fingerprint_records(fingerprint)
+                     if entry.get("name")}
     return len(landmarks) >= MIN_DISTINCT_LANDMARKS
 
 
 def label_for_fingerprint(fp, location_id):
-    seen = sorted({l.split(":", 1)[1] for l in fp.get("labels") or []})
+    seen = sorted({name for name in
+                   ((l.get("name") if isinstance(l, dict)
+                     else str(l).split(":", 1)[-1])
+                    for l in fp.get("labels") or [])
+                   if name})
+    if not seen:
+        seen = sorted({entry["name"] for entry in _fingerprint_records(fp)
+                       if entry.get("name")})
     if seen:
         return f"place {location_id} ({', '.join(seen[:3])})"
     return f"place {location_id} (open {fp.get('range', 'unknown')} area)"

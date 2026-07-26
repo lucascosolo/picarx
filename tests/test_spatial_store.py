@@ -6,7 +6,64 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402  - stubs + sys.path
 
-from spatial_store import SpatialStore  # noqa: E402
+from spatial_store import (SpatialStore, fingerprint_from_scan,
+                           fingerprint_similarity)  # noqa: E402
+
+
+class FingerprintRichnessTest(unittest.TestCase):
+    def _scan(self, order=(0, 1), pans=(-35, 35)):
+        sightings = [
+            {"pan": pans[0], "labels": [{"name": "chair", "confidence": 0.9,
+                                       "area_ratio": 0.20}]},
+            {"pan": pans[1], "labels": [{"name": "lamp", "confidence": 0.8,
+                                      "area_ratio": 0.10}]},
+        ]
+        return fingerprint_from_scan([sightings[i] for i in order], 100)
+
+    def test_reordered_rotated_sweep_is_identical(self):
+        first = self._scan()
+        rotated = self._scan((1, 0), pans=(-55, 55))
+        self.assertEqual(first, rotated)
+        self.assertEqual(fingerprint_similarity(first, rotated), 1.0)
+
+    def test_metadata_keeps_lateral_and_detector_features(self):
+        fp = fingerprint_from_scan([{
+            "pan": -10,
+            "labels": [{"name": "chair", "confidence": 0.72,
+                         "area_ratio": 0.18}],
+        }], 100)
+        self.assertEqual(fp["labels"], ["l:chair"])
+        self.assertEqual(fp["metadata"]["labels"], [{
+            "name": "chair", "conf": 0.72, "bin": -1, "area": 0.18,
+        }])
+
+    def test_range_change_separates_otherwise_same_scan(self):
+        first = self._scan()
+        far = fingerprint_from_scan([
+            {"pan": -35, "labels": [{"name": "chair", "confidence": 0.9,
+                                       "area_ratio": 0.20}]},
+            {"pan": 35, "labels": [{"name": "lamp", "confidence": 0.8,
+                                      "area_ratio": 0.10}]},
+        ], 250)
+        self.assertLess(fingerprint_similarity(first, far), 0.70)
+
+    def test_range_change_creates_a_distinct_location(self):
+        db = tempfile.mktemp(suffix=".db")
+        store = SpatialStore(readonly=False, db_path=db)
+        try:
+            self.assertTrue(store.match_or_create(self._scan(), now=1.0)["is_new"])
+            far = fingerprint_from_scan([
+                {"pan": -35, "labels": ["chair"]},
+                {"pan": 35, "labels": ["lamp"]},
+            ], 250)
+            result = store.match_or_create(far, now=2.0)
+            self.assertTrue(result["is_new"])
+            self.assertEqual(store.location_count(), 2)
+        finally:
+            try:
+                os.remove(db)
+            except OSError:
+                pass
 
 
 class SpatialStoreVetoTest(unittest.TestCase):
@@ -65,6 +122,36 @@ class SpatialStoreVetoTest(unittest.TestCase):
         self.w.relax_veto(1)
         ro = SpatialStore(readonly=True, db_path=self.db)
         self.assertEqual(ro.get_location(1)["veto_count"], 4)
+
+
+class LocationConfidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.db = tempfile.mktemp(suffix=".db")
+        self.w = SpatialStore(readonly=False, db_path=self.db)
+
+    def tearDown(self):
+        try:
+            os.remove(self.db)
+        except OSError:
+            pass
+
+    def test_weak_scan_does_not_identify_an_existing_place(self):
+        first = self.w.match_or_create(
+            {"labels": ["l:sofa", "r:lamp"], "range": "mid"}, now=1.0)
+        result = self.w.match_or_create({"labels": ["l:sofa"], "range": "mid"}, now=2.0)
+        self.assertTrue(first["resolved"])
+        self.assertFalse(result["resolved"])
+        self.assertEqual(result["reason"], "insufficient_landmarks")
+        self.assertEqual(self.w.location_count(), 1)
+
+    def test_near_tied_known_places_remain_unlocalized(self):
+        self.w.match_or_create({"labels": ["l:sofa", "r:lamp"], "range": "mid"}, now=1.0)
+        self.w.match_or_create({"labels": ["l:sofa", "r:table"], "range": "mid"}, now=2.0)
+        result = self.w.match_or_create(
+            {"labels": ["l:sofa", "r:lamp", "r:table"], "range": "mid"}, now=3.0)
+        self.assertFalse(result["resolved"])
+        self.assertEqual(result["reason"], "ambiguous_match")
+        self.assertEqual(self.w.location_count(), 2)
 
 
 if __name__ == "__main__":
