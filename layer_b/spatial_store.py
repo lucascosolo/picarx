@@ -26,6 +26,7 @@ rest of the codebase is built on stays intact (reflection.py keeps
 sole ownership of semantic.db).
 """
 import json
+import math
 import os
 import sqlite3
 import time
@@ -47,6 +48,8 @@ MIN_DISTINCT_LANDMARKS = 2
 # re-scanning every 25s isn't ten visits).
 REVISIT_GAP_SEC = 120.0
 MAX_CANDIDATE_SCORES = 3
+MAX_EVIDENCE_JSON_CHARS = 4000
+MAX_EVIDENCE_LABELS = 64
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS locations (
@@ -79,6 +82,22 @@ CREATE TABLE IF NOT EXISTS sightings (
     last_seen REAL NOT NULL,
     PRIMARY KEY (location_id, label)
 );
+CREATE TABLE IF NOT EXISTS veto_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    scan_id TEXT,
+    snapshot_id TEXT,
+    snapshot_json TEXT,
+    fingerprint_json TEXT,
+    labels_json TEXT NOT NULL DEFAULT '[]',
+    distance_cm REAL,
+    candidate_similarities_json TEXT NOT NULL DEFAULT '[]',
+    action_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_veto_evidence_location_ts
+    ON veto_evidence(location_id, ts DESC);
 """
 
 
@@ -434,6 +453,55 @@ def label_for_fingerprint(fp, location_id):
     return f"place {location_id} (open {fp.get('range', 'unknown')} area)"
 
 
+def _redact_json(value, depth=0):
+    """Return a compact, JSON-safe copy without image/blob payloads."""
+    if depth > 4:
+        return "[depth limit]"
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            name = str(key)
+            lowered = name.lower()
+            if any(token in lowered for token in
+                   ("image", "jpeg", "png", "frame_bytes", "raw_bytes")):
+                continue
+            out[name[:80]] = _redact_json(item, depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_redact_json(item, depth + 1) for item in list(value)[:64]]
+    if isinstance(value, str):
+        return value[:500]
+    if isinstance(value, bool) or value is None or isinstance(value, int):
+        return value
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return str(value)[:500]
+
+
+def _bounded_json(value, default, limit=MAX_EVIDENCE_JSON_CHARS):
+    try:
+        encoded = json.dumps(_redact_json(value), separators=(",", ":"),
+                             allow_nan=False)
+    except (TypeError, ValueError):
+        encoded = json.dumps(default, separators=(",", ":"))
+    if len(encoded) <= limit:
+        return encoded
+    return json.dumps({"truncated": True}, separators=(",", ":"))
+
+
+def _evidence_labels(value):
+    labels = []
+    raw = value if isinstance(value, (list, tuple, set)) else [value]
+    for item in raw:
+        if isinstance(item, dict):
+            item = item.get("name", item.get("label"))
+        if item is not None and str(item).strip():
+            labels.append(str(item).strip()[:80])
+    return sorted(set(labels))[:MAX_EVIDENCE_LABELS]
+
+
 class SpatialStore:
     def __init__(self, readonly=True, db_path=None):
         self.readonly = readonly
@@ -443,7 +511,38 @@ class SpatialStore:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.executescript(_SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self):
+        """Apply additive spatial upgrades to an existing map."""
+        # The first evidence table is created by _SCHEMA, while this method
+        # remains the explicit migration hook for future additive columns and
+        # makes the writer upgrade path obvious and idempotent.
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS veto_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_id INTEGER NOT NULL,
+            ts REAL NOT NULL,
+            scan_id TEXT,
+            snapshot_id TEXT,
+            snapshot_json TEXT,
+            fingerprint_json TEXT,
+            labels_json TEXT NOT NULL DEFAULT '[]',
+            distance_cm REAL,
+            candidate_similarities_json TEXT NOT NULL DEFAULT '[]',
+            action_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}'
+        )""")
+        columns = {row[1] for row in
+                   self.conn.execute("PRAGMA table_info(veto_evidence)").fetchall()}
+        for name, definition in (("scan_id", "TEXT"),
+                                 ("fingerprint_json", "TEXT")):
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE veto_evidence ADD COLUMN {name} {definition}")
+        self.conn.execute("""CREATE INDEX IF NOT EXISTS
+            idx_veto_evidence_location_ts
+            ON veto_evidence(location_id, ts DESC)""")
 
     # ---------- reader side (fail-soft) ----------
 
@@ -530,6 +629,71 @@ class SpatialStore:
     def sighting_labels(self):
         """Every object label ever recorded at any place."""
         return [r[0] for r in self._query("SELECT DISTINCT label FROM sightings")]
+
+    def veto_evidence_for(self, location_id, limit=20):
+        """Read recent compact veto evidence for one place."""
+        try:
+            limit = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            limit = 20
+        rows = self._query(
+            "SELECT id, location_id, ts, scan_id, snapshot_id, snapshot_json, "
+            "fingerprint_json, labels_json, distance_cm, candidate_similarities_json, "
+            "action_json, result_json FROM veto_evidence "
+            "WHERE location_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (location_id, limit))
+        return [self._evidence_row(row) for row in rows]
+
+    def recent_veto_evidence(self, limit=20, since=None):
+        """Read bounded recent veto evidence across the map."""
+        try:
+            limit = max(1, min(100, int(limit)))
+        except (TypeError, ValueError):
+            limit = 20
+        if since is None:
+            rows = self._query(
+                "SELECT id, location_id, ts, scan_id, snapshot_id, snapshot_json, "
+                "fingerprint_json, labels_json, distance_cm, candidate_similarities_json, "
+                "action_json, result_json FROM veto_evidence "
+                "ORDER BY ts DESC, id DESC LIMIT ?", (limit,))
+        else:
+            rows = self._query(
+                "SELECT id, location_id, ts, scan_id, snapshot_id, snapshot_json, "
+                "fingerprint_json, labels_json, distance_cm, candidate_similarities_json, "
+                "action_json, result_json FROM veto_evidence "
+                "WHERE ts >= ? ORDER BY ts DESC, id DESC LIMIT ?",
+                (float(since), limit))
+        return [self._evidence_row(row) for row in rows]
+
+    def get_veto_evidence(self, evidence_id):
+        rows = self._query(
+            "SELECT id, location_id, ts, scan_id, snapshot_id, snapshot_json, "
+            "fingerprint_json, labels_json, distance_cm, candidate_similarities_json, "
+            "action_json, result_json FROM veto_evidence WHERE id = ?",
+            (evidence_id,))
+        return self._evidence_row(rows[0]) if rows else None
+
+    @staticmethod
+    def _decode_json(text, default):
+        try:
+            value = json.loads(text)
+            return value
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+
+    @classmethod
+    def _evidence_row(cls, row):
+        return {
+            "id": row[0], "location_id": row[1], "ts": row[2],
+            "scan_id": row[3], "snapshot_id": row[4],
+            "snapshot": cls._decode_json(row[5], None) if row[5] else None,
+            "fingerprint": cls._decode_json(row[6], None) if row[6] else None,
+            "labels": cls._decode_json(row[7], []),
+            "distance_cm": row[8],
+            "candidate_similarities": cls._decode_json(row[9], []),
+            "action": cls._decode_json(row[10], {}),
+            "result": cls._decode_json(row[11], {}),
+        }
 
     @staticmethod
     def _row_to_location(r):
@@ -630,11 +794,51 @@ class SpatialStore:
             (lo, hi, now))
         self.conn.commit()
 
-    def note_veto(self, location_id):
+    def note_veto(self, location_id, evidence=None, now=None):
+        """Atomically increment a place veto and retain compact evidence."""
         self._assert_writer()
-        self.conn.execute(
-            "UPDATE locations SET veto_count = veto_count + 1 WHERE id = ?", (location_id,))
-        self.conn.commit()
+        now = time.time() if now is None else float(now)
+        evidence = evidence if isinstance(evidence, dict) else {}
+        snapshot_id = evidence.get("snapshot_id")
+        snapshot_id = str(snapshot_id)[:120] if snapshot_id else None
+        snapshot = evidence.get("snapshot", evidence.get("snapshot_json"))
+        snapshot_json = (_bounded_json(snapshot, {}) if snapshot is not None else None)
+        scan_id = evidence.get("scan_id")
+        scan_id = str(scan_id)[:120] if scan_id else None
+        fingerprint_json = (_bounded_json(evidence.get("fingerprint"), {})
+                            if evidence.get("fingerprint") is not None else None)
+        labels_json = _bounded_json(_evidence_labels(evidence.get("labels", [])), [])
+        candidates = evidence.get("candidate_similarities",
+                                   evidence.get("candidate_scores", []))
+        candidates = list(candidates)[:MAX_CANDIDATE_SCORES] \
+            if isinstance(candidates, (list, tuple)) else []
+        candidates = [item for item in candidates if isinstance(item, dict)]
+        distance = evidence.get("distance_cm")
+        try:
+            distance = float(distance) if distance is not None else None
+            if distance is not None and not math.isfinite(distance):
+                distance = None
+        except (TypeError, ValueError):
+            distance = None
+        with self.conn:
+            updated = self.conn.execute(
+                "UPDATE locations SET veto_count = veto_count + 1 WHERE id = ?",
+                (location_id,))
+            if updated.rowcount == 0:
+                return None
+            cursor = self.conn.execute(
+                """INSERT INTO veto_evidence
+                   (location_id, ts, scan_id, snapshot_id, snapshot_json,
+                    fingerprint_json, labels_json,
+                    distance_cm, candidate_similarities_json, action_json,
+                    result_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (location_id, now, scan_id, snapshot_id, snapshot_json,
+                 fingerprint_json, labels_json,
+                 distance, _bounded_json(candidates, []),
+                 _bounded_json(evidence.get("action", {}), {}),
+                 _bounded_json(evidence.get("result", {}), {})))
+            return cursor.lastrowid
 
     def relax_veto(self, location_id, amount=1):
         """Ease a place's veto_count back DOWN (floored at 0), the inverse

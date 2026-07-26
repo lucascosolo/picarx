@@ -62,6 +62,7 @@ VETO_RELAX_STEP = 1
 # landmark is in-frame without driving the robot into an unknown space.
 DISAMBIGUATION_PANS = (-50, 50)
 DISAMBIGUATION_MAX_ATTEMPTS = 1
+WORLD_SNAPSHOT_MAX_AGE_SEC = 5.0
 
 
 class LocationGraph:
@@ -72,6 +73,8 @@ class LocationGraph:
         self.current_id = None      # location of the most recent scan
         self.current_label = None
         self._disambiguation_pending = None
+        self._last_scan_context = None
+        self._latest_world_snapshot = None
 
     @staticmethod
     def _id(value=None):
@@ -93,6 +96,22 @@ class LocationGraph:
         if scan_id not in out:
             out.append(scan_id)
         return out[:8]
+
+    @staticmethod
+    def _scan_labels(sightings):
+        labels = set()
+        for sighting in sightings or []:
+            if not isinstance(sighting, dict):
+                continue
+            raw = sighting.get("labels") or sighting.get("objects") or []
+            if isinstance(raw, (str, dict)):
+                raw = [raw]
+            for item in raw:
+                label = item.get("name", item.get("label")) \
+                    if isinstance(item, dict) else item
+                if label:
+                    labels.add(str(label)[:80])
+        return sorted(labels)[:64]
 
     # ---------- inbound: scans resolve to locations ----------
 
@@ -127,6 +146,16 @@ class LocationGraph:
         now = time.time()
         loc = self.store.match_or_create(fingerprint, now)
         candidate_scores = list(loc.get("candidate_scores") or [])[:3]
+        scan_context = {
+            "scan_id": scan_id,
+            "scanned_at": payload.get("scanned_at", now),
+            "fingerprint": fingerprint,
+            "labels": self._scan_labels(payload.get("sightings")),
+            "distance_cm": payload.get("distance_cm"),
+            "candidate_similarities": candidate_scores,
+        }
+        with self.lock:
+            self._last_scan_context = scan_context
 
         # A probe is only allowed to confirm one of the candidates that made
         # the original scan ambiguous. This prevents an unrelated follow-up
@@ -229,10 +258,10 @@ class LocationGraph:
         """Request one richer scan for an ambiguous location match.
 
         The location graph cannot manufacture a camera sweep, so it publishes
-        a durable request for field_agent (or another actuator owner) and also
-        nudges the head immediately.  The next ``room_scan`` consumes the
-        one-shot marker and is matched normally; an unresolved result stays
-        unresolved rather than creating a third duplicate place.
+        a durable request for field_agent (or another actuator owner). The
+        next ``room_scan`` consumes the one-shot marker and is matched
+        normally; an unresolved result stays unresolved rather than creating
+        a third duplicate place.
         """
         ambiguity = loc.get("ambiguity") or {}
         candidate_ids = [value for value in (
@@ -288,13 +317,43 @@ class LocationGraph:
 
     # ---------- inbound: outcomes get pinned to the current place ----------
 
+    def on_world_state(self, payload):
+        """Cache only explicitly correlated world snapshots for veto evidence."""
+        snapshot_id = payload.get("snapshot_id")
+        if not snapshot_id:
+            return
+        try:
+            observed_at = float(payload.get("timestamp", time.time()))
+        except (TypeError, ValueError):
+            observed_at = time.time()
+        with self.lock:
+            self._latest_world_snapshot = {
+                "snapshot_id": str(snapshot_id)[:120],
+                "observed_at": observed_at,
+                "snapshot": dict(payload),
+            }
+
     def on_action_result(self, payload):
         if (payload.get("result") or {}).get("status") != "vetoed":
             return
         with self.lock:
             loc_id = self.current_id
+            scan = dict(getattr(self, "_last_scan_context", None) or {})
+            snapshot = dict(getattr(self, "_latest_world_snapshot", None) or {})
         if loc_id is not None:
-            self.store.note_veto(loc_id)
+            evidence = {
+                "scan_id": scan.get("scan_id"),
+                "fingerprint": scan.get("fingerprint"),
+                "labels": scan.get("labels", []),
+                "distance_cm": scan.get("distance_cm"),
+                "candidate_similarities": scan.get("candidate_similarities", []),
+                "action": payload.get("action", {}),
+                "result": payload.get("result", {}),
+            }
+            if snapshot and time.time() - snapshot.get("observed_at", 0) <= WORLD_SNAPSHOT_MAX_AGE_SEC:
+                evidence.update({"snapshot_id": snapshot.get("snapshot_id"),
+                                 "snapshot": snapshot.get("snapshot")})
+            self.store.note_veto(loc_id, evidence=evidence)
 
     def on_coach_episode(self, payload):
         with self.lock:
@@ -392,6 +451,7 @@ class LocationGraph:
     def run(self):
         self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
+        self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe("picarx/coach/episode", self.on_coach_episode)
         self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
         self.bus.subscribe("picarx/exploration/name_place", self.on_name_place)

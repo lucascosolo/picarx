@@ -123,6 +123,35 @@ class SpatialStoreVetoTest(unittest.TestCase):
         ro = SpatialStore(readonly=True, db_path=self.db)
         self.assertEqual(ro.get_location(1)["veto_count"], 4)
 
+    def test_note_veto_retains_compact_redacted_evidence(self):
+        evidence_id = self.w.note_veto(1, evidence={
+            "snapshot_id": "world-7",
+            "snapshot": {"distance_cm": 18, "image_bytes": "do not store",
+                          "objects": [{"label": "chair"}]},
+            "labels": ["chair", {"name": "table"}],
+            "distance_cm": 18,
+            "candidate_scores": [{"location_id": 1, "similarity": 0.92}],
+            "action": {"direction": "forward", "speed": 20},
+            "result": {"status": "vetoed", "reason": "obstacle"},
+        }, now=123.0)
+        self.assertIsNotNone(evidence_id)
+        self.assertEqual(self._veto(), 6)
+        row = self.w.get_veto_evidence(evidence_id)
+        self.assertEqual(row["snapshot_id"], "world-7")
+        self.assertNotIn("image_bytes", row["snapshot"])
+        self.assertEqual(row["labels"], ["chair", "table"])
+        self.assertEqual(row["candidate_similarities"][0]["location_id"], 1)
+        self.assertEqual(row["result"]["status"], "vetoed")
+
+    def test_veto_evidence_readers_are_bounded_and_readonly(self):
+        self.w.note_veto(1, evidence={"labels": ["chair"]}, now=10)
+        self.w.note_veto(1, evidence={"labels": ["table"]}, now=11)
+        self.assertEqual(len(self.w.veto_evidence_for(1, limit=1)), 1)
+        ro = SpatialStore(readonly=True, db_path=self.db)
+        self.assertEqual(len(ro.recent_veto_evidence()), 2)
+        with self.assertRaises(RuntimeError):
+            ro.note_veto(1)
+
 
 class LocationConfidenceTest(unittest.TestCase):
     def setUp(self):

@@ -74,6 +74,16 @@ CREATE TABLE IF NOT EXISTS patterns (
     last_seen REAL NOT NULL,
     UNIQUE(condition, outcome)
 );
+CREATE TABLE IF NOT EXISTS fact_evidence (
+    fact_id INTEGER NOT NULL,
+    evidence_kind TEXT NOT NULL,
+    evidence_db TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    observed_at REAL,
+    PRIMARY KEY (fact_id, evidence_kind, evidence_db, evidence_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_evidence_fact
+    ON fact_evidence(fact_id, observed_at DESC);
 """
 
 
@@ -180,6 +190,16 @@ class SemanticStore:
         rows = self._query("SELECT COUNT(*) FROM facts")
         return rows[0][0] if rows else 0
 
+    def fact_evidence_for(self, fact_id):
+        """Read provenance references attached to one fact."""
+        rows = self._query(
+            "SELECT fact_id, evidence_kind, evidence_db, evidence_id, observed_at "
+            "FROM fact_evidence WHERE fact_id = ? ORDER BY observed_at DESC",
+            (fact_id,))
+        return [{"fact_id": row[0], "evidence_kind": row[1],
+                 "evidence_db": row[2], "evidence_id": row[3],
+                 "observed_at": row[4]} for row in rows]
+
     def top_patterns(self, limit=5, max_age_sec=7 * 86400):
         """Mined event-sequence patterns, freshest + most confident
         first. Old patterns age out of the results (the world changes;
@@ -243,6 +263,35 @@ class SemanticStore:
                 (new_id, int(supersedes)))
         self.conn.commit()
         return new_id
+
+    def attach_fact_evidence(self, fact_id, evidence_kind, evidence_db,
+                             evidence_id, observed_at=None):
+        """Attach an idempotent provenance reference to an existing fact."""
+        if self.readonly:
+            raise RuntimeError("SemanticStore opened readonly - only reflection.py writes")
+        try:
+            fact_id = int(fact_id)
+        except (TypeError, ValueError):
+            return False
+        if not self.conn.execute("SELECT 1 FROM facts WHERE id = ?", (fact_id,)).fetchone():
+            return False
+        kind = str(evidence_kind or "")[:80]
+        db = str(evidence_db or "")[:80]
+        evidence = str(evidence_id or "")[:200]
+        if not kind or not db or not evidence:
+            return False
+        try:
+            observed_at = (float(observed_at) if observed_at is not None
+                           else None)
+        except (TypeError, ValueError):
+            observed_at = None
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO fact_evidence "
+                "(fact_id, evidence_kind, evidence_db, evidence_id, observed_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (fact_id, kind, db, evidence, observed_at))
+        return True
 
     def replace_subject(self, subject, facts, source="reflection"):
         """Make `facts` the COMPLETE active set for `subject`, atomically.

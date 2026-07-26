@@ -96,6 +96,20 @@ class SemanticStoreTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ro.replace_subject("self", [("a", 0.5)])
 
+    def test_fact_evidence_is_additive_and_idempotent(self):
+        fid = self.s.upsert_fact("hall", "the hall often vetoes", 0.7)
+        self.assertTrue(self.s.attach_fact_evidence(
+            fid, "veto", "spatial", "12", observed_at=100.0))
+        self.assertTrue(self.s.attach_fact_evidence(
+            fid, "veto", "spatial", "12", observed_at=100.0))
+        self.assertEqual(self.s.fact_evidence_for(fid), [{
+            "fact_id": fid, "evidence_kind": "veto", "evidence_db": "spatial",
+            "evidence_id": "12", "observed_at": 100.0,
+        }])
+        ro = SemanticStore(readonly=True, db_path=self.db)
+        with self.assertRaises(RuntimeError):
+            ro.attach_fact_evidence(fid, "veto", "spatial", "13")
+
 
 if __name__ == "__main__":
     unittest.main()

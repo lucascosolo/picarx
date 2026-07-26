@@ -80,6 +80,10 @@ MIN_NEW_EVENTS = 8             # don't bother reflecting on less than this
 MAX_EVENTS_PER_DIGEST = 120    # newest N events considered per window
 DIGEST_CHAR_BUDGET = 2800      # hard cap on digest text sent to the model
 MAX_FACTS_PER_REFLECTION = 6
+REFLECTION_HIGH_CONFIDENCE_CEILING = 0.70
+MIN_SENSOR_EVIDENCE_FOR_HIGH_CONFIDENCE = 1
+SENSOR_EVIDENCE_MAX_AGE_SEC = 7 * 86400
+MAX_SENSOR_EVIDENCE_FOR_PROMPT = 20
 
 # Belief revision: how many current active facts to show the model as
 # "existing memory" so it can spot a new fact that contradicts an old one.
@@ -146,10 +150,17 @@ you. Its "fact" is a short (2-3 sentence) first-person, diary-style narrative of
 happened this session - warm and reflective, not a bullet list. This is the only entry
 allowed to be narrative and multi-sentence; never emit an episode entry otherwise.
 
+SENSOR PROVENANCE: the user message may include a SENSOR EVIDENCE CATALOG. If a
+fact is supported by one or more catalog entries, cite their exact ids in an
+"evidence" array, for example ["spatial:veto:12"]. Never invent evidence ids.
+An uncited fact may still be useful, but its confidence will be treated as
+tentative by the storage layer.
+
 Reply with a JSON array only, no prose:
 [{{"subject": "<short topic, e.g. 'living room' or 'escape tactics'>",
    "fact": "<one sentence>",
    "confidence": <0.0-1.0>,
+   "evidence": ["spatial:veto:<id>"],
    "supersedes": <id of a contradicted EXISTING MEMORY fact, or null>}}]
 Return [] if nothing is worth remembering."""
 
@@ -430,13 +441,16 @@ class Reflection:
             return None
         return "episode:" + time.strftime("%Y-%m-%d", time.localtime(ts[-1]))
 
-    def _extract_facts(self, digest, memory_block="", episode_subject=None):
+    def _extract_facts(self, digest, memory_block="", episode_subject=None,
+                       evidence_block=""):
         client = self._get_client()
         if client is None:
             return None
         content = digest
         if memory_block:
             content = f"{memory_block}\n\n---\nRECENT EVENTS:\n{digest}"
+        if evidence_block:
+            content += "\n\n---\nSENSOR EVIDENCE CATALOG:\n" + evidence_block
         if episode_subject:
             content += (f"\n\n---\nSESSION BOUNDARY DETECTED. Also emit one "
                         f"episode entry with subject \"{episode_subject}\".")
@@ -461,6 +475,56 @@ class Reflection:
         except Exception as e:
             print(f"Reflection: LLM extraction failed: {e}")
             return None
+
+    def _sensor_evidence_catalog(self, now):
+        """Return recent spatial veto evidence keyed by stable prompt ids."""
+        rows = self.spatial.recent_veto_evidence(
+            limit=MAX_SENSOR_EVIDENCE_FOR_PROMPT,
+            since=now - SENSOR_EVIDENCE_MAX_AGE_SEC)
+        catalog = {}
+        lines = []
+        for row in rows:
+            key = f"spatial:veto:{row['id']}"
+            catalog[key] = row
+            labels = ",".join(row.get("labels") or []) or "no labels"
+            action = (row.get("action") or {}).get("direction", "action")
+            lines.append(f"{key} at location {row.get('location_id')} "
+                         f"labels={labels} distance={row.get('distance_cm')} "
+                         f"action={action} ts={row.get('ts')}")
+        return catalog, "\n".join(lines)
+
+    @staticmethod
+    def _evidence_refs(fact, catalog):
+        """Normalize only citations that resolve to the supplied catalog."""
+        raw = fact.get("evidence", fact.get("evidence_ids", []))
+        if isinstance(raw, (str, dict)):
+            raw = [raw]
+        refs = []
+        for item in raw or []:
+            if isinstance(item, dict):
+                db = str(item.get("evidence_db", item.get("db", "spatial")))
+                kind = str(item.get("evidence_kind", item.get("kind", "veto")))
+                ident = str(item.get("evidence_id", item.get("id", "")))
+                key = f"{db}:{kind}:{ident}"
+            else:
+                key = str(item)
+            if key in catalog and key not in refs:
+                refs.append(key)
+        return refs[:8]
+
+    def _record_confidence_gate(self, subject, requested, refs, now):
+        if requested <= REFLECTION_HIGH_CONFIDENCE_CEILING or refs:
+            return
+        bus = getattr(self, "bus", None)
+        if bus is not None:
+            bus.publish("picarx/decision", {
+                "source": "reflection", "kind": "fact_confidence_gate",
+                "choice": {"subject": subject, "requested": requested,
+                           "applied": REFLECTION_HIGH_CONFIDENCE_CEILING,
+                           "evidence_count": 0},
+                "reason": "LLM fact cited no recent validated sensor evidence",
+                "ts": now,
+            })
 
     # ---------- offline analysis (pure Python, no LLM, no API key) ----------
 
@@ -666,7 +730,9 @@ class Reflection:
         # call - it's all folded into the one request.
         memory_block, existing_by_id = self._existing_memory_block()
         episode_subject = self._session_boundary_subject(rows, now)
-        facts = self._extract_facts(digest, memory_block, episode_subject)
+        evidence_catalog, evidence_block = self._sensor_evidence_catalog(now)
+        facts = self._extract_facts(digest, memory_block, episode_subject,
+                                    evidence_block)
         if facts is None:
             return False  # no key / API failure - leave events unconsumed, retry next window
 
@@ -692,6 +758,12 @@ class Reflection:
                 confidence = max(0.0, min(1.0, float(f.get("confidence", 0.5))))
             except (TypeError, ValueError):
                 confidence = 0.5
+            evidence_refs = self._evidence_refs(f, evidence_catalog)
+            if (confidence > REFLECTION_HIGH_CONFIDENCE_CEILING and
+                    len(evidence_refs) < MIN_SENSOR_EVIDENCE_FOR_HIGH_CONFIDENCE):
+                self._record_confidence_gate(subject, confidence,
+                                              evidence_refs, now)
+                confidence = REFLECTION_HIGH_CONFIDENCE_CEILING
             # Only honor a supersede pointing at a real active fact we
             # actually showed the model, so a hallucinated id can't retire
             # an arbitrary belief. Episodes never supersede anything.
@@ -703,7 +775,14 @@ class Reflection:
                     cand = None
                 if cand is not None and cand in existing_by_id:
                     supersedes = cand
-            self.store.upsert_fact(subject, fact, confidence, supersedes=supersedes)
+            fact_id = self.store.upsert_fact(
+                subject, fact, confidence, source="reflection",
+                supersedes=supersedes)
+            for ref in evidence_refs:
+                db, kind, evidence_id = ref.split(":", 2)
+                self.store.attach_fact_evidence(
+                    fact_id, kind, db, evidence_id,
+                    observed_at=evidence_catalog[ref].get("ts"))
             stored += 1
             if supersedes is not None:
                 superseded += 1

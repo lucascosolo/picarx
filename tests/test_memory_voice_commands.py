@@ -214,6 +214,25 @@ class LocationGraphSightingsTest(unittest.TestCase):
         speech = " ".join(p["text"] for p in self.lg.bus.of("picarx/audio/speak"))
         self.assertIn("not sure where I am", speech)
 
+    def test_veto_uses_latest_scan_context(self):
+        self.lg.on_room_scan({"scan_id": "scan-veto", "sightings": [
+            {"pan": -20, "labels": ["chair"]},
+            {"pan": 20, "labels": ["table"]},
+        ], "distance_cm": 24})
+        self.lg.on_action_result({
+            "action": {"direction": "forward", "speed": 20},
+            "result": {"status": "vetoed", "reason": "obstacle"},
+        })
+        rows = self.lg.store.veto_evidence_for(self.lg.current_id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["scan_id"], "scan-veto")
+        self.assertEqual(rows[0]["fingerprint"]["range"], "near")
+        self.assertEqual(rows[0]["snapshot_id"], None)
+        self.assertEqual(rows[0]["labels"], ["chair", "table"])
+        self.assertEqual(rows[0]["distance_cm"], 24.0)
+        self.assertEqual(rows[0]["action"]["direction"], "forward")
+        self.assertEqual(rows[0]["result"]["reason"], "obstacle")
+
 
 
 class LocationGraphDisambiguationTest(unittest.TestCase):

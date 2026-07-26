@@ -13,7 +13,9 @@ Implement **7 → 1 → 2 → 3 → 5 (replacement) → 6 → 4**. Resolution te
 
 Roadmap item **7 (rich location-resolution telemetry) is implemented**. `SpatialStore.match_or_create()` now returns at most three ranked candidate scores for every resolution outcome. Room scans and location changes carry bounded UUID correlation fields (`scan_id`, `resolution_id`, `probe_id`, and `evidence_ids`); ambiguous matches publish one probe request, and `field_agent.py` owns the deduplicated quick-scan FSM that produces the correlated follow-up. `event_logger.py` persists disambiguation requests in `events.db` without relying on asynchronous SQLite row IDs. Focused store, location-graph, field-agent, and event-logger tests cover ordering, correlation, replay deduplication, and terminal resolved/unresolved outcomes.
 
-The remaining items are still pending; item 7's telemetry is the prerequisite evidence layer for the later veto provenance, conservative merge/split, and embedding evaluation work.
+Roadmap item **1 (veto evidence and provenance) is now implemented**. Vetoes atomically increment the location aggregate and store bounded scan/action/result context in `spatial.db`; image-like fields are redacted and read-only evidence helpers are fail-soft. Reflection receives a recent sensor-evidence catalog, caps uncited LLM facts at 0.70, and copies validated citations into additive `fact_evidence` rows. The confidence-gate decision is published with a reason when a proposed promotion lacks corroboration.
+
+Items **2, 3, 5 (replacement), 6, and 4 remain pending**. Item 2 is next because it has no prerequisite and is the smallest low-risk foundation after telemetry/provenance; item 3 can follow independently, while the conservative IMU replacement remains intentionally later.
 
 ## 1. Veto evidence and provenance
 

@@ -2,6 +2,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -141,6 +143,57 @@ class SelfModelTest(unittest.TestCase):
         line = reflection.Reflection._summarize_event("picarx/coach/episode", payload)
         self.assertIn("stop", line)
         self.assertIn("failed", line)
+
+
+class ReflectionEvidenceGateTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.sem_db = os.path.join(self.tmp, "semantic.db")
+        self.spa_db = os.path.join(self.tmp, "spatial.db")
+        spatial = SpatialStore(readonly=False, db_path=self.spa_db)
+        spatial.conn.execute(
+            "INSERT INTO locations (label, fingerprint_json, discovered_at, "
+            "last_visited_at) VALUES (?,?,?,?)",
+            ("place 1", "{}", 1.0, 1.0))
+        spatial.conn.commit()
+        spatial.note_veto(1, evidence={"labels": ["chair"]}, now=time.time())
+
+        self.r = reflection.Reflection.__new__(reflection.Reflection)
+        self.r.store = SemanticStore(readonly=False, db_path=self.sem_db)
+        self.r.spatial = SpatialStore(readonly=True, db_path=self.spa_db)
+        self.r.bus = harness.FakeBus()
+        self.r.lock = threading.Lock()
+        self.r.last_activity = time.time() - reflection.IDLE_AFTER_SEC - 1
+
+        rows = [(1, time.time(), "picarx/action/result", json.dumps({
+            "result": {"status": "vetoed", "reason": "obstacle"}}))]
+        self.r._fetch_new_events = lambda _since: (rows, 1)
+        self.r._build_digest = lambda _rows: ("safety veto: obstacle", 8)
+        self.r._existing_memory_block = lambda: ("", {})
+        self.r._session_boundary_subject = lambda _rows, _now: None
+
+    def _run_with_fact(self, fact):
+        self.r._extract_facts = lambda digest, memory, episode, evidence: [fact]
+        self.assertTrue(self.r.try_reflect(now=time.time()))
+        return self.r.store.facts_for(fact["subject"])[0]
+
+    def test_uncorroborated_llm_confidence_is_capped_and_explained(self):
+        stored = self._run_with_fact({
+            "subject": "hall", "fact": "the hall is blocked", "confidence": 0.95})
+        self.assertEqual(stored["confidence"], reflection.REFLECTION_HIGH_CONFIDENCE_CEILING)
+        self.assertEqual(self.r.store.fact_evidence_for(stored["id"]), [])
+        decision = self.r.bus.last("picarx/decision")
+        self.assertEqual(decision["kind"], "fact_confidence_gate")
+
+    def test_valid_sensor_citation_allows_high_confidence_and_is_copied(self):
+        stored = self._run_with_fact({
+            "subject": "hall", "fact": "the hall vetoes near the chair",
+            "confidence": 0.95, "evidence": ["spatial:veto:1"]})
+        self.assertAlmostEqual(stored["confidence"], 0.95)
+        evidence = self.r.store.fact_evidence_for(stored["id"])
+        self.assertEqual(evidence[0]["evidence_kind"], "veto")
+        self.assertEqual(evidence[0]["evidence_db"], "spatial")
+        self.assertEqual(evidence[0]["evidence_id"], "1")
 
 
 if __name__ == "__main__":
