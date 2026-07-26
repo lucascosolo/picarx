@@ -44,6 +44,7 @@ from spatial_store import SpatialStore, fingerprint_from_scan
 
 import time
 import threading
+import uuid
 
 # The hypothesis-outcome contract from field_agent's VetoProneLocationProbe
 # (see modules/field_agent.py). Matching on the question string keeps this
@@ -72,6 +73,27 @@ class LocationGraph:
         self.current_label = None
         self._disambiguation_pending = None
 
+    @staticmethod
+    def _id(value=None):
+        """Return a caller-supplied correlation id or a fresh UUID."""
+        return str(value) if value else uuid.uuid4().hex
+
+    @staticmethod
+    def _evidence_ids(payload, scan_id):
+        """Normalize bounded, transport-safe evidence references.
+
+        Event logger row ids are deliberately not used here: room scans and
+        location changes cross an asynchronous broker boundary.  The scan id
+        is therefore the stable evidence reference for this resolution.
+        """
+        values = payload.get("evidence_ids") or []
+        if isinstance(values, str):
+            values = [values]
+        out = [str(value) for value in values[:8] if value]
+        if scan_id not in out:
+            out.append(scan_id)
+        return out[:8]
+
     # ---------- inbound: scans resolve to locations ----------
 
     def on_room_scan(self, payload):
@@ -81,6 +103,16 @@ class LocationGraph:
         with self.lock:
             probe = getattr(self, "_disambiguation_pending", None)
             self._disambiguation_pending = None
+
+        scan_id = self._id(payload.get("scan_id"))
+        resolution_id = self._id(
+            (probe or {}).get("resolution_id") or payload.get("resolution_id"))
+        evidence_ids = self._evidence_ids(payload, scan_id)
+        if probe:
+            for evidence_id in probe.get("evidence_ids") or []:
+                if evidence_id and evidence_id not in evidence_ids:
+                    evidence_ids.append(str(evidence_id))
+            evidence_ids = evidence_ids[:8]
 
         # Keep positional compatibility with small test/adaptor
         # implementations that still expose the historical two-argument
@@ -94,6 +126,7 @@ class LocationGraph:
                 payload.get("sightings"), payload.get("distance_cm"))
         now = time.time()
         loc = self.store.match_or_create(fingerprint, now)
+        candidate_scores = list(loc.get("candidate_scores") or [])[:3]
 
         # A probe is only allowed to confirm one of the candidates that made
         # the original scan ambiguous. This prevents an unrelated follow-up
@@ -110,8 +143,11 @@ class LocationGraph:
         # location fix. Publishing that uncertainty is important: consumers
         # must not quietly retain an old place and mistake it for an arrival.
         if not loc.get("resolved"):
+            request = None
             if loc.get("reason") == "ambiguous_match" and probe is None:
-                self._schedule_disambiguation(loc, now)
+                request = self._schedule_disambiguation(
+                    loc, now, scan_id=scan_id, resolution_id=resolution_id,
+                    evidence_ids=evidence_ids)
             with self.lock:
                 self.current_id = None
                 self.current_label = None
@@ -121,6 +157,17 @@ class LocationGraph:
                 "veto_count": None, "localized": False,
                 "confidence": loc.get("similarity"),
                 "reason": loc.get("reason"), "ambiguity": loc.get("ambiguity"),
+                "scan_id": scan_id, "resolution_id": resolution_id,
+                "probe_id": (probe or {}).get("probe_id"),
+                "candidate_scores": candidate_scores,
+                "evidence_ids": evidence_ids,
+                "disambiguation": (
+                    {"attempt": 0, "outcome": "pending",
+                     "probe_id": request.get("probe_id")} if request else
+                    ({"attempt": int((probe or {}).get("attempt", 1)),
+                      "outcome": "unresolved",
+                      "probe_id": (probe or {}).get("probe_id")}
+                     if probe else None)),
                 "ts": now,
             })
             return
@@ -166,10 +213,19 @@ class LocationGraph:
             "localized": True,
             "confidence": loc.get("similarity"),
             "reason": loc.get("reason"),
+            "scan_id": scan_id, "resolution_id": resolution_id,
+            "probe_id": (probe or {}).get("probe_id"),
+            "candidate_scores": candidate_scores,
+            "evidence_ids": evidence_ids,
+            "disambiguation": (
+                {"attempt": int((probe or {}).get("attempt", 1)),
+                 "outcome": "resolved", "probe_id": (probe or {}).get("probe_id")}
+                if probe else None),
             "ts": now,
         })
 
-    def _schedule_disambiguation(self, loc, now):
+    def _schedule_disambiguation(self, loc, now, scan_id=None,
+                                 resolution_id=None, evidence_ids=None):
         """Request one richer scan for an ambiguous location match.
 
         The location graph cannot manufacture a camera sweep, so it publishes
@@ -182,6 +238,25 @@ class LocationGraph:
         candidate_ids = [value for value in (
             ambiguity.get("best_location_id"),
             ambiguity.get("second_location_id")) if value is not None]
+        candidate_scores = list(loc.get("candidate_scores") or [])[:3]
+        if not candidate_scores:
+            # Keep compatibility with small test stores and old adapters that
+            # only returned the historical ambiguity block.
+            best_id = ambiguity.get("best_location_id")
+            if best_id is not None:
+                candidate_scores.append({"location_id": best_id,
+                                         "similarity": loc.get("similarity")})
+            second_id = ambiguity.get("second_location_id")
+            second_similarity = ambiguity.get("second_similarity")
+            if second_id is not None and second_similarity is not None:
+                candidate_scores.append({"location_id": second_id,
+                                         "similarity": second_similarity})
+        scan_id = self._id(scan_id)
+        resolution_id = self._id(resolution_id)
+        evidence_ids = list(evidence_ids or [])[:8]
+        if scan_id not in evidence_ids:
+            evidence_ids.append(scan_id)
+        probe_id = self._id()
         pan_offsets = list(DISAMBIGUATION_PANS)
         request = {
             "reason": "ambiguous_match",
@@ -195,6 +270,9 @@ class LocationGraph:
             "pan_offsets": pan_offsets,
             "probe": {"type": "head_sweep", "pan_offsets": pan_offsets,
                       "saccades": 2, "quick": True},
+            "scan_id": scan_id, "resolution_id": resolution_id,
+            "probe_id": probe_id, "candidate_scores": candidate_scores,
+            "evidence_ids": evidence_ids[:8],
             "quick": True,
             "ts": now,
         }
@@ -206,15 +284,7 @@ class LocationGraph:
             self._disambiguation_pending = request
 
         self.bus.publish("picarx/exploration/disambiguation_needed", request)
-        # Camera look intents are harmless if field_agent handles the request
-        # itself, and make the probe immediate on installations without an
-        # optional event consumer.  Exactly two saccades are intentional.
-        for pan in DISAMBIGUATION_PANS:
-            self.bus.publish("picarx/intent/look", {
-                "source": "location_graph",
-                "action": {"direction": "look", "pan": pan, "tilt": 0},
-                "quick": True,
-            })
+        return request
 
     # ---------- inbound: outcomes get pinned to the current place ----------
 

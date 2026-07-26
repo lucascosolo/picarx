@@ -272,9 +272,14 @@ class LocationGraphDisambiguationTest(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["reason"], "ambiguous_match")
         self.assertEqual(requests[0]["pan_offsets"], [-50, 50])
-        self.assertEqual(
-            [m["action"]["pan"] for m in self.lg.bus.of("picarx/intent/look")],
-            [-50, 50])
+        self.assertEqual(len(requests[0]["scan_id"]), 32)
+        self.assertEqual(len(requests[0]["resolution_id"]), 32)
+        self.assertEqual(len(requests[0]["probe_id"]), 32)
+        self.assertIn(requests[0]["scan_id"], requests[0]["evidence_ids"])
+        # The field agent owns the active quick-scan FSM; location_graph only
+        # publishes the correlated request and never emits duplicate direct
+        # head intents.
+        self.assertEqual(self.lg.bus.of("picarx/intent/look"), [])
 
         self.lg.on_room_scan({"sightings": [{"pan": 20,
                                               "labels": ["sofa", "lamp"]}],
@@ -283,7 +288,12 @@ class LocationGraphDisambiguationTest(unittest.TestCase):
         self.assertEqual(self.lg.current_id, 2)
         self.assertEqual(
             len(self.lg.bus.of("picarx/exploration/disambiguation_needed")), 1)
-        self.assertTrue(self.lg.bus.last("picarx/exploration/location_change")["localized"])
+        terminal = self.lg.bus.last("picarx/exploration/location_change")
+        self.assertTrue(terminal["localized"])
+        self.assertEqual(terminal["resolution_id"], requests[0]["resolution_id"])
+        self.assertEqual(terminal["probe_id"], requests[0]["probe_id"])
+        self.assertEqual(terminal["disambiguation"]["attempt"], 1)
+        self.assertEqual(terminal["disambiguation"]["outcome"], "resolved")
 
     def test_ambiguous_probe_stays_uncertain_without_second_request(self):
         self.lg.store = self._SequenceStore([self._ambiguous(), self._ambiguous()])

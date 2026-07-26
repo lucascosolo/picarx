@@ -156,5 +156,41 @@ class DriverHandoffTest(unittest.TestCase):
             self.assertEqual(self.fa.steering._angle, 0.0)
 
 
+class DisambiguationProbeTest(unittest.TestCase):
+    def setUp(self):
+        self.fa = field_agent.FieldAgent()
+        self.fa.explore_mode = True
+        self.fa.latest_world = {
+            "distance_cm": 90, "distance_stale": False,
+            "objects": {"items": [], "stale": False},
+        }
+        self.request = {
+            "probe_id": "probe-1", "resolution_id": "resolution-1",
+            "pan_offsets": [-50, 50], "attempt": 1,
+            "candidate_scores": [{"location_id": 1, "similarity": 0.8}],
+            "evidence_ids": ["scan-1"],
+        }
+
+    def test_replayed_request_produces_one_correlated_quick_scan(self):
+        self.fa.on_disambiguation_needed(self.request)
+        self.fa.on_disambiguation_needed(self.request)
+        self.fa.explore_tick()  # dequeue and start the bounded FSM
+        self.assertEqual(self.fa.state, "SCANNING")
+        self.assertEqual(self.fa.scan_angles, (-50, 50))
+
+        # Complete the two requested dwells without waiting in real time.
+        for _ in range(2):
+            self.fa.scan_dwell_until = 0
+            self.fa._handle_scanning_tick(10.0)
+
+        scans = self.fa.bus.of("picarx/exploration/room_scan")
+        self.assertEqual(len(scans), 1)
+        self.assertEqual(scans[0]["probe_id"], "probe-1")
+        self.assertEqual(scans[0]["resolution_id"], "resolution-1")
+        self.assertEqual(scans[0]["attempt"], 1)
+        self.assertEqual(scans[0]["evidence_ids"], ["scan-1"])
+        self.assertEqual(len(scans[0]["scan_id"]), 32)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,12 @@ This roadmap was validated against `master` at `f2aeb18`. The existing ownership
 
 Implement **7 → 1 → 2 → 3 → 5 (replacement) → 6 → 4**. Resolution telemetry and scan correlation make evidence and later operator actions auditable; configuration and directional history are low-risk foundations. The IMU proposal needs a safe motion-quality replacement rather than pose estimation. Merge/split and embeddings should follow once there is enough retained, measured evidence. Estimated total for the viable work is roughly **100–166 engineering hours**, excluding field calibration and model/data collection.
 
+## Current implementation state — 2026-07-26
+
+Roadmap item **7 (rich location-resolution telemetry) is implemented**. `SpatialStore.match_or_create()` now returns at most three ranked candidate scores for every resolution outcome. Room scans and location changes carry bounded UUID correlation fields (`scan_id`, `resolution_id`, `probe_id`, and `evidence_ids`); ambiguous matches publish one probe request, and `field_agent.py` owns the deduplicated quick-scan FSM that produces the correlated follow-up. `event_logger.py` persists disambiguation requests in `events.db` without relying on asynchronous SQLite row IDs. Focused store, location-graph, field-agent, and event-logger tests cover ordering, correlation, replay deduplication, and terminal resolved/unresolved outcomes.
+
+The remaining items are still pending; item 7's telemetry is the prerequisite evidence layer for the later veto provenance, conservative merge/split, and embedding evaluation work.
+
 ## 1. Veto evidence and provenance
 
 **Verdict: viable.**

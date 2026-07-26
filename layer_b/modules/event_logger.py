@@ -166,6 +166,12 @@ class EventLogger:
         # the robot decided it was in, or that it minted a new one.
         self.log_event("picarx/exploration/location_change", payload)
 
+    def on_disambiguation_needed(self, payload):
+        # The request carries UUID correlation fields (scan_id,
+        # resolution_id, probe_id); event_logger must not manufacture or
+        # synchronously return a SQLite id to the location graph.
+        self.log_event("picarx/exploration/disambiguation_needed", payload)
+
     def on_uncertainty_map(self, payload):
         # explorer.py only publishes when scores materially move, so
         # logging every publish is already change-triggered, not periodic.
@@ -248,6 +254,8 @@ class EventLogger:
         self.bus.subscribe("picarx/coach/surprise", self.on_coach_surprise)
         self.bus.subscribe("picarx/exploration/room_scan", self.on_room_scan)
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
+        self.bus.subscribe("picarx/exploration/disambiguation_needed",
+                           self.on_disambiguation_needed)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
         self.bus.subscribe("picarx/exploration/hypothesis", self.on_hypothesis)
         self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)

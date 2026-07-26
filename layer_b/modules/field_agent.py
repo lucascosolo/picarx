@@ -98,6 +98,7 @@ doesn't require driving anywhere.
 import os
 import getpass
 os.getlogin = getpass.getuser
+import uuid
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -192,6 +193,9 @@ SCAN_TILT = 0
 # look-around every half minute.
 SCAN_PAN_ANGLES_QUICK = (-55, 0, 55)
 SCAN_DWELL_QUICK_SEC = 1.0
+# The location graph requests these two offsets for an active ambiguity probe.
+# Keep the actuator-side fallback local so field_agent remains optional.
+DISAMBIGUATION_PANS = (-50, 50)
 CRUISE_SCAN_INTERVAL = 25.0    # re-glance around at least this often while cruising
 
 # Physical stuck detection: commanding forward with nothing being
@@ -776,6 +780,7 @@ class FieldAgent:
         self.scan_dwell_sec = SCAN_DWELL_SEC
         self.scan_is_startup = True    # startup scan announces; periodic glance stays quiet
         self.last_scan_at = 0.0        # when the last sweep finished (paces periodic glances)
+        self.scan_probe = None         # active location-graph disambiguation request
         # Escape direction learned from the most recent scan: turn toward
         # whichever side had fewer objects, instead of a coin flip. None
         # until a scan has produced an asymmetry.
@@ -841,6 +846,8 @@ class FieldAgent:
         self.last_veto_at = 0.0
         self.pending_novel_objects = deque()
         self.pending_suggestions = deque()
+        self.pending_disambiguations = deque()
+        self._seen_disambiguation_probes = deque(maxlen=32)
 
         # Urgent (blocking, fail-state) coach query bookkeeping.
         self.coach_query_id = None
@@ -1188,6 +1195,23 @@ class FieldAgent:
         with self.lock:
             self.active_goal = payload if payload.get("location_id") is not None else None
             self.goal_bias_angle = None  # re-derived from the next scan
+
+    def on_disambiguation_needed(self, payload):
+        """Queue one bounded quick scan for an ambiguous place resolution.
+
+        The location graph owns the request and consumes the resulting room
+        scan.  Keeping the request in this module's normal FSM prevents a
+        broker callback from moving the head directly and, importantly,
+        makes replayed MQTT deliveries idempotent by probe id.
+        """
+        probe_id = payload.get("probe_id")
+        if not probe_id:
+            return
+        with self.lock:
+            if probe_id in self._seen_disambiguation_probes:
+                return
+            self._seen_disambiguation_probes.append(probe_id)
+            self.pending_disambiguations.append(dict(payload))
 
     def _current_place_label(self):
         """The label of where the robot currently believes it is, or None -
@@ -2140,14 +2164,29 @@ class FieldAgent:
 
     # ---------- look-around head scan ----------
 
-    def _enter_scanning(self, now, startup):
+    def _enter_scanning(self, now, startup, probe=None):
         """Begin a camera head sweep. startup=True is the full sweep on
         'explore' (announces what it sees); startup=False is the lighter,
         silent periodic glance done while cruising."""
         self.state = "SCANNING"
         self.scan_is_startup = startup
-        self.scan_angles = SCAN_PAN_ANGLES if startup else SCAN_PAN_ANGLES_QUICK
-        self.scan_dwell_sec = SCAN_DWELL_SEC if startup else SCAN_DWELL_QUICK_SEC
+        self.scan_probe = dict(probe) if probe else None
+        if probe:
+            # The request is authoritative about the two probe looks. Cap and
+            # sanitize it so malformed/replayed bus data cannot turn this into
+            # an unbounded stationary sweep.
+            requested_pans = probe.get("pan_offsets") or probe.get("pans") or []
+            pans = []
+            for pan in requested_pans[:3]:
+                try:
+                    pans.append(max(-70, min(70, int(float(pan)))))
+                except (TypeError, ValueError):
+                    continue
+            self.scan_angles = tuple(pans) or DISAMBIGUATION_PANS
+            self.scan_dwell_sec = min(SCAN_DWELL_QUICK_SEC, 1.0)
+        else:
+            self.scan_angles = SCAN_PAN_ANGLES if startup else SCAN_PAN_ANGLES_QUICK
+            self.scan_dwell_sec = SCAN_DWELL_SEC if startup else SCAN_DWELL_QUICK_SEC
         self.scan_index = 0
         self.scan_sightings = []
         self.scan_dwell_until = now + self.scan_dwell_sec
@@ -2192,12 +2231,24 @@ class FieldAgent:
         scan_distance = None
         if snap.get("distance_cm") is not None and not snap.get("distance_stale", True):
             scan_distance = snap["distance_cm"]
-        self.last_room_scan = {"scanned_at": now, "sightings": self.scan_sightings,
-                               "distance_cm": scan_distance}
+        scan_id = uuid.uuid4().hex
+        scan = {"scanned_at": now, "scan_id": scan_id,
+                "sightings": list(self.scan_sightings),
+                "distance_cm": scan_distance}
+        if self.scan_probe:
+            # Carry the original resolution and probe correlation through the
+            # scan; location_graph remains the only consumer that resolves it.
+            for key in ("resolution_id", "probe_id", "candidate_scores",
+                        "candidate_location_ids", "evidence_ids"):
+                if self.scan_probe.get(key) is not None:
+                    scan[key] = self.scan_probe[key]
+            scan["attempt"] = self.scan_probe.get("attempt", 1)
+        self.last_room_scan = scan
         self.bus.publish("picarx/exploration/room_scan", self.last_room_scan)
         self.preferred_escape_angle = self._escape_angle_from_scan()
         self.goal_bias_angle = self._goal_angle_from_scan()
         self.last_scan_at = now
+        self.scan_probe = None
         self.state = "CRUISING"
         self.last_wander = now
 
@@ -2361,6 +2412,16 @@ class FieldAgent:
         with self.lock:
             _prune_older_than(self.veto_events, VETO_WINDOW, now, key=lambda e: e[0])
             veto_count = len(self.veto_events)
+
+        # Start a queued disambiguation only from the ordinary cruise state;
+        # an active evasion/coach/hypothesis state keeps ownership until it is
+        # safe to stop and look. The request remains queued in that case.
+        if self.state == "CRUISING":
+            with self.lock:
+                probe = self.pending_disambiguations.popleft() \
+                    if self.pending_disambiguations else None
+            if probe is not None:
+                self._enter_scanning(now, startup=False, probe=probe)
 
         if self.state == "SCANNING":
             self._handle_scanning_tick(now)
@@ -2700,6 +2761,8 @@ class FieldAgent:
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/suggestion", self.on_coach_suggestion)
         self.bus.subscribe("picarx/exploration/location_change", self.on_location_change)
+        self.bus.subscribe("picarx/exploration/disambiguation_needed",
+                           self.on_disambiguation_needed)
         self.bus.subscribe("picarx/exploration/uncertainty_map", self.on_uncertainty_map)
         self.bus.subscribe("picarx/exploration/active_goal", self.on_active_goal)
         self.bus.subscribe("picarx/vision/person", self.on_person)
