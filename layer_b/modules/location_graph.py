@@ -56,6 +56,12 @@ MAYBE_CLEAR = "maybe_clear"
 # recurring hazard.
 VETO_RELAX_STEP = 1
 
+# An ambiguous visual match is cheap to probe with the camera head.  Keep the
+# probe deliberately small: two offset looks are enough to change which
+# landmark is in-frame without driving the robot into an unknown space.
+DISAMBIGUATION_PANS = (-50, 50)
+DISAMBIGUATION_MAX_ATTEMPTS = 1
+
 
 class LocationGraph:
     def __init__(self):
@@ -64,19 +70,48 @@ class LocationGraph:
         self.lock = threading.Lock()
         self.current_id = None      # location of the most recent scan
         self.current_label = None
+        self._disambiguation_pending = None
 
     # ---------- inbound: scans resolve to locations ----------
 
     def on_room_scan(self, payload):
-        fingerprint = fingerprint_from_scan(
-            payload.get("sightings"), payload.get("distance_cm"))
+        # ``on_room_scan`` is also the completion callback for an active
+        # disambiguation probe. Consume the one-shot marker before matching so
+        # an ambiguous probe result cannot recursively schedule probes.
+        with self.lock:
+            probe = getattr(self, "_disambiguation_pending", None)
+            self._disambiguation_pending = None
+
+        # Keep positional compatibility with small test/adaptor
+        # implementations that still expose the historical two-argument
+        # helper, while forwarding pose data when a producer supplies it.
+        if "imu_delta" in payload or "pose_delta" in payload:
+            fingerprint = fingerprint_from_scan(
+                payload.get("sightings"), payload.get("distance_cm"),
+                payload.get("imu_delta", payload.get("pose_delta")))
+        else:
+            fingerprint = fingerprint_from_scan(
+                payload.get("sightings"), payload.get("distance_cm"))
         now = time.time()
         loc = self.store.match_or_create(fingerprint, now)
 
+        # A probe is only allowed to confirm one of the candidates that made
+        # the original scan ambiguous. This prevents an unrelated follow-up
+        # frame from silently teleporting the graph to a different place.
+        candidate_ids = set((probe or {}).get("candidate_location_ids") or [])
+        if probe is not None and loc.get("resolved") and candidate_ids and \
+                loc.get("id") not in candidate_ids:
+            loc = {**loc, "id": None, "label": None, "resolved": False,
+                   "is_new": False, "new_visit": False,
+                   "reason": "disambiguation_disagreed",
+                   "ambiguity": {"candidate_location_ids": sorted(candidate_ids)}}
+
         # A sparse scan or one that fits several remembered places is not a
-        # location fix.  Publishing that uncertainty is important: consumers
+        # location fix. Publishing that uncertainty is important: consumers
         # must not quietly retain an old place and mistake it for an arrival.
         if not loc.get("resolved"):
+            if loc.get("reason") == "ambiguous_match" and probe is None:
+                self._schedule_disambiguation(loc, now)
             with self.lock:
                 self.current_id = None
                 self.current_label = None
@@ -94,9 +129,18 @@ class LocationGraph:
         # against the resolved place, so "where is the bottle?" has a
         # durable answer ("the kitchen, 20 minutes ago") instead of only
         # the last few seconds of tracked objects.
-        labels = {label
-                  for s in payload.get("sightings") or []
-                  for label in s.get("labels") or []}
+        labels = set()
+        for sighting in payload.get("sightings") or []:
+            if not isinstance(sighting, dict):
+                continue
+            raw_labels = sighting.get("labels") or sighting.get("objects") or []
+            if isinstance(raw_labels, (str, dict)):
+                raw_labels = [raw_labels]
+            for raw in raw_labels:
+                name = (raw.get("name", raw.get("label"))
+                        if isinstance(raw, dict) else raw)
+                if name:
+                    labels.add(str(name))
         if labels:
             self.store.note_sightings(loc["id"], labels, now)
 
@@ -124,6 +168,53 @@ class LocationGraph:
             "reason": loc.get("reason"),
             "ts": now,
         })
+
+    def _schedule_disambiguation(self, loc, now):
+        """Request one richer scan for an ambiguous location match.
+
+        The location graph cannot manufacture a camera sweep, so it publishes
+        a durable request for field_agent (or another actuator owner) and also
+        nudges the head immediately.  The next ``room_scan`` consumes the
+        one-shot marker and is matched normally; an unresolved result stays
+        unresolved rather than creating a third duplicate place.
+        """
+        ambiguity = loc.get("ambiguity") or {}
+        candidate_ids = [value for value in (
+            ambiguity.get("best_location_id"),
+            ambiguity.get("second_location_id")) if value is not None]
+        pan_offsets = list(DISAMBIGUATION_PANS)
+        request = {
+            "reason": "ambiguous_match",
+            "ambiguity": ambiguity,
+            "candidate_location_ids": candidate_ids,
+            "scan_attempt": 1,
+            "attempt": 1,
+            "max_scan_attempts": DISAMBIGUATION_MAX_ATTEMPTS,
+            "action": "head_sweep",
+            "pans": pan_offsets,
+            "pan_offsets": pan_offsets,
+            "probe": {"type": "head_sweep", "pan_offsets": pan_offsets,
+                      "saccades": 2, "quick": True},
+            "quick": True,
+            "ts": now,
+        }
+        with self.lock:
+            # The guard makes a single ambiguous scan idempotent even if a
+            # broker redelivers it before the probe result arrives.
+            if getattr(self, "_disambiguation_pending", None) is not None:
+                return
+            self._disambiguation_pending = request
+
+        self.bus.publish("picarx/exploration/disambiguation_needed", request)
+        # Camera look intents are harmless if field_agent handles the request
+        # itself, and make the probe immediate on installations without an
+        # optional event consumer.  Exactly two saccades are intentional.
+        for pan in DISAMBIGUATION_PANS:
+            self.bus.publish("picarx/intent/look", {
+                "source": "location_graph",
+                "action": {"direction": "look", "pan": pan, "tilt": 0},
+                "quick": True,
+            })
 
     # ---------- inbound: outcomes get pinned to the current place ----------
 

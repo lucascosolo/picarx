@@ -215,5 +215,96 @@ class LocationGraphSightingsTest(unittest.TestCase):
         self.assertIn("not sure where I am", speech)
 
 
+
+class LocationGraphDisambiguationTest(unittest.TestCase):
+    class _SequenceStore:
+        def __init__(self, results):
+            self.results = list(results)
+            self.calls = 0
+            self.sightings = []
+
+        def match_or_create(self, fingerprint, now):
+            self.calls += 1
+            return self.results.pop(0)
+
+        def note_sightings(self, location_id, labels, now):
+            self.sightings.append((location_id, labels))
+
+        def note_edge(self, *args):
+            pass
+
+        def location_count(self):
+            return 2
+
+    def setUp(self):
+        self.lg = location_graph.LocationGraph.__new__(location_graph.LocationGraph)
+        self.lg.bus = harness.FakeBus()
+        self.lg.lock = __import__("threading").Lock()
+        self.lg.current_id = None
+        self.lg.current_label = None
+
+    @staticmethod
+    def _ambiguous():
+        return {
+            "id": None, "label": None, "is_new": False, "new_visit": False,
+            "resolved": False, "similarity": 0.78,
+            "reason": "ambiguous_match",
+            "ambiguity": {"best_location_id": 1, "second_location_id": 2,
+                          "margin": 0.01},
+        }
+
+    @staticmethod
+    def _resolved(location_id=2):
+        return {
+            "id": location_id, "label": "place 2", "is_new": False,
+            "new_visit": False, "visit_count": 2, "veto_count": 0,
+            "resolved": True, "similarity": 0.91, "reason": "matched",
+        }
+
+    def test_ambiguous_match_requests_one_probe_then_resolves(self):
+        self.lg.store = self._SequenceStore([self._ambiguous(), self._resolved()])
+        scan = {"sightings": [{"pan": 0, "labels": ["sofa"]}],
+                "distance_cm": 80}
+
+        self.lg.on_room_scan(scan)
+        self.assertEqual(self.lg.store.calls, 1)
+        requests = self.lg.bus.of("picarx/exploration/disambiguation_needed")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["reason"], "ambiguous_match")
+        self.assertEqual(requests[0]["pan_offsets"], [-50, 50])
+        self.assertEqual(
+            [m["action"]["pan"] for m in self.lg.bus.of("picarx/intent/look")],
+            [-50, 50])
+
+        self.lg.on_room_scan({"sightings": [{"pan": 20,
+                                              "labels": ["sofa", "lamp"]}],
+                              "distance_cm": 80})
+        self.assertEqual(self.lg.store.calls, 2)
+        self.assertEqual(self.lg.current_id, 2)
+        self.assertEqual(
+            len(self.lg.bus.of("picarx/exploration/disambiguation_needed")), 1)
+        self.assertTrue(self.lg.bus.last("picarx/exploration/location_change")["localized"])
+
+    def test_ambiguous_probe_stays_uncertain_without_second_request(self):
+        self.lg.store = self._SequenceStore([self._ambiguous(), self._ambiguous()])
+        scan = {"sightings": [{"pan": 0, "labels": ["sofa"]}],
+                "distance_cm": 80}
+        self.lg.on_room_scan(scan)
+        self.lg.on_room_scan(scan)
+        self.assertEqual(self.lg.store.calls, 2)
+        self.assertIsNone(self.lg.current_id)
+        self.assertEqual(
+            len(self.lg.bus.of("picarx/exploration/disambiguation_needed")), 1)
+        self.assertFalse(self.lg.bus.last("picarx/exploration/location_change")["localized"])
+
+    def test_rich_scan_labels_are_recorded_without_type_error(self):
+        self.lg.store = self._SequenceStore([self._resolved(1)])
+        self.lg.on_room_scan({"sightings": [{"pan": 0, "labels": [
+            {"name": "chair", "confidence": 0.9, "area_ratio": 0.2},
+            {"name": "lamp", "confidence": 0.8, "area_ratio": 0.1},
+        ]}], "distance_cm": 80})
+        self.assertEqual(self.lg.store.sightings[0][1], {"chair", "lamp"})
+
+
 if __name__ == "__main__":
     unittest.main()
