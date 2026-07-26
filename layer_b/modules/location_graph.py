@@ -73,6 +73,23 @@ class LocationGraph:
         now = time.time()
         loc = self.store.match_or_create(fingerprint, now)
 
+        # A sparse scan or one that fits several remembered places is not a
+        # location fix.  Publishing that uncertainty is important: consumers
+        # must not quietly retain an old place and mistake it for an arrival.
+        if not loc.get("resolved"):
+            with self.lock:
+                self.current_id = None
+                self.current_label = None
+            self.bus.publish("picarx/exploration/location_change", {
+                "location_id": None, "label": None, "is_new": False,
+                "changed": False, "new_visit": False, "visit_count": None,
+                "veto_count": None, "localized": False,
+                "confidence": loc.get("similarity"),
+                "reason": loc.get("reason"), "ambiguity": loc.get("ambiguity"),
+                "ts": now,
+            })
+            return
+
         # Object-place memory: every label this sweep saw is recorded
         # against the resolved place, so "where is the bottle?" has a
         # durable answer ("the kitchen, 20 minutes ago") instead of only
@@ -102,6 +119,9 @@ class LocationGraph:
             "new_visit": loc["new_visit"],
             "visit_count": loc["visit_count"],
             "veto_count": loc["veto_count"],
+            "localized": True,
+            "confidence": loc.get("similarity"),
+            "reason": loc.get("reason"),
             "ts": now,
         })
 

@@ -1567,8 +1567,11 @@ class FieldAgent:
             self.consecutive_coach_failures = 0
             self.next_fail_state_allowed_at = 0.0
             self._enter_scanning(time.time(), startup=True)
-        self.announce(f"Heading toward {loc['label']}. I'll keep an eye out for it "
-                      f"as I go.", force=True)
+        # This platform has no odometry or route executor.  A goal is an
+        # evidence-guided search, not a promise that we know a path there.
+        # Say that plainly so the robot does not overstate what its map can do.
+        self.announce(f"I'll search for {loc['label']} and watch for its landmarks "
+                      f"as I explore.", force=True)
 
     def report_object_location(self, query):
         """'where is the bottle' - answered from the sighting store, no

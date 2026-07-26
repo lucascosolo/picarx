@@ -54,7 +54,7 @@ class GoalManager:
         self.store = SpatialStore(readonly=True)
         self.lock = threading.Lock()
         self.scores = {}          # location_id -> uncertainty score
-        self.current_id = None    # where the robot is (last location_change)
+        self.current_id = None    # where the robot is (last confident location fix)
         self.active = None        # {"goal_id","location_id","label","started_at","deadline"}
         self.failures = self._load_failures()
 
@@ -84,10 +84,14 @@ class GoalManager:
 
     def on_location_change(self, payload):
         now = time.time()
+        # An explicit uncertain fix must not quietly retain an old location
+        # or complete a goal.  Older publishers that omit this field retain
+        # their historic behavior for compatibility.
+        localized = payload.get("localized", payload.get("location_id") is not None)
         with self.lock:
-            self.current_id = payload.get("location_id")
+            self.current_id = payload.get("location_id") if localized else None
             active = dict(self.active) if self.active else None
-        if active and self.current_id == active["location_id"]:
+        if active and localized and self.current_id == active["location_id"]:
             self._finish_goal(active, "reached", now)
         elif active is None:
             self._maybe_adopt_goal(now)
@@ -119,6 +123,7 @@ class GoalManager:
             })
         target_labels = sorted({l.split(":", 1)[1]
                                 for l in loc["fingerprint"].get("labels") or []})
+        target_landmarks = list(loc["fingerprint"].get("labels") or [])
         goal = {
             "goal_id": str(uuid.uuid4()),
             "location_id": location_id,
@@ -134,6 +139,9 @@ class GoalManager:
         self.bus.publish("picarx/exploration/active_goal", {
             "goal_id": goal["goal_id"], "location_id": location_id,
             "label": loc["label"], "target_labels": target_labels,
+            "target_landmarks": target_landmarks,
+            "guidance": "landmark_search",
+            "arrival_requires": "confident_localization",
             "reason": reason, "deadline": goal["deadline"], "ts": now,
         })
         self.bus.publish("picarx/decision", {
@@ -168,6 +176,7 @@ class GoalManager:
             return
         target_labels = sorted({l.split(":", 1)[1]
                                 for l in loc["fingerprint"].get("labels") or []})
+        target_landmarks = list(loc["fingerprint"].get("labels") or [])
         goal = {
             "goal_id": str(uuid.uuid4()),
             "location_id": best_id,
@@ -184,6 +193,9 @@ class GoalManager:
         self.bus.publish("picarx/exploration/active_goal", {
             "goal_id": goal["goal_id"], "location_id": best_id,
             "label": loc["label"], "target_labels": target_labels,
+            "target_landmarks": target_landmarks,
+            "guidance": "landmark_search",
+            "arrival_requires": "confident_localization",
             "reason": reason, "deadline": goal["deadline"], "ts": now,
         })
         self.bus.publish("picarx/decision", {
@@ -192,7 +204,7 @@ class GoalManager:
             "reason": reason, "ts": now,
         })
         self.bus.publish("picarx/audio/speak", {
-            "text": f"New mission: find my way back to {loc['label']}.", "ts": now})
+            "text": f"New mission: explore and look for landmarks from {loc['label']}.", "ts": now})
 
     def _finish_goal(self, goal, status, now):
         with self.lock:
@@ -217,7 +229,7 @@ class GoalManager:
             "goal_id": None, "location_id": None, "ts": now})
         if status == "reached":
             self.bus.publish("picarx/audio/speak", {
-                "text": f"Made it back to {goal['label']}. Mission complete.", "ts": now})
+                "text": f"I recognize this as {goal['label']}. Mission complete.", "ts": now})
 
     # ---------- main loop ----------
 

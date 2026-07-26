@@ -35,8 +35,13 @@ import robot_config
 DB_DIR = robot_config.data_path()
 DB_PATH = f"{DB_DIR}/spatial.db"
 
-# Two fingerprints at least this similar are the same place.
-MATCH_THRESHOLD = 0.60
+# A location is a *belief*, not an answer the robot must always produce.
+# These deliberately leave a little room between "some overlap" and a
+# confident recognition.  In particular, a sofa and a range bucket are not
+# enough to tell two living-room corners apart.
+MATCH_THRESHOLD = 0.70
+MATCH_MARGIN = 0.15
+MIN_DISTINCT_LANDMARKS = 2
 # A re-scan within this many seconds of the last visit refreshes the
 # location but doesn't count as a new "visit" (one wander session
 # re-scanning every 25s isn't ten visits).
@@ -114,6 +119,15 @@ def fingerprint_similarity(fp_a, fp_b):
         jaccard = 1.0  # both featureless - rely on the range bucket
     range_match = 1.0 if fp_a.get("range") == fp_b.get("range") else 0.0
     return 0.8 * jaccard + 0.2 * range_match
+
+
+def fingerprint_is_distinctive(fingerprint):
+    """Whether a scan contains enough independent visual evidence to name
+    a place.  Range alone, and one common detector label, are useful hints
+    but are far too easy to alias in a house."""
+    landmarks = {entry.split(":", 1)[-1]
+                 for entry in (fingerprint.get("labels") or [])}
+    return len(landmarks) >= MIN_DISTINCT_LANDMARKS
 
 
 def label_for_fingerprint(fp, location_id):
@@ -241,12 +255,38 @@ class SpatialStore:
         away, vs. a same-session re-scan)."""
         self._assert_writer()
         now = now if now is not None else time.time()
-        best, best_sim = None, MATCH_THRESHOLD
-        for loc in self.all_locations():
-            sim = fingerprint_similarity(fingerprint, loc["fingerprint"])
-            if sim >= best_sim:
-                best, best_sim = loc, sim
-        if best is not None:
+        # Do not turn a nearly empty sweep into either a false recognition
+        # or a durable "open floor" node.  The caller receives an explicit
+        # unlocalized result and can keep exploring/scanning.
+        # Permit the very first weak scan to seed a named place for backwards
+        # compatibility and human labelling, but never use weak evidence to
+        # identify an already-known place.  It is a hypothesis until a later,
+        # richer scan confirms it.
+        known_locations = self.all_locations()
+        if not fingerprint_is_distinctive(fingerprint) and known_locations:
+            return {"id": None, "label": None, "fingerprint": fingerprint,
+                    "is_new": False, "new_visit": False, "similarity": None,
+                    "resolved": False, "reason": "insufficient_landmarks",
+                    "ambiguity": None}
+
+        candidates = sorted(
+            ((fingerprint_similarity(fingerprint, loc["fingerprint"]), loc)
+             for loc in known_locations),
+            key=lambda item: item[0], reverse=True)
+        best_sim, best = candidates[0] if candidates else (None, None)
+        second_sim = candidates[1][0] if len(candidates) > 1 else None
+        # Two known places that explain this scan almost equally well are an
+        # ambiguity, not a license to pick whichever SQLite row happened to
+        # win a tie.  Avoid minting a third duplicate as well.
+        if best is not None and best_sim >= MATCH_THRESHOLD and \
+                second_sim is not None and best_sim - second_sim < MATCH_MARGIN:
+            return {"id": None, "label": None, "fingerprint": fingerprint,
+                    "is_new": False, "new_visit": False, "similarity": best_sim,
+                    "resolved": False, "reason": "ambiguous_match",
+                    "ambiguity": {"best_location_id": best["id"],
+                                  "second_location_id": candidates[1][1]["id"],
+                                  "margin": best_sim - second_sim}}
+        if best is not None and best_sim >= MATCH_THRESHOLD:
             new_visit = (now - best["last_visited_at"]) > REVISIT_GAP_SEC
             self.conn.execute(
                 "UPDATE locations SET last_visited_at = ?, visit_count = visit_count + ? WHERE id = ?",
@@ -254,7 +294,9 @@ class SpatialStore:
             self.conn.commit()
             best.update(last_visited_at=now,
                         visit_count=best["visit_count"] + (1 if new_visit else 0))
-            return {**best, "is_new": False, "new_visit": new_visit, "similarity": best_sim}
+            return {**best, "is_new": False, "new_visit": new_visit,
+                    "similarity": best_sim, "resolved": True,
+                    "reason": "matched", "ambiguity": None}
 
         cur = self.conn.execute(
             "INSERT INTO locations (label, fingerprint_json, discovered_at, last_visited_at)"
@@ -267,7 +309,9 @@ class SpatialStore:
         return {"id": loc_id, "label": label, "fingerprint": fingerprint,
                 "discovered_at": now, "last_visited_at": now, "visit_count": 1,
                 "veto_count": 0, "coach_wins": 0, "coach_losses": 0,
-                "is_new": True, "new_visit": True, "similarity": None}
+                "is_new": True, "new_visit": True, "similarity": None,
+                "resolved": True, "reason": "new_distinctive_place",
+                "ambiguity": None}
 
     def note_edge(self, a, b, now=None):
         self._assert_writer()
