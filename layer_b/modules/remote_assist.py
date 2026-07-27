@@ -208,6 +208,10 @@ class RemoteAssist:
         self.lock = threading.RLock()
         self.connected = False
         self.target = None
+        # Authorization is deliberately robot-side session state.  The host
+        # helper remains launched with its write-capable protocol, but no
+        # write request reaches it until this one-time grant is made.
+        self.write_authorized = False
 
     def _publish(self, payload):
         message = dict(payload, ts=time.time())
@@ -249,6 +253,19 @@ class RemoteAssist:
         elif message.get("command") == "apply_patch":
             result = message.get("result") or {}
             text = "Remote patch " + ("applied." if result.get("applied") else "was not applied.")
+        elif message.get("command") == "rollback":
+            result = message.get("result") or {}
+            text = "Remote patch " + ("rolled back." if result.get("rolled_back")
+                                       else "was not rolled back.")
+        elif message.get("command") == "authorize_write":
+            text = "Remote write access is enabled for this connection session."
+        elif message.get("command") == "revoke_write":
+            text = "Remote write access is disabled for this connection session."
+        elif message.get("command") == "logs":
+            result = message.get("result") or {}
+            entries = result.get("entries") or []
+            text = f"Remote session log has {len(entries)} recorded operation"
+            text += "s." if len(entries) != 1 else "."
         else:
             text = "Remote operation complete. I sent the details to the tools console."
         self.bus.publish("picarx/audio/speak", {"text": text[:400], "ts": time.time()})
@@ -276,6 +293,7 @@ class RemoteAssist:
                                                   payload.get("port"),
                                                   payload.get("project_root", "."))
                     self.target, self.connected = target, True
+                    self.write_authorized = False
                     self._claim()
                     response = {"ok": True, "command": command, "request_id": request_id,
                                 "target": target}
@@ -283,20 +301,45 @@ class RemoteAssist:
                     self.session.close()
                     self.connected = False
                     self.target = None
+                    self.write_authorized = False
                     self._release()
                     response = {"ok": True, "command": "disconnect",
                                 "request_id": request_id}
                 elif command == "status":
                     response = {"ok": True, "command": command,
                                 "request_id": request_id, "connected": self.connected,
-                                "target": self.target}
+                                "target": self.target,
+                                "write_authorized": self.write_authorized}
                 elif not self.connected:
                     raise RuntimeError("not connected; connect to a host first")
-                elif command in {"list", "read", "search", "stat", "preview_patch", "apply_patch", "run"}:
+                elif command == "authorize_write":
+                    if not payload.get("confirmed"):
+                        raise PermissionError(
+                            "explicit confirmation is required to grant remote write access")
+                    self.write_authorized = True
+                    response = {"ok": True, "command": command,
+                                "request_id": request_id,
+                                "write_authorized": True}
+                elif command == "revoke_write":
+                    self.write_authorized = False
+                    response = {"ok": True, "command": command,
+                                "request_id": request_id,
+                                "write_authorized": False}
+                elif command in {"list", "read", "search", "stat", "logs",
+                                 "preview_patch", "apply_patch", "rollback", "run"}:
                     request = dict(payload)
                     request["op"] = command
-                    if command in {"apply_patch", "run"} and not payload.get("confirmed"):
-                        raise PermissionError("explicit confirmation is required for remote writes/commands")
+                    if command in {"apply_patch", "rollback"}:
+                        if not self.write_authorized:
+                            raise PermissionError(
+                                "grant remote write access for this session first")
+                        # The one-time robot-side grant is the explicit
+                        # confirmation for the helper protocol.  It persists
+                        # until disconnect/reconnect or revoke_write.
+                        request["confirmed"] = True
+                    elif command == "run" and not payload.get("confirmed"):
+                        raise PermissionError(
+                            "explicit confirmation is required for remote commands")
                     self._claim()
                     result = self.session.request(request)
                     response = {"ok": bool(result.get("ok")), "command": command,
@@ -316,6 +359,7 @@ class RemoteAssist:
                     pass
                 self.connected = False
                 self.target = None
+                self.write_authorized = False
             self._publish({"ok": False, "command": command, "request_id": request_id,
                            "error": str(e)[:500]})
 

@@ -636,7 +636,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/remote":
             command = str(body.get("command") or "").lower()
             allowed = {"connect", "disconnect", "status", "list", "read", "search",
-                       "stat", "preview_patch", "apply_patch", "run"}
+                       "stat", "logs", "authorize_write", "revoke_write",
+                       "preview_patch", "apply_patch", "rollback", "run"}
             if command not in allowed:
                 self._send(400, {"error": "unsupported remote command"})
                 return

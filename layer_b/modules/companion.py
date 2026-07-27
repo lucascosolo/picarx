@@ -362,14 +362,19 @@ TOOLS = [
     {"name": "remote_project_operation",
      "description": "Use the connected host helper to inspect or debug the scoped "
                     "project. Supported operations are status, list, read, search, "
-                    "preview_patch, apply_patch, run, and disconnect. Read/list/search/"
-                    "preview are safe. For apply_patch or run, set confirmed=true "
-                    "ONLY after the person explicitly approves that specific write "
-                    "or command; otherwise ask for approval first. Commands remain "
+                    "preview_patch, apply_patch, rollback, run, logs, authorize_write, "
+                    "revoke_write, and disconnect. "
+                    "Read/list/search/preview/logs are safe. Grant write access once "
+                    "with authorize_write after the person explicitly approves it; "
+                    "that grant covers apply_patch and rollback until disconnect. "
+                    "For run, set confirmed=true ONLY after the person explicitly "
+                    "approves that specific command; otherwise ask for approval. Commands remain "
                     "host-side allowlisted and bounded.",
      "input_schema": {"type": "object", "properties": {
          "operation": {"type": "string", "enum": ["status", "list", "read",
-                       "search", "preview_patch", "apply_patch", "run", "disconnect"]},
+                       "search", "stat", "logs", "preview_patch", "apply_patch",
+                       "rollback", "run", "authorize_write", "revoke_write",
+                       "disconnect"]},
          "path": {"type": "string"},
          "pattern": {"type": "string"},
          "patch": {"type": "string"},
@@ -1299,11 +1304,12 @@ class Companion:
                         "scoped helper there.")
             if name == "remote_project_operation":
                 operation = str(tool_input.get("operation") or "").lower()
-                allowed = {"status", "list", "read", "search", "preview_patch",
-                            "apply_patch", "run", "disconnect"}
+                allowed = {"status", "list", "read", "search", "stat", "logs",
+                           "preview_patch", "apply_patch", "rollback", "run",
+                           "authorize_write", "revoke_write", "disconnect"}
                 if operation not in allowed:
                     return "That remote operation is not supported."
-                if operation in {"apply_patch", "run"} and \
+                if operation in {"run", "authorize_write"} and \
                         not bool(tool_input.get("confirmed")):
                     return ("I need your explicit approval before I can apply a "
                             "remote patch or run a remote command.")

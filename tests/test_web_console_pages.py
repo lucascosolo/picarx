@@ -151,7 +151,8 @@ class RouteTableTest(unittest.TestCase):
             page = stream.read()
         for marker in ("setGesture(true)", "remoteConnect()", "remoteRead()",
                        "remotePatch('preview_patch')", "remotePatch('apply_patch')",
-                       "remoteRun()", "remote-confirm"):
+                       "remoteRun()", "authorizeRemoteWrites()", "revoke_write",
+                       "remote-confirm", "argv: document.getElementById('remote-command')"):
             self.assertIn(marker, page)
 
 

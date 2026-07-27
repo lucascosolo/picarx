@@ -152,6 +152,13 @@ def _remote_payload(m, text):
 RULES = [
     # Remote project assistance. Require ssh/remote/host/computer wording or
     # an unmistakable "ssh into" phrase so this never captures a place goal.
+    (re.compile(r"\b(?:revoke|remove|disable)\b.*\b(?:remote|ssh|host|project)\b"
+                r".*\bwrite(?: access| permission)?\b"),
+     REMOTE_TOPIC, lambda m, t: {"command": "revoke_write"}),
+    (re.compile(r"\b(?:grant|give|allow|enable)\b.*\b(?:remote|ssh|host|project)\b"
+                r".*\bwrite(?: access| permission)?\b|"
+                r"\b(?:remote|ssh|host|project)\b.*\bwrite access\b"),
+     REMOTE_TOPIC, lambda m, t: {"command": "authorize_write", "confirmed": True}),
     (re.compile(r"\b(?:ssh\s+(?:into\s+)?|(?:remote|host|computer)\s+)"
                 r"((?:\d{1,3}(?:[ .]\d{1,3}){3})|[a-z][a-z0-9.-]{1,62})\b|"
                 r"\bconnect\s+to\s+((?:\d{1,3}(?:[ .]\d{1,3}){3})|"
@@ -199,7 +206,7 @@ RULES = [
 
 TOOL_DESCRIPTIONS = [
     {"name": "remote_assist", "topic": REMOTE_TOPIC,
-     "say": "ssh into <host> / disconnect remote assist",
+     "say": "ssh into <host> / give or revoke remote write access / disconnect remote assist",
      "description": "connects to a provisioned host helper over verified SSH so I can inspect a project, preview approved patches, and run bounded debugging commands"},
     {"name": "radio", "topic": "picarx/tools/radio",
      "say": "play radio / stop radio / next station / station <name> / "

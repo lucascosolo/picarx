@@ -35,18 +35,23 @@
   <div class="row"><input id="remote-root" placeholder="project root, e.g. ~/src/project">
     <button class="primary" onclick="remoteConnect()">Connect</button>
     <button onclick="remoteCommand('disconnect')">Disconnect</button></div>
+  <div class="row"><button onclick="authorizeRemoteWrites()">Authorize writes for this session</button>
+    <button onclick="remoteCommand('revoke_write')">Revoke writes</button>
+    <span id="remote-write-status" class="hint">writes not authorized</span></div>
   <div class="row"><input id="remote-path" placeholder="relative path, e.g. src/main.py">
     <button onclick="remoteRead()">Read file</button>
     <button onclick="remoteList()">List directory</button></div>
   <div class="row"><input id="remote-search" placeholder="search pattern">
     <button onclick="remoteSearch()">Search</button>
-    <button onclick="remoteCommand('status')">Status</button></div>
+    <button onclick="remoteCommand('status')">Status</button>
+    <button onclick="remoteCommand('logs')">Session log</button></div>
   <div class="row"><input id="remote-command" placeholder="allowlisted test command">
     <label><input type="checkbox" id="remote-confirm"> confirm remote command/write</label>
     <button onclick="remoteRun()">Run</button></div>
   <textarea id="remote-patch" rows="10" placeholder="unified git diff to preview or apply"></textarea>
   <div class="row"><button onclick="remotePatch('preview_patch')">Preview patch</button>
-    <button class="danger" onclick="remotePatch('apply_patch')">Apply confirmed patch</button></div>
+    <button class="danger" onclick="remotePatch('apply_patch')">Apply confirmed patch</button>
+    <button class="danger" onclick="remoteCommand('rollback', {confirmed: document.getElementById('remote-confirm').checked})">Rollback last patch</button></div>
   <div class="stat"><span>Remote status</span><span id="remote-status">not connected</span></div>
   <pre id="remote-output" class="hint">No remote result yet.</pre>
 </div>
@@ -61,6 +66,13 @@ function remotePayload(command, extra) { return Object.assign({command}, extra |
 async function remoteCommand(command, extra) {
   await PX.post('/remote', remotePayload(command, extra));
   setTimeout(PX.poll, 200);
+}
+function authorizeRemoteWrites() {
+  if (!document.getElementById('remote-confirm').checked) {
+    alert('Check the confirmation box first. This enables remote writes until disconnect or revoke.');
+    return;
+  }
+  remoteCommand('authorize_write', {confirmed: true});
 }
 function remoteConnect() {
   const host = document.getElementById('remote-host').value.trim();
@@ -79,7 +91,7 @@ function remoteSearch() {
   remoteCommand('search', {pattern: document.getElementById('remote-search').value.trim()});
 }
 function remoteRun() {
-  remoteCommand('run', {command: document.getElementById('remote-command').value.trim(),
+  remoteCommand('run', {argv: document.getElementById('remote-command').value.trim(),
     confirmed: document.getElementById('remote-confirm').checked});
 }
 function remotePatch(command) {
@@ -98,6 +110,8 @@ PX.onPoll(s => {
     ? `connected to ${r.target.host || 'host'}` : (r.error || 'not connected');
   if (Object.keys(r).length)
     document.getElementById('remote-output').textContent = JSON.stringify(r, null, 2);
+  document.getElementById('remote-write-status').textContent = r.write_authorized
+    ? 'writes authorized for this session' : 'writes not authorized';
 });
 PX.startPolling(2000);
 </script>

@@ -72,6 +72,18 @@ class RemoteRuleTest(unittest.TestCase):
         registry.on_heard({"text": "connect to the kitchen"})
         self.assertIsNone(registry.bus.last("picarx/tools/remote_assist"))
 
+    def test_explicit_write_grant_routes_to_session_authorization(self):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": "give the remote host write access"})
+        self.assertEqual(registry.bus.last("picarx/tools/remote_assist"),
+                         {"command": "authorize_write", "confirmed": True})
+
+    def test_write_revoke_routes_to_session_revoke(self):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": "revoke remote write access"})
+        self.assertEqual(registry.bus.last("picarx/tools/remote_assist"),
+                         {"command": "revoke_write"})
+
 
 if __name__ == "__main__":
     unittest.main()

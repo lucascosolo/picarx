@@ -71,6 +71,15 @@ class HostHelperTests(unittest.TestCase):
         with self.assertRaises(self.mod.HelperError):
             self.helper.run({"command": "sh -c 'echo unsafe'"})
 
+    def test_jsonl_mutating_operations_require_confirmation_and_logs_are_bounded(self):
+        with self.assertRaises(self.mod.HelperError):
+            self.helper.handle({"op": "run", "argv": ["git", "status"]})
+        self.helper.handle({"op": "status", "request_id": "s1"})
+        logs = self.helper.handle({"op": "logs", "limit": 5})
+        self.assertTrue(logs["entries"])
+        self.assertEqual(logs["entries"][0]["op"], "run")
+        self.assertFalse(any("argv" in entry for entry in logs["entries"]))
+
     def test_writes_require_explicit_host_write_enablement(self):
         with self.assertRaises(self.mod.HelperError):
             self.helper.apply_patch({"patch": "diff --git a/main.py b/main.py\n"})
@@ -135,6 +144,29 @@ class RemoteAssistTests(unittest.TestCase):
         self.assertEqual(session.requests[-1]["op"], "run")
         remote._handle({"command": "disconnect"})
         self.assertFalse(remote.connected)
+
+    def test_write_authorization_persists_until_revoke_or_disconnect(self):
+        session = FakeSession()
+        remote = RemoteAssist(session=session)
+        remote._handle({"command": "connect", "host": "192.168.1.20"})
+        before = len(session.requests)
+        remote._handle({"command": "apply_patch", "patch": "diff"})
+        self.assertEqual(len(session.requests), before)
+        self.assertFalse(remote.write_authorized)
+        remote._handle({"command": "authorize_write", "confirmed": True})
+        self.assertTrue(remote.write_authorized)
+        remote._handle({"command": "apply_patch", "patch": "diff"})
+        self.assertEqual(session.requests[-1]["op"], "apply_patch")
+        self.assertTrue(session.requests[-1]["confirmed"])
+        remote._handle({"command": "apply_patch", "patch": "diff"})
+        self.assertTrue(session.requests[-1]["confirmed"])
+        remote._handle({"command": "revoke_write"})
+        self.assertFalse(remote.write_authorized)
+        count = len(session.requests)
+        remote._handle({"command": "rollback"})
+        self.assertEqual(len(session.requests), count)
+        remote._handle({"command": "disconnect"})
+        self.assertFalse(remote.write_authorized)
 
     def test_session_bootstraps_robot_owned_helper_before_starting_it(self):
         class Proc:

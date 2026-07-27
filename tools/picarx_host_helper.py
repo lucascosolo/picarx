@@ -10,7 +10,7 @@ is required. For local testing it can be run as
 
 Protocol: one JSON object per stdin line, one JSON result per stdout line.
 Supported operations are ``status``, ``list``, ``read``, ``search``, ``stat``,
-``preview_patch``, ``apply_patch``, and ``run``.
+``logs``, ``preview_patch``, ``apply_patch``, ``rollback``, and ``run``.
 """
 import argparse
 import json
@@ -20,6 +20,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 MAX_READ_BYTES = 512 * 1024
@@ -27,6 +28,7 @@ MAX_OUTPUT_BYTES = 64 * 1024
 MAX_SEARCH_RESULTS = 200
 MAX_LIST_RESULTS = 200
 MAX_COMMAND_SEC = 120.0
+MAX_SESSION_LOG = 200
 DEFAULT_COMMAND_PREFIXES = (
     ("python", "-m", "pytest"),
     ("python3", "-m", "pytest"),
@@ -61,6 +63,8 @@ class HostHelper:
         self.allow_write = bool(allow_write)
         self.command_prefixes = tuple(command_prefixes or DEFAULT_COMMAND_PREFIXES)
         self.started_at = time.time()
+        self._session_log = deque(maxlen=MAX_SESSION_LOG)
+        self._last_patch = None
 
     def _path(self, value, must_exist=False):
         rel = str(value or ".")
@@ -98,7 +102,24 @@ class HostHelper:
 
     def status(self, _request):
         return {"root": str(self.root), "allow_write": self.allow_write,
-                "uptime_sec": round(time.time() - self.started_at, 2)}
+                "uptime_sec": round(time.time() - self.started_at, 2),
+                "requests": len(self._session_log),
+                "rollback_available": self._last_patch is not None}
+
+    def logs(self, request):
+        """Return a bounded, metadata-only audit trail for this SSH session.
+
+        Source text, patch bodies, command arguments, and file contents are
+        deliberately excluded.  This is enough to explain a debugging run
+        without turning the helper into a secret-bearing transcript store.
+        """
+        try:
+            limit = int(request.get("limit", 50))
+        except (TypeError, ValueError):
+            raise HelperError("log limit must be an integer")
+        limit = max(1, min(MAX_SESSION_LOG, limit))
+        return {"entries": list(self._session_log)[-limit:],
+                "truncated": len(self._session_log) > limit}
 
     def list(self, request):
         path = self._path(request.get("path", "."), must_exist=True)
@@ -205,7 +226,40 @@ class HostHelper:
         err, err_trunc = _bounded_text(proc.stderr)
         if proc.returncode:
             raise HelperError(err or "patch application failed")
+        self._last_patch = {"patch": patch, "applied_at": time.time()}
         return {"applied": True, "stdout": out, "stderr": err,
+                "truncated": out_trunc or err_trunc}
+
+    def rollback(self, _request):
+        """Reverse only the most recent successful patch in this session.
+
+        ``git apply --check -R`` makes this conservative: if the project has
+        changed since the patch was applied, rollback fails instead of
+        overwriting unrelated work.  A successful rollback clears the one
+        available rollback slot and is itself recorded in the session log.
+        """
+        if not self.allow_write:
+            raise HelperError("host helper is read-only; restart it with --allow-write")
+        if not self._last_patch:
+            raise HelperError("no successful patch is available to roll back")
+        patch = self._last_patch["patch"]
+        check = subprocess.run(["git", "apply", "--check", "-R",
+                                "--whitespace=nowarn", "-"], input=patch,
+                               text=True, cwd=self.root, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=10, check=False)
+        if check.returncode:
+            raise HelperError(_bounded_text(check.stderr)[0] or
+                              "rollback failed validation; project changed")
+        proc = subprocess.run(["git", "apply", "-R", "--whitespace=nowarn", "-"],
+                              input=patch, text=True, cwd=self.root,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=20, check=False)
+        out, out_trunc = _bounded_text(proc.stdout)
+        err, err_trunc = _bounded_text(proc.stderr)
+        if proc.returncode:
+            raise HelperError(err or "rollback failed")
+        self._last_patch = None
+        return {"rolled_back": True, "stdout": out, "stderr": err,
                 "truncated": out_trunc or err_trunc}
 
     def _allowed(self, argv):
@@ -248,13 +302,32 @@ class HostHelper:
         if not isinstance(request, dict):
             raise HelperError("request must be an object")
         op = str(request.get("op") or "").lower()
+        request_id = request.get("request_id")
+        started = time.monotonic()
         methods = {"status": self.status, "list": self.list, "read": self.read,
-                   "search": self.search, "stat": self.stat,
+                   "search": self.search, "stat": self.stat, "logs": self.logs,
                    "preview_patch": self.preview_patch, "apply_patch": self.apply_patch,
-                   "run": self.run}
+                   "rollback": self.rollback, "run": self.run}
         if op not in methods:
             raise HelperError(f"unsupported operation: {op}")
-        return methods[op](request)
+        try:
+            if op in {"apply_patch", "rollback", "run"} and \
+                    not bool(request.get("confirmed")):
+                raise HelperError("explicit confirmation is required for this operation")
+            result = methods[op](request)
+        except Exception as exc:
+            self._session_log.append({
+                "request_id": str(request_id)[:80] if request_id else None,
+                "op": op, "ok": False, "error": str(exc)[:200],
+                "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                "ts": time.time()})
+            raise
+        self._session_log.append({
+            "request_id": str(request_id)[:80] if request_id else None,
+            "op": op, "ok": True,
+            "duration_ms": round((time.monotonic() - started) * 1000, 1),
+            "ts": time.time()})
+        return result
 
 
 def main(argv=None):

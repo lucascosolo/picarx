@@ -101,12 +101,18 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(request["project_root"], "~/src/picarx")
         self.assertNotIn("password", request)
 
-    def test_remote_write_and_run_require_confirmation_before_publish(self):
+    def test_remote_write_access_is_granted_once_but_commands_stay_confirmed(self):
         out = self.c._execute_tool(
             "remote_project_operation",
             {"operation": "apply_patch", "patch": "diff --git ..."})
-        self.assertIn("explicit approval", out)
-        self.assertEqual(self.c.bus.of(companion.REMOTE_ASSIST_TOPIC), [])
+        self.assertIn("request sent", out)
+        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(request["command"], "apply_patch")
+        self.c._execute_tool(
+            "remote_project_operation",
+            {"operation": "authorize_write", "confirmed": True})
+        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(request["command"], "authorize_write")
         self.c._execute_tool(
             "remote_project_operation",
             {"operation": "run", "command": "pytest", "confirmed": True})
