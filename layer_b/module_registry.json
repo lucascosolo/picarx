@@ -298,11 +298,7 @@
     "entrypoint": "tools/bluetooth_daemon.py",
     "enabled": true,
     "activation": {
-      "mode": "demand",
-      "topic": "picarx/tools/bluetooth/connect",
-      "state_topic": "picarx/tools/bluetooth/state",
-      "state_field": "online",
-      "ttl_sec": 120
+      "mode": "always"
     }
   },
   {
