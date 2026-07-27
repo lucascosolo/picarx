@@ -280,6 +280,7 @@ class GestureTracker:
         self._model_error = None
         self._last_pose = None
         self._last_hand_at = 0.0
+        self._last_camera_wait_at = 0.0
 
     def _claim(self):
         self.bus.publish(STATE_CLAIM_TOPIC, {
@@ -299,6 +300,7 @@ class GestureTracker:
                 self.scheduler = AdaptiveFrameScheduler()
                 self._last_pose = None
                 self._last_hand_at = 0.0
+                self._last_camera_wait_at = 0.0
             self._claim()
             self.bus.publish(STATUS_TOPIC, {"enabled": True, "state": "starting",
                                              "ts": time.time()})
@@ -320,7 +322,25 @@ class GestureTracker:
         try:
             # RobotState closes the normal race, while this non-blocking
             # kernel lock protects the short MQTT handoff window too.
-            lease = CameraLease().acquire()
+            while self.running and self.enabled and self.state == STATE_NAME:
+                try:
+                    lease = CameraLease().acquire()
+                    break
+                except CameraBusy:
+                    # Keep the capture worker alive while vision finishes its
+                    # handoff instead of exiting and spawning a new worker on
+                    # every 10 ms tick. The one-second log/status throttle
+                    # also prevents camera_wait from flooding systemd/MQTT.
+                    now = time.monotonic()
+                    if now - self._last_camera_wait_at >= 1.0:
+                        self._last_camera_wait_at = now
+                        self.bus.publish(STATUS_TOPIC, {
+                            "enabled": self.enabled, "state": "camera_wait",
+                            "error": "camera owned by another process",
+                            "lock": CameraLease().path, "ts": time.time()})
+                    time.sleep(0.2)
+            if lease is None:
+                return
             from picamera2 import Picamera2
             camera = Picamera2()
             config = camera.create_preview_configuration(
@@ -331,9 +351,6 @@ class GestureTracker:
             time.sleep(0.3)
             while self.running and self.enabled and self.state == STATE_NAME:
                 self.frames.put(camera.capture_array())
-        except CameraBusy:
-            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "camera_wait",
-                                             "error": "camera owned by another process", "ts": time.time()})
         except Exception as e:
             self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "camera_error",
                                              "error": str(e)[:200], "ts": time.time()})

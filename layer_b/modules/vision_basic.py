@@ -135,6 +135,7 @@ import base64
 import cv2
 import numpy as np
 import time
+import threading
 
 cv2.setNumThreads(THREAD_LIMIT)
 
@@ -327,6 +328,7 @@ STREAM_FRAME_TOPIC = "picarx/vision/frame"
 STREAM_MIN_INTERVAL = 0.2       # cap publish rate (~5 fps ceiling; loop tick bounds it lower)
 STREAM_JPEG_QUALITY = 60        # small over MQTT/base64; a debug view doesn't need more
 ROBOT_STATE_TOPIC = "picarx/state/current"
+STATE_QUERY_TOPIC = "picarx/state/query"
 STATE_CLAIM_TOPIC = "picarx/state/claim"
 STATE_RELEASE_TOPIC = "picarx/state/release"
 VISION_STATE_OWNER = "vision_basic"
@@ -674,10 +676,17 @@ def run():
     # Subscribe before opening Picamera2 so a retained/current state or a
     # fast gesture claim can prevent a competing camera owner from starting.
     robot_state = {"state": "IDLE"}
+    state_seen = threading.Event()
     object_state_claimed = False
     def on_robot_state(payload):
         robot_state["state"] = str(payload.get("state") or "IDLE")
+        state_seen.set()
     bus.subscribe(ROBOT_STATE_TOPIC, on_robot_state)
+    # RobotState does not rely on MQTT retained messages. Ask for a fresh
+    # snapshot before opening the camera, otherwise vision can win the lock
+    # during startup just before an already-active gesture claim is delivered.
+    bus.publish(STATE_QUERY_TOPIC, {"source": "vision_basic"})
+    state_seen.wait(1.0)
 
     def claim_object_state():
         nonlocal object_state_claimed

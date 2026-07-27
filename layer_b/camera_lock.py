@@ -9,7 +9,10 @@ import fcntl
 import os
 
 
-LOCK_PATH = os.environ.get("PICARX_CAMERA_LOCK", "/tmp/picarx-camera.lock")
+# Resolve once so a relative override cannot point at different files when
+# systemd launches modules with different working directories.
+LOCK_PATH = os.path.abspath(os.path.expanduser(
+    os.environ.get("PICARX_CAMERA_LOCK", "/tmp/picarx-camera.lock")))
 
 
 class CameraBusy(RuntimeError):
@@ -48,4 +51,3 @@ class CameraLease:
 
     def __exit__(self, *_):
         self.release()
-
