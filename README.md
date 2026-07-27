@@ -79,10 +79,14 @@ All Layer B modules talk over a local **MQTT broker** (mosquitto,
 `localhost:1883`) via a thin wrapper, [`broker_client.Bus`](layer_b/broker_client.py).
 Two consequences shape the whole codebase:
 
-- **Additive capabilities.** A new behaviour is a new file in
-  `layer_b/modules/` plus one line in
-  [`module_registry.json`](layer_b/module_registry.json). It subscribes to the
-  topics it needs and publishes its own. No core process changes.
+- **Need-driven capabilities.** A new behaviour is a new file in
+  `layer_b/modules/` plus one catalog entry in
+  [`module_registry.json`](layer_b/module_registry.json). The orchestrator
+  keeps infrastructure alive, follows `RobotState` for resource-heavy modes,
+  and starts demand workers when their typed bus request arrives. The entry's
+  `enabled` field is now an availability/emergency kill switch, not the normal
+  runtime behavior selector; lifecycle transitions are visible on
+  `picarx/lifecycle/status`.
 - **Crash isolation.** Every bus callback is guarded, every hardware/sensor
   read is `try`/soft-`None`, and a module that dies or is disabled degrades the
   robot to *exactly* its previous behaviour — never to an unsafe or stuck one.
@@ -239,10 +243,11 @@ On the robot (a Raspberry Pi with the PiCar-X assembled), three things run:
 
 1. **mosquitto** — the MQTT broker (`localhost:1883`).
 2. **`safety/safety_daemon.py`** — Layer A. Start it first; it owns the hardware.
-3. **`layer_b/orchestrator.py`** — the Layer B supervisor. It reads
-   `module_registry.json`, starts one `python3` subprocess per enabled module,
-   and watches the manifest and module files: add/enable/edit an entry and it
-   hot-starts or restarts just that module, no full reboot.
+3. **`layer_b/orchestrator.py`** — the Layer B supervisor. It reads the module
+   catalog, keeps core infrastructure alive, and starts/stops state- and
+   demand-driven workers as RobotState and typed bus requests change. It also
+   watches the manifest and module files, hot-restarting affected modules
+   without a full reboot.
 
 ```bash
 # Layer A (owns the wheels)
@@ -324,8 +329,8 @@ more. Off-robot steering behaviour can also be inspected with
 ```
 safety/                 Layer A — the hardcoded safety daemon (owns the wheels)
 layer_b/
-  orchestrator.py       Layer B supervisor: subprocess per module, hot reload
-  module_registry.json  Which modules run (name → entrypoint → enabled)
+  orchestrator.py       Need-driven supervisor: state/demand lifecycle + hot reload
+  module_registry.json  Module catalog (entrypoint + activation policy)
   broker_client.py      The MQTT Bus wrapper every module uses (+ heartbeat)
   config.json           All tunables, at their defaults
   robot_config.py       env > config.json > default resolution
