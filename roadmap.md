@@ -2,7 +2,7 @@
 
 Generated: 2026-07-26
 Repository: <https://github.com/lucascosolo/picarx>
-Baseline: `master` at `3f33224`
+Baseline: `master` at `1ebd6a8`
 
 This is the single source of truth for planned work and delivered roadmap
 features. The previous `ROADMAP_STATUS.md` build log has been folded into the
