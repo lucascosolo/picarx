@@ -83,6 +83,14 @@ class GestureTrackingTests(unittest.TestCase):
         self.assertEqual(look["action"], {"direction": "look", "pan": 0.0, "tilt": 0.0})
         self.assertEqual(tracker.controller.pose(), (0.0, 0.0))
 
+    def test_enabled_tracker_renews_lease_when_preempted(self):
+        tracker = GestureTracker()
+        tracker.enabled = True
+        tracker.on_state({"state": "SPEAKING"})
+        claim = tracker.bus.last("picarx/state/claim")
+        self.assertEqual(claim["owner"], "gesture_tracking")
+        self.assertEqual(claim["state"], "GESTURE_TRACKING")
+
     def test_model_import_failure_reports_missing_dependency(self):
         tracker = GestureTracker()
         original_import = __import__

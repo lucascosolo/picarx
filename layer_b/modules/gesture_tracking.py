@@ -338,6 +338,14 @@ class GestureTracker:
 
     def on_state(self, payload):
         self.state = str(payload.get("state") or "IDLE")
+        # Speech/RC/safety can temporarily outrank gesture tracking.  Keep
+        # our lease alive while preempted so RobotState hands the resource
+        # back as soon as the higher-priority owner releases it.  Without
+        # this, the initial TTS confirmation can let the 1.5s gesture lease
+        # expire, leaving the module stuck in IDLE with the camera held by a
+        # different process.
+        if self.enabled and self.state != STATE_NAME:
+            self._claim()
 
     def _capture_loop(self):
         lease = None
