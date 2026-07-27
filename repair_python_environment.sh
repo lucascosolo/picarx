@@ -1,26 +1,64 @@
 #!/usr/bin/env bash
-# Consolidate the project's Python dependencies into the system interpreter
-# used by systemd. Only this project's allow-listed distributions are touched;
-# unrelated system/user packages are left alone.
+# Install this project's Python dependencies in a dedicated virtual
+# environment.  Debian and Raspberry Pi OS mark their system interpreter as
+# externally managed (PEP 668), so installing these distributions into it is
+# both unnecessary and unsafe.
 set -euo pipefail
 
+# The virtual environment and its packages are root-owned by default because
+# the target processes are system services.  Both locations can be changed by
+# the caller when a service uses a different layout.
 if [[ "$(id -u)" -ne 0 ]]; then
-    exec sudo "$0" "$@"
+    # sudo commonly removes arbitrary environment variables.  Preserve the
+    # two settings that affect where and how the environment is built.
+    exec sudo env \
+        "PYTHON=${PYTHON-}" \
+        "PICARX_VENV=${PICARX_VENV-}" \
+        "$0" "$@"
 fi
 
 if [[ -n "${PYTHON:-}" ]]; then
-    PYTHON="$PYTHON"
+    if [[ "$PYTHON" == */* ]]; then
+        BASE_PYTHON="$PYTHON"
+    else
+        BASE_PYTHON="$(command -v "$PYTHON" || true)"
+    fi
 elif [[ -x /usr/bin/python3 ]]; then
-    PYTHON=/usr/bin/python3
+    BASE_PYTHON=/usr/bin/python3
 else
-    PYTHON="$(command -v python3)"
+    BASE_PYTHON="$(command -v python3 || true)"
 fi
-if [[ ! -x "$PYTHON" ]]; then
-    echo "Python interpreter not found: $PYTHON" >&2
+if [[ -z "$BASE_PYTHON" || ! -x "$BASE_PYTHON" ]]; then
+    echo "Python interpreter not found: ${PYTHON:-python3}" >&2
     exit 1
 fi
-if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
-    echo "pip is not available for $PYTHON" >&2
+
+VENV="${PICARX_VENV:-/opt/picarx/venv}"
+if [[ "$VENV" != /* ]]; then
+    echo "PICARX_VENV must be an absolute path: $VENV" >&2
+    exit 1
+fi
+VENV_PYTHON="$VENV/bin/python"
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    echo "Creating Python virtual environment: $VENV"
+    mkdir -p "$(dirname "$VENV")"
+    if ! "$BASE_PYTHON" -m venv "$VENV"; then
+        cat >&2 <<EOF
+Could not create $VENV.
+Install the venv support for the selected interpreter and run this script
+again (on Debian/Raspberry Pi OS this is usually: apt install python3-venv).
+EOF
+        exit 1
+    fi
+fi
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    echo "Virtual environment is missing its Python executable: $VENV_PYTHON" >&2
+    exit 1
+fi
+if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+    echo "pip is not available in $VENV; recreate it with python3-venv." >&2
     exit 1
 fi
 
@@ -51,8 +89,8 @@ add_user() {
     users+=("$candidate")
 }
 
-# A systemd service runs as root only when its unit has no User= setting.
-# Inspect both units instead of assuming that is true.
+# Discover the accounts used by the services so that the final import check
+# also verifies that those accounts can read the root-owned environment.
 for unit in picarx-safety.service picarx-orchestrator.service; do
     if command -v systemctl >/dev/null 2>&1 && systemctl cat "$unit" >/dev/null 2>&1; then
         service_user="$(systemctl show "$unit" -p User --value 2>/dev/null || true)"
@@ -72,76 +110,58 @@ as_user() {
     fi
 }
 
-echo "Canonical interpreter: $PYTHON"
-echo "Removing only project dependency copies from user site-packages..."
-for user in "${users[@]}"; do
-    user_site="$(as_user "$user" "$PYTHON" -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)"
-    [[ -n "$user_site" ]] || continue
-    for dependency in "${dependencies[@]}"; do
-        import_name="${dependency%%|*}"
-        package_name="${dependency##*|}"
-        origin="$(as_user "$user" env -u PYTHONNOUSERSITE "$PYTHON" -c \
-            "import importlib.util; s=importlib.util.find_spec('$import_name'); print(getattr(s, 'origin', '') if s else '')" \
-            2>/dev/null || true)"
-        if [[ "$origin" == "$user_site"/* ]]; then
-            echo "remove: $package_name from $user user site ($origin)"
-            as_user "$user" "$PYTHON" -m pip uninstall -y "$package_name" >/dev/null
-        fi
-    done
-done
-
-echo "Installing/upgrading the allow-listed dependencies for $PYTHON..."
+venv_site="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
+echo "Base interpreter: $BASE_PYTHON"
+echo "Installing allow-listed dependencies in: $VENV"
 for dependency in "${dependencies[@]}"; do
     package_name="${dependency##*|}"
-    "$PYTHON" -m pip install --upgrade --break-system-packages "$package_name"
+    "$VENV_PYTHON" -m pip install --upgrade "$package_name"
 done
 
-# Normalize ownership only for the distributions just installed, and only
-# under standard system Python locations. Never recursively chown arbitrary
-# paths returned by a package or anything in a user's home directory.
-for dependency in "${dependencies[@]}"; do
-    package_name="${dependency##*|}"
-    package_root="$("$PYTHON" -c \
-        "import importlib.metadata as m; print(m.distribution('$package_name').locate_file(''))" \
-        2>/dev/null || true)"
-    package_root="$(realpath -m "$package_root" 2>/dev/null || true)"
-    case "$package_root" in
-        /usr/lib/python*/*|/usr/local/lib/python*/*)
-            chown -R root:root "$package_root"
-            chmod -R a+rX "$package_root"
-            ;;
-        "")
-            echo "warning: could not locate installed files for $package_name" >&2
-            ;;
-        *)
-            echo "warning: refusing to change ownership outside system Python: $package_root" >&2
-            ;;
-    esac
-done
+# Keep the venv readable by service accounts without changing anything in a
+# user's home directory or in the system Python installation.
+chown -R root:root "$VENV"
+chmod -R a+rX "$VENV"
 
-# Prevent future ~/.local package shadowing for the two services. This does
-# not force either service to run as root; it makes both use the canonical
-# system installation selected above.
+# Existing units may invoke /usr/bin/python3 with an absolute ExecStart.  A
+# systemd drop-in cannot replace that command through PATH alone, so expose
+# the venv's site-packages explicitly as well as putting its bin directory
+# first for subprocesses and bare `python`/`pip` commands.
 if command -v systemctl >/dev/null 2>&1; then
+    changed_units=0
     for unit in picarx-safety.service picarx-orchestrator.service; do
         if systemctl cat "$unit" >/dev/null 2>&1; then
             dropin="/etc/systemd/system/${unit}.d"
             mkdir -p "$dropin"
-            printf '%s\n' '[Service]' 'Environment=PYTHONNOUSERSITE=1' \
-                > "$dropin/python-environment.conf"
+            {
+                printf '%s\n' '[Service]'
+                printf 'Environment=VIRTUAL_ENV=%s\n' "$VENV"
+                printf 'Environment=PATH=%s/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n' "$VENV"
+                printf 'Environment=PYTHONPATH=%s\n' "$venv_site"
+                printf '%s\n' 'Environment=PYTHONNOUSERSITE=1'
+            } > "$dropin/picarx-python-environment.conf"
+            changed_units=1
         fi
     done
-    systemctl daemon-reload
+    if [[ "$changed_units" -eq 1 ]]; then
+        if ! systemctl daemon-reload; then
+            echo "warning: systemd daemon-reload failed; reload it before restarting the services." >&2
+        fi
+    fi
 fi
 
-echo "Validating imports with user-site packages disabled..."
+echo "Validating imports with the service environment..."
 for user in "${users[@]}"; do
     for dependency in "${dependencies[@]}"; do
         import_name="${dependency%%|*}"
-        as_user "$user" env PYTHONNOUSERSITE=1 "$PYTHON" -c \
-            "import $import_name" >/dev/null
+        as_user "$user" env \
+            VIRTUAL_ENV="$VENV" \
+            PATH="$VENV/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            PYTHONPATH="$venv_site" \
+            PYTHONNOUSERSITE=1 \
+            "$BASE_PYTHON" -c "import $import_name" >/dev/null
     done
     echo "validated: $user"
 done
 
-echo "Done. Restart picarx-safety and picarx-orchestrator to apply the systemd environment guard."
+echo "Done. Restart picarx-safety and picarx-orchestrator to apply the Python environment."

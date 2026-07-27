@@ -308,13 +308,12 @@ so the interesting behaviour is unit-testable without a robot.
 python3 -m unittest discover -s tests
 ```
 
-If packages have been installed under both the system and a user's
-`~/.local` Python tree, run `sudo ./repair_python_environment.sh`. It
-consolidates this project's allow-listed dependencies into `/usr/bin/python3`,
-removes only user-site copies that would shadow them, normalizes their
-ownership, and configures the two systemd services with
-`PYTHONNOUSERSITE=1`. Set `PYTHON=/path/to/python` when the service uses a
-different interpreter.
+If packages have been installed under incompatible Python locations, run
+`sudo ./repair_python_environment.sh`. It creates `/opt/picarx/venv`, installs
+the project's allow-listed PyPI dependencies there without modifying the
+PEP-668-managed system interpreter, and configures the two systemd services to
+see that environment. Set `PYTHON=/path/to/python` to choose the base
+interpreter or `PICARX_VENV=/path/to/venv` to choose another environment path.
 
 The suite is ~500 fast, deterministic tests (`tests/`, sharing
 [`tests/harness.py`](tests/harness.py)) covering perception logic, the safety
