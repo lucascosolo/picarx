@@ -68,9 +68,11 @@ FOLLOW_STEER_RATE = 90.0   # deg/s
 STEER_SEND_DEADBAND = 1.0  # min commanded change (deg) worth a steer tick
 DT_MIN, DT_MAX = 0.02, 0.5 # clamp on measured tick spacing
 STOP_AREA_RATIO = 0.35     # person's box fills this much of the frame -> close enough, stop
-FRESH_TARGET_SEC = 1.2     # a detection older than this is stale (SSD updates ~every 1.5s)
-LOST_HOLD_SEC = 2.0        # target stale this long -> hold still (stop)
+FRESH_TARGET_SEC = 2.5     # tolerate a throttled SSD pass plus MQTT/CPU jitter
+LOST_HOLD_SEC = 3.0        # target stale this long -> hold still (stop)
 LOST_GIVEUP_SEC = 15.0     # ...this long -> give up and switch follow off
+REACQUIRE_INTERVAL_SEC = 1.0
+REACQUIRE_PANS = (-25, 0, 25)
 
 
 def steer_angle(offset, frame_width):
@@ -95,7 +97,7 @@ def pick_person(objects_payload):
     """Largest 'person' box in a vision objects payload, or None."""
     best = None
     for item in (objects_payload or {}).get("objects", []):
-        if item.get("label") != "person":
+        if str(item.get("label") or "").lower() not in ("person", "human", "people"):
             continue
         if best is None or item.get("area_ratio", 0) > best.get("area_ratio", 0):
             best = item
@@ -124,6 +126,8 @@ class FollowDaemon:
         self._pending_straighten = False
         self._steered_last_tick = False
         self._last_tick_ts = None
+        self._last_reacquire_at = 0.0
+        self._reacquire_index = 0
 
     # ---------- inbound ----------
 
@@ -137,6 +141,8 @@ class FollowDaemon:
             self._pending_straighten = want
             self._steered_last_tick = False
             self._last_tick_ts = None
+            self._last_reacquire_at = 0.0
+            self._reacquire_index = 0
             if want and not was:
                 # Fresh start: forget sightings from before this session (a
                 # person box from an hour ago must not count as "just lost")
@@ -166,20 +172,35 @@ class FollowDaemon:
         person = pick_person(payload)
         if person is None:
             return
+        # vision_basic republishes a cached object payload between detector
+        # passes. Prefer the producer's detection timestamp when present so a
+        # healthy MQTT stream cannot make a genuinely old person box look
+        # fresh forever; old payloads without that field retain the legacy
+        # callback-time behavior.
+        observed_at = payload.get("objects_updated_at")
+        try:
+            observed_at = float(observed_at) if observed_at is not None else time.time()
+        except (TypeError, ValueError):
+            observed_at = time.time()
         with self.lock:
             self.person = (person.get("center_offset", 0),
                            person.get("frame_width"),
                            person.get("area_ratio"),
-                           time.time())
+                           observed_at)
 
     def on_faces(self, payload):
         if not payload.get("detected"):
             return
+        observed_at = payload.get("updated_at")
+        try:
+            observed_at = float(observed_at) if observed_at is not None else time.time()
+        except (TypeError, ValueError):
+            observed_at = time.time()
         with self.lock:
             self.face = (payload.get("frame_center_offset", 0),
                          payload.get("frame_width"),
                          None,                      # a face gives no distance proxy
-                         time.time())
+                         observed_at)
 
     def on_heard(self, payload):
         # Literal spoken kill switch - never depends on the LLM. Matches the
@@ -286,9 +307,29 @@ class FollowDaemon:
             return
         # Briefly lost: hold still and wait to reacquire.
         self._publish_intent({"direction": "stop"})
+        self._reacquire_head(now)
         if gone_for >= LOST_HOLD_SEC and not self.lost_announced:
             self.lost_announced = True
             self.bus.publish(SPEAK_TOPIC, {"text": "Where did you go?", "ts": now})
+
+    def _reacquire_head(self, now):
+        """Sweep the camera while stationary instead of waiting forever on a
+        stale center crop.
+
+        This is deliberately a head-only action: the follow daemon never
+        drives while it has no fresh target. The sweep is slow enough not to
+        fight normal tracking and uses the same look channel as every other
+        head behavior.
+        """
+        if now - self._last_reacquire_at < REACQUIRE_INTERVAL_SEC:
+            return
+        self._last_reacquire_at = now
+        pan = REACQUIRE_PANS[self._reacquire_index % len(REACQUIRE_PANS)]
+        self._reacquire_index += 1
+        self.bus.publish("picarx/intent/look", {
+            "source": SOURCE_NAME,
+            "action": {"direction": "look", "pan": pan, "tilt": 0},
+            "ts": now})
 
     # ---------- main loop ----------
 

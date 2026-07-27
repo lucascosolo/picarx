@@ -128,6 +128,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 import label_memory
+from perception_feedback import PerceptionFeedbackStore
 from picamera2 import Picamera2
 import base64
 import cv2
@@ -324,6 +325,10 @@ TRAINING_LOOP_INTERVAL = 1.0                # slow the capture loop while traini
 STREAM_FRAME_TOPIC = "picarx/vision/frame"
 STREAM_MIN_INTERVAL = 0.2       # cap publish rate (~5 fps ceiling; loop tick bounds it lower)
 STREAM_JPEG_QUALITY = 60        # small over MQTT/base64; a debug view doesn't need more
+ROBOT_STATE_TOPIC = "picarx/state/current"
+STATE_CLAIM_TOPIC = "picarx/state/claim"
+STATE_RELEASE_TOPIC = "picarx/state/release"
+VISION_STATE_OWNER = "vision_basic"
 
 MODEL_DIR = robot_config.base_path("modules", "models", "mobilenet_ssd")
 SSD_PROTOTXT = f"{MODEL_DIR}/deploy.prototxt"
@@ -629,11 +634,53 @@ class CentroidTracker:
 
 def run():
     bus = Bus()
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"format": "RGB888", "size": CAPTURE_SIZE})
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(1)
+    picam2 = None
+    # Subscribe before opening Picamera2 so a retained/current state or a
+    # fast gesture claim can prevent a competing camera owner from starting.
+    robot_state = {"state": "IDLE"}
+    object_state_claimed = False
+    def on_robot_state(payload):
+        robot_state["state"] = str(payload.get("state") or "IDLE")
+    bus.subscribe(ROBOT_STATE_TOPIC, on_robot_state)
+
+    def claim_object_state():
+        nonlocal object_state_claimed
+        if not object_state_claimed:
+            bus.publish(STATE_CLAIM_TOPIC, {
+                "owner": VISION_STATE_OWNER, "state": "OBJECT_DETECTION",
+                "ttl": 1.5, "reason": "vision detector active", "ts": time.time()})
+            object_state_claimed = True
+
+    def release_object_state():
+        nonlocal object_state_claimed
+        if object_state_claimed:
+            bus.publish(STATE_RELEASE_TOPIC, {
+                "owner": VISION_STATE_OWNER, "ts": time.time()})
+            object_state_claimed = False
+
+    def open_camera():
+        camera = Picamera2()
+        config = camera.create_preview_configuration(
+            main={"format": "RGB888", "size": CAPTURE_SIZE})
+        camera.configure(config)
+        camera.start()
+        time.sleep(1)
+        return camera
+
+    def close_camera(camera):
+        if camera is None:
+            return
+        for method in ("stop", "close"):
+            try:
+                getattr(camera, method)()
+            except Exception:
+                pass
+
+    try:
+        picam2 = open_camera()
+    except Exception as e:
+        print(f"vision: camera failed to start ({e})")
+        return
 
     face_cascade = cv2.CascadeClassifier(
         robot_config.base_path("modules", "cascades", "cascades.xml")
@@ -673,6 +720,11 @@ def run():
         print(f"vision: self-training mode {'ON - throttling detection' if training['active'] else 'off'}")
     bus.subscribe(TRAINING_TOPIC, on_training)
 
+    # Camera ownership is exclusive with gesture_tracking.py.  When the
+    # state manager grants GESTURE_TRACKING, release Picamera2 completely so
+    # the gesture capture thread can open it; reacquire it after the state
+    # returns. During SPEAKING we keep the device open but deliberately drop
+    # frames so TTS gets the CPU and no stale camera queue can build.
     # On-board label memory (recognition tier 2): visual signatures of tracked
     # objects, cached by track id on each detection pass, plus the persistent
     # signature->label store a human/LLM teaches. A label arriving on
@@ -682,6 +734,13 @@ def run():
     # phone the cloud. All fail-soft - any error here degrades to plain
     # detector labels and never disturbs the real-time loop.
     memory = label_memory.LabelMemory()
+    feedback = PerceptionFeedbackStore(
+        robot_config.data_path("perception_feedback"),
+        encoder=lambda image: cv2.imencode(
+            ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82]))
+    # Keep the most recent complete frame briefly so a human correction can
+    # become a detector-training example, not only a signature-memory update.
+    feedback_frame = {"frame": None, "ts": 0.0}
     sig_cache = {}   # track id -> (signature, last_seen_ts)
     def on_label(payload):
         oid = payload.get("object_id")
@@ -691,15 +750,28 @@ def run():
         entry = sig_cache.get(oid)
         if entry is None:
             print(f"vision: label '{correct}' for {oid} but its signature has aged out")
-            return
         source = {"web": "user", "voice": "user", "llm": "llm",
                   "coach": "coach"}.get(payload.get("origin"), "user")
-        try:
-            if memory.remember(entry[0], correct, source):
-                print(f"vision: learned '{correct}' by sight "
-                      f"(source {source}, {len(memory)} memories)")
-        except Exception as e:
-            print(f"vision: failed to remember '{correct}': {e}")
+        if entry is not None:
+            try:
+                if memory.remember(entry[0], correct, source):
+                    print(f"vision: learned '{correct}' by sight "
+                          f"(source {source}, {len(memory)} memories)")
+            except Exception as e:
+                print(f"vision: failed to remember '{correct}': {e}")
+        # The signature memory above is an on-device overlay; it does NOT
+        # retrain detector weights. Also retain a bounded full-frame example
+        # with the corrected bbox so an offline detector-training job can use
+        # real human labels later.
+        track = tracker.tracks.get(str(oid))
+        frame = feedback_frame.get("frame")
+        frame_age = time.time() - float(feedback_frame.get("ts") or 0.0)
+        if track is not None and frame is not None and frame_age <= 5.0:
+            sample = feedback.record(frame, track.get("bbox"), correct, source,
+                                     observed_at=track.get("last_seen"))
+            if sample:
+                print(f"vision: saved detector-training example {sample['sample_id']} "
+                      f"for '{correct}'")
     bus.subscribe(LABEL_TOPIC, on_label)
 
     print(f"vision basic module running ({detector.name}, {len(memory)} label "
@@ -721,7 +793,32 @@ def run():
                            # republished on the intervening throttled ticks
 
     while True:
+        if robot_state["state"] == "GESTURE_TRACKING":
+            release_object_state()
+            if picam2 is not None:
+                close_camera(picam2)
+                picam2 = None
+                print("vision: released camera to gesture tracker")
+            time.sleep(0.05)
+            continue
+        claim_object_state()
+        if picam2 is None:
+            try:
+                picam2 = open_camera()
+                print("vision: reacquired camera after gesture mode")
+            except Exception as e:
+                print(f"vision: camera reacquire failed ({e})")
+                time.sleep(0.5)
+                continue
         frame = picam2.capture_array()
+        if robot_state["state"] == "SPEAKING":
+            # TTS owns the CPU/audio path. Capture is drained to avoid a
+            # hardware buffer backlog, but this frame is intentionally not
+            # decoded, tracked, encoded, or published.
+            time.sleep(DETECT_INTERVAL)
+            continue
+        feedback_frame["frame"] = frame
+        feedback_frame["ts"] = time.time()
         frame_h, frame_w = frame.shape[:2]
 
         # ---------- face detection (debounced; throttled in low power) ----------
@@ -756,6 +853,7 @@ def run():
                     "x": x, "y": y, "w": w, "h": h,
                     "frame_width": frame_w,
                     "frame_center_offset": (x + w // 2) - (frame_w // 2),
+                    "updated_at": face_now,
                 })
                 # Face crop for person_memory (throttled - see FACE_CROP_*).
                 crop_now = time.time()
@@ -775,7 +873,8 @@ def run():
                                 "ts": crop_now,
                             })
             else:
-                bus.publish("picarx/vision/faces", {"detected": False})
+                bus.publish("picarx/vision/faces", {"detected": False,
+                                                     "updated_at": face_now})
 
         # ---------- object detection (motion-gated + throttled) ----------
         now = time.time()
@@ -880,6 +979,12 @@ def run():
             "close_object": close_object,
             "overhead": overhead_object,   # None, or {"area_ratio","y_center_frac"}
             "scene_motion": scene_motion,
+            # Consumers such as follow_daemon must distinguish a fresh
+            # callback carrying a cached track from a genuinely new detector
+            # pass. This prevents a dead/slow person track from looking alive
+            # merely because the vision loop is still publishing.
+            "objects_updated_at": last_forced_detect if last_forced_detect else None,
+            "frame_ts": now,
         })
 
         # ---------- on-demand console stream (only while a viewer watches) ----------

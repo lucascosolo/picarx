@@ -122,6 +122,25 @@ class FollowDaemonBehaviourTest(unittest.TestCase):
         # Holds still while waiting to acquire, doesn't drive blind.
         self.assertEqual(self._intents()[-1]["action"], {"direction": "stop"})
 
+    def test_lost_target_reacquires_by_sweeping_head(self):
+        self.d.on_control({"enabled": True})
+        self.d.bus.clear()
+        self.d._tick(1000.0)
+        self.d._tick(1000.0 + fd.REACQUIRE_INTERVAL_SEC)
+        looks = self.d.bus.of("picarx/intent/look")
+        self.assertTrue(looks)
+        self.assertIn(looks[-1]["action"]["pan"], fd.REACQUIRE_PANS)
+
+    def test_producer_timestamp_expires_cached_person_track(self):
+        self.d.on_control({"enabled": True})
+        self.d.on_objects({
+            "objects": [{"label": "person", "area_ratio": 0.1,
+                          "center_offset": 0, "frame_width": 640}],
+            "objects_updated_at": 100.0,
+        })
+        self.d._tick(100.0 + fd.FRESH_TARGET_SEC + 0.1)
+        self.assertEqual(self._intents()[-1]["action"], {"direction": "stop"})
+
     def test_enable_clears_stale_sightings(self):
         # A person box from a previous session must not seed the new one.
         self.d.person = (0, 640, 0.1, 12345.0)
