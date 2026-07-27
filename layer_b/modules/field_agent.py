@@ -150,7 +150,7 @@ INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
 # radio synonyms AND escalates its own unparsed radio-ish utterances -
 # without them here both modules would escalate the same text twice.
 TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
-                 "music", "song")
+                 "music", "song", "ssh", "remote assist", "remote", "host")
 
 # Person identity (person_memory.py, optional): greet a recognized person
 # by name, but not every time their face is re-confirmed - once per

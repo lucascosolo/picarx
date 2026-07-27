@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiCarX · Tools</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>Resource state</h2>
+  <div class="stat"><span>Active mode</span><span id="robot-state">IDLE</span></div>
+</div>
+
+<div class="card">
+  <h2>Gesture head</h2>
+  <div class="hint">MediaPipe hand tracking owns the camera/head budget while
+    active. Speaking, RC, and safety stop preempt it.</div>
+  <div class="grid">
+    <button class="primary" onclick="setGesture(true)">Follow my hand</button>
+    <button class="danger" onclick="setGesture(false)">Stop hand tracking</button>
+  </div>
+  <div class="stat"><span>Gesture status</span><span id="gesture-status">off</span></div>
+  <div class="stat"><span>Head pose</span><span id="gesture-pose">–</span></div>
+</div>
+
+<div class="card">
+  <h2>Remote project helper</h2>
+  <div class="hint">The robot verifies SSH host keys, then streams its own helper
+    script to a private host temp path. No host installation or separate launch
+    is required.</div>
+  <div class="row"><input id="remote-host" placeholder="host IP or DNS name">
+    <input id="remote-user" placeholder="SSH user (optional)"></div>
+  <div class="row"><input id="remote-root" placeholder="project root, e.g. ~/src/project">
+    <button class="primary" onclick="remoteConnect()">Connect</button>
+    <button onclick="remoteCommand('disconnect')">Disconnect</button></div>
+  <div class="row"><input id="remote-path" placeholder="relative path, e.g. src/main.py">
+    <button onclick="remoteRead()">Read file</button>
+    <button onclick="remoteList()">List directory</button></div>
+  <div class="row"><input id="remote-search" placeholder="search pattern">
+    <button onclick="remoteSearch()">Search</button>
+    <button onclick="remoteCommand('status')">Status</button></div>
+  <div class="row"><input id="remote-command" placeholder="allowlisted test command">
+    <label><input type="checkbox" id="remote-confirm"> confirm remote command/write</label>
+    <button onclick="remoteRun()">Run</button></div>
+  <textarea id="remote-patch" rows="10" placeholder="unified git diff to preview or apply"></textarea>
+  <div class="row"><button onclick="remotePatch('preview_patch')">Preview patch</button>
+    <button class="danger" onclick="remotePatch('apply_patch')">Apply confirmed patch</button></div>
+  <div class="stat"><span>Remote status</span><span id="remote-status">not connected</span></div>
+  <pre id="remote-output" class="hint">No remote result yet.</pre>
+</div>
+
+<script src="/app.js"></script>
+<script>
+async function setGesture(enabled) {
+  await PX.post('/gesture', {enabled});
+  setTimeout(PX.poll, 150);
+}
+function remotePayload(command, extra) { return Object.assign({command}, extra || {}); }
+async function remoteCommand(command, extra) {
+  await PX.post('/remote', remotePayload(command, extra));
+  setTimeout(PX.poll, 200);
+}
+function remoteConnect() {
+  const host = document.getElementById('remote-host').value.trim();
+  if (!host) return;
+  remoteCommand('connect', {host,
+    user: document.getElementById('remote-user').value.trim() || undefined,
+    project_root: document.getElementById('remote-root').value.trim() || '.'});
+}
+function remoteRead() {
+  remoteCommand('read', {path: document.getElementById('remote-path').value.trim()});
+}
+function remoteList() {
+  remoteCommand('list', {path: document.getElementById('remote-path').value.trim() || '.'});
+}
+function remoteSearch() {
+  remoteCommand('search', {pattern: document.getElementById('remote-search').value.trim()});
+}
+function remoteRun() {
+  remoteCommand('run', {command: document.getElementById('remote-command').value.trim(),
+    confirmed: document.getElementById('remote-confirm').checked});
+}
+function remotePatch(command) {
+  const patch = document.getElementById('remote-patch').value;
+  remoteCommand(command, {patch, confirmed: document.getElementById('remote-confirm').checked});
+}
+PX.onPoll(s => {
+  const mode = s.robot_state || {};
+  document.getElementById('robot-state').textContent = mode.state || 'IDLE';
+  const g = s.gesture || {};
+  document.getElementById('gesture-status').textContent = g.state || 'off';
+  document.getElementById('gesture-pose').textContent =
+    (g.pan != null && g.tilt != null) ? `${g.pan}° pan / ${g.tilt}° tilt` : '–';
+  const r = s.remote || {};
+  document.getElementById('remote-status').textContent = r.target
+    ? `connected to ${r.target.host || 'host'}` : (r.error || 'not connected');
+  if (Object.keys(r).length)
+    document.getElementById('remote-output').textContent = JSON.stringify(r, null, 2);
+});
+PX.startPolling(2000);
+</script>
+</body>
+</html>

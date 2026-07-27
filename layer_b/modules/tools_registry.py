@@ -34,6 +34,8 @@ import speech_match
 import re
 import time
 
+REMOTE_TOPIC = "picarx/tools/remote_assist"
+
 # ---------- spoken-number → dial string ----------
 # Vosk transcribes a frequency as WORDS ("ninety eight point seven",
 # "one oh two point five"), sometimes as digits ("98.7"). This turns
@@ -124,10 +126,41 @@ def _find_payload(m, text):
     return {"command": "find", "keywords": " ".join(words)}
 
 
+def _remote_payload(m, text):
+    # Keep extraction deliberately narrow. Hostnames/IPs are validated again
+    # by remote_assist.py; this only prevents ordinary navigation phrases such
+    # as "connect to the kitchen" from becoming network requests.
+    host = None
+    if m:
+        for i in range(1, (len(m.groups()) if m.lastindex else 0) + 1):
+            if m.group(i):
+                host = m.group(i).strip().rstrip(".,")
+                break
+    if not host:
+        return None
+    # speech_match.canonicalize() separates punctuation in IPv4 addresses
+    # ("192.168.1.20" -> "192 168 1 20"). Put the four octets back together
+    # before the remote module performs its own strict validation.
+    if re.fullmatch(r"\d{1,3}(?:\s+\d{1,3}){3}", host):
+        host = ".".join(host.split())
+    return {"command": "connect", "host": host}
+
+
 # Patterns run against speech_match.canonicalize()d text ("play the
 # radio for me please" arrives here as "play radio"), so they only need
 # to cover meaningful word variants, not filler permutations.
 RULES = [
+    # Remote project assistance. Require ssh/remote/host/computer wording or
+    # an unmistakable "ssh into" phrase so this never captures a place goal.
+    (re.compile(r"\b(?:ssh\s+(?:into\s+)?|(?:remote|host|computer)\s+)"
+                r"((?:\d{1,3}(?:[ .]\d{1,3}){3})|[a-z][a-z0-9.-]{1,62})\b|"
+                r"\bconnect\s+to\s+((?:\d{1,3}(?:[ .]\d{1,3}){3})|"
+                r"[a-z0-9-]+\.[a-z0-9.-]+)\b"),
+     REMOTE_TOPIC,
+     _remote_payload),
+    (re.compile(r"\b(?:disconnect|close)\b.*\b(?:ssh|remote|host|computer)\b|"
+                r"\bstop\s+remote\s+assist\b"),
+     REMOTE_TOPIC, lambda m, t: {"command": "disconnect"}),
     (re.compile(r"\b(?:stop|pause|turn off|shut off|kill)\b.*\b(?:radio|music)\b|"
                 r"\b(?:radio|music) off\b"),
      "picarx/tools/radio", lambda m, t: {"command": "stop"}),
@@ -165,6 +198,9 @@ RULES = [
 ]
 
 TOOL_DESCRIPTIONS = [
+    {"name": "remote_assist", "topic": REMOTE_TOPIC,
+     "say": "ssh into <host> / disconnect remote assist",
+     "description": "connects to a provisioned host helper over verified SSH so I can inspect a project, preview approved patches, and run bounded debugging commands"},
     {"name": "radio", "topic": "picarx/tools/radio",
      "say": "play radio / stop radio / next station / station <name> / "
             "tune to <number> / radio find <genre or name> / "

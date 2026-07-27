@@ -13,6 +13,7 @@ top nav, a common stylesheet (web_ui/app.css) and helper script (web_ui/app.js):
   /people    People      - face enrolment, following, places & navigation
   /audio     Audio+Radio - mic/speaker kill-switches, internet radio
   /config    Config      - every config.json knob, editable in the browser
+  /tools     Tools       - gesture mode and remote project helper
 
 One design rule keeps most of this honest: the console does NOT get its own
 command paths. Almost every button and text box submits a phrase to POST /say,
@@ -28,7 +29,7 @@ browser is actually fetching /camera.jpg (with an idle watchdog), so the camera
 costs nothing unless someone is on the Drive page watching it.
 
 HTTP endpoints (JSON unless noted):
-  GET  /,/drive,/training,/people,/audio,/config   the pages (HTML)
+  GET  /,/drive,/training,/people,/audio,/config,/tools   the pages (HTML)
   GET  /app.css /app.js                            shared static assets
   GET  /state         status cache + speak/heard log + places/people
   GET  /boxes         camera-overlay boxes for the current frame
@@ -36,7 +37,7 @@ HTTP endpoints (JSON unless noted):
   GET  /camera.jpg    latest JPEG frame (also arms the stream)
   GET  /facts[?q=]    recent (or searched) semantic-memory facts
   GET  /config/data   the full config tree + per-knob help + env note
-  POST /say /mic /speaker /feedback /label /rc /rc/drive /camera   (as before)
+  POST /say /mic /speaker /feedback /label /rc /rc/drive /camera /gesture /remote
   POST /config/save   {"config": {section: {key: value}}} -> config.json
 
 Serves plain HTTP on the LAN with no authentication - anyone on your network
@@ -81,6 +82,7 @@ PAGES = {
     "/people": "people.html",
     "/audio": "audio.html",
     "/config": "config.html",
+    "/tools": "tools.html",
 }
 # Shared static assets, whitelisted (never serve an arbitrary path from disk).
 ASSETS = {
@@ -136,6 +138,9 @@ class ConsoleState:
         self.goal = {}
         self.world = {}
         self.follow = {}
+        self.robot_state = {}
+        self.gesture = {}
+        self.remote = {}
         self.log = deque(maxlen=LOG_LINES)
         # Most recent user text ("you" or "heard") - each robot log line
         # records it as "re", so the check/X feedback buttons know which
@@ -227,6 +232,9 @@ class ConsoleState:
                 "sees": seen,
                 "person": person.get("name") if not person.get("stale", True) else None,
                 "follow": bool(self.follow.get("enabled")),
+                "robot_state": self.robot_state,
+                "gesture": self.gesture,
+                "remote": self.remote,
                 "log": list(self.log),
             }
 
@@ -305,6 +313,12 @@ class RcController:
             self._publish({"direction": "turn", "angle": 0})
             self._publish({"direction": "stop"})
             self.bus.publish("picarx/intent/cancel", {"source": RC_SOURCE})
+            self.bus.publish("picarx/state/release", {"owner": "web_console_rc",
+                                                        "ts": now})
+        else:
+            self.bus.publish("picarx/state/claim", {
+                "owner": "web_console_rc", "state": "RC", "ttl": 2.0,
+                "reason": "manual RC mode", "ts": now})
         self.bus.publish(RC_MODE_TOPIC, {"active": enabled, "ts": now})
         print(f"Web console: RC mode {'ON - manual driving' if enabled else 'off'}")
 
@@ -339,6 +353,9 @@ class RcController:
                 print("Web console: RC dead-man - client went quiet, stopping")
                 return {"direction": "stop"}
             f, t, last_update = self.f, self.t, self.last_update
+        self.bus.publish("picarx/state/claim", {
+            "owner": "web_console_rc", "state": "RC", "ttl": 2.0,
+            "reason": "manual RC mode", "ts": now})
         if now - last_update > RC_MODE_TIMEOUT_SEC:
             print("Web console: RC client gone - leaving RC mode")
             self.set_mode(False, now)
@@ -611,6 +628,27 @@ class Handler(BaseHTTPRequestHandler):
             if STATE.set_stream(enabled):
                 BUS.publish(VISION_STREAM_CONTROL, {"enabled": enabled})
             self._send(200, {"ok": True})
+        elif self.path == "/gesture":
+            BUS.publish("picarx/gesture/control", {
+                "enabled": bool(body.get("enabled", False)), "source": "web",
+                "ts": time.time()})
+            self._send(200, {"ok": True})
+        elif self.path == "/remote":
+            command = str(body.get("command") or "").lower()
+            allowed = {"connect", "disconnect", "status", "list", "read", "search",
+                       "stat", "preview_patch", "apply_patch", "run"}
+            if command not in allowed:
+                self._send(400, {"error": "unsupported remote command"})
+                return
+            # Keep this endpoint a typed control surface, not arbitrary MQTT
+            # forwarding. The remote module still validates all paths,
+            # commands, hosts, and write confirmation.
+            fields = {"command", "host", "user", "port", "project_root", "path",
+                      "pattern", "ignore_case", "start_line", "end_line", "cwd",
+                      "argv", "patch", "timeout_sec", "confirmed"}
+            request = {k: v for k, v in body.items() if k in fields}
+            BUS.publish("picarx/tools/remote_assist", request)
+            self._send(200, {"ok": True})
         elif self.path == "/config/save":
             # Persist edited knobs to config.json (merged, so untouched keys and
             # the _readme survive). Announce the change for any future live
@@ -691,6 +729,18 @@ def on_follow_state(p):
     with STATE.lock:
         STATE.follow = p
 
+def on_robot_state(p):
+    with STATE.lock:
+        STATE.robot_state = p
+
+def on_gesture_status(p):
+    with STATE.lock:
+        STATE.gesture = p
+
+def on_remote_result(p):
+    with STATE.lock:
+        STATE.remote = p
+
 def on_vision_frame(p):
     b64 = p.get("jpeg")
     if not b64:
@@ -726,6 +776,9 @@ def main():
     BUS.subscribe("picarx/exploration/location_change", on_location)
     BUS.subscribe("picarx/exploration/active_goal", on_goal)
     BUS.subscribe("picarx/tools/follow/state", on_follow_state)
+    BUS.subscribe("picarx/state/current", on_robot_state)
+    BUS.subscribe("picarx/gesture/status", on_gesture_status)
+    BUS.subscribe("picarx/tools/remote_assist/result", on_remote_result)
     BUS.subscribe(VISION_FRAME_TOPIC, on_vision_frame)
 
     try:

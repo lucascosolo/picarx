@@ -60,5 +60,18 @@ class TuneRuleScopeTest(unittest.TestCase):
         self.assertEqual(self._route("count to 10"), [])
 
 
+class RemoteRuleTest(unittest.TestCase):
+    def test_ssh_ip_routes_to_remote_assist(self):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": "ssh into 192.168.1.20"})
+        self.assertEqual(registry.bus.last("picarx/tools/remote_assist"),
+                         {"command": "connect", "host": "192.168.1.20"})
+
+    def test_place_connection_does_not_route(self):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": "connect to the kitchen"})
+        self.assertIsNone(registry.bus.last("picarx/tools/remote_assist"))
+
+
 if __name__ == "__main__":
     unittest.main()

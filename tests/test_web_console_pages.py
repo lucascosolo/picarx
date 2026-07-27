@@ -142,8 +142,17 @@ class RouteTableTest(unittest.TestCase):
                             f"{fname} referenced by a route but missing on disk")
 
     def test_core_pages_are_routed(self):
-        for path in ("/", "/drive", "/training", "/people", "/audio", "/config"):
+        for path in ("/", "/drive", "/training", "/people", "/audio", "/tools", "/config"):
             self.assertIn(path, web_console.PAGES)
+
+    def test_tools_page_exposes_feature_commands(self):
+        with open(os.path.join(harness.LAYER_B, "web_ui", "tools.html"),
+                  encoding="utf-8") as stream:
+            page = stream.read()
+        for marker in ("setGesture(true)", "remoteConnect()", "remoteRead()",
+                       "remotePatch('preview_patch')", "remotePatch('apply_patch')",
+                       "remoteRun()", "remote-confirm"):
+            self.assertIn(marker, page)
 
 
 if __name__ == "__main__":
