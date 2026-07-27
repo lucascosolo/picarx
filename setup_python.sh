@@ -34,11 +34,21 @@ dependencies=(
 for dependency in "${dependencies[@]}"; do
     import_name="${dependency%%|*}"
     package_name="${dependency##*|}"
-    if "$PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('$import_name') else 1)"; then
+    if [[ "$import_name" == "cv2" ]]; then
+        # Importing cv2 alone is not enough: the vision module needs the DNN
+        # model loaders, which are absent from some minimal distro builds.
+        cv2_ok="$($PYTHON -c 'import cv2; d=getattr(cv2, "dnn", None); raise SystemExit(0 if d and (hasattr(d, "readNetFromCaffe") or hasattr(d, "readNet")) and (hasattr(d, "readNetFromDarknet") or hasattr(d, "readNet")) else 1' 2>/dev/null && echo yes || echo no)"
+    else
+        cv2_ok=yes
+    fi
+    if [[ "$import_name" != "cv2" ]] && ! "$PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('$import_name') else 1)"; then
+        cv2_ok=no
+    fi
+    if [[ "$cv2_ok" == yes ]]; then
         echo "skip: $package_name (import $import_name already works)"
     else
         echo "install: $package_name"
-        "$PYTHON" -m pip install --break-system-packages "$package_name"
+        "$PYTHON" -m pip install --upgrade --break-system-packages "$package_name"
     fi
 done
 

@@ -374,7 +374,17 @@ class CaffeSsdDetector:
     name = "MobileNet-SSD (Caffe, 20 VOC classes)"
 
     def __init__(self):
-        self.net = cv2.dnn.readNetFromCaffe(SSD_PROTOTXT, SSD_WEIGHTS)
+        loader = getattr(cv2.dnn, "readNetFromCaffe", None)
+        if loader is not None:
+            self.net = loader(SSD_PROTOTXT, SSD_WEIGHTS)
+            return
+        # Some distro builds expose only the generic DNN entry point. Keep
+        # the Caffe model usable there instead of assuming the convenience
+        # wrapper exists.
+        loader = getattr(cv2.dnn, "readNet", None)
+        if loader is None:
+            raise AttributeError("OpenCV DNN has neither readNetFromCaffe nor readNet")
+        self.net = loader(SSD_WEIGHTS, SSD_PROTOTXT, "Caffe")
 
     def detect(self, frame, frame_w, frame_h):
         # Resize first (cheap - CAPTURE_SIZE is already small), then let
@@ -431,7 +441,14 @@ class YoloTinyDetector:
     def __init__(self):
         with open(YOLO_NAMES) as f:
             self.classes = [line.strip() for line in f if line.strip()]
-        self.net = cv2.dnn.readNetFromDarknet(YOLO_CFG, YOLO_WEIGHTS)
+        loader = getattr(cv2.dnn, "readNetFromDarknet", None)
+        if loader is not None:
+            self.net = loader(YOLO_CFG, YOLO_WEIGHTS)
+        else:
+            loader = getattr(cv2.dnn, "readNet", None)
+            if loader is None:
+                raise AttributeError("OpenCV DNN has neither readNetFromDarknet nor readNet")
+            self.net = loader(YOLO_WEIGHTS, YOLO_CFG, "Darknet")
         self.out_names = self.net.getUnconnectedOutLayersNames()
         self.name = f"YOLOv4-tiny (Darknet, {len(self.classes)} COCO classes)"
 
@@ -496,7 +513,24 @@ def _make_detector():
     else:
         print("vision: COCO model not found (run layer_b/setup_coco_detector.sh "
               "for 80-class detection) - using the 20-class VOC model")
-    return CaffeSsdDetector()
+    try:
+        return CaffeSsdDetector()
+    except Exception as e:
+        # A stripped-down OpenCV build must not take the whole vision module
+        # down. Camera streaming, faces, and motion can still operate while
+        # object detection is unavailable.
+        print(f"vision: object detector unavailable ({e}); continuing without object detection")
+        return UnavailableDetector(str(e))
+
+
+class UnavailableDetector:
+    """No-op detector used when OpenCV lacks a model loader or weights."""
+
+    def __init__(self, reason):
+        self.name = f"object detection unavailable ({reason})"
+
+    def detect(self, frame, frame_w, frame_h):
+        return [], False, None
 
 
 def contested_label(label_counts):

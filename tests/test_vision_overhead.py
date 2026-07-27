@@ -44,6 +44,10 @@ class PickOverheadTest(unittest.TestCase):
         ])
         self.assertEqual(out["area_ratio"], 0.55)
 
+    def test_unavailable_detector_is_safe_noop(self):
+        detector = vb.UnavailableDetector("missing DNN loader")
+        self.assertEqual(detector.detect(None, 320, 240), ([], False, None))
+
 
 class EdgeTruncationTest(unittest.TestCase):
     """edge_truncation is pure geometry: which borders cut a box off, so
