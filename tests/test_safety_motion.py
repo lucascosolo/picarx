@@ -221,8 +221,14 @@ class CommandSafetyTest(unittest.TestCase):
             {"direction": "forward", "speed": 999})["speed"], 100.0)
         self.assertEqual(safety_daemon.normalize_action(
             {"direction": "turn", "angle": -999})["angle"], -30.0)
-        self.assertEqual(safety_daemon.normalize_action(
-            {"direction": "look", "pan": 999, "tilt": -999})["pan"], 80)
+        normalized = safety_daemon.normalize_action(
+            {"direction": "look", "pan": 999, "tilt": 999})
+        self.assertEqual(normalized["pan"], 75)
+        self.assertEqual(normalized["tilt"], 35)
+        normalized = safety_daemon.normalize_action(
+            {"direction": "look", "pan": -999, "tilt": -999})
+        self.assertEqual(normalized["pan"], -75)
+        self.assertEqual(normalized["tilt"], -35)
 
     def test_unknown_or_nonfinite_commands_are_rejected(self):
         with self.assertRaises(ValueError):

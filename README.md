@@ -117,7 +117,7 @@ separate channel so a glance never competes with driving.
 | **Attention & dialogue** | `dialog`, `attention` | One central turn-taking broker answers "is this utterance addressed to me, and is it the answer to my open question?" so a command, a web-console button, or one module's answer can't be swallowed by another. `attention.py` is the shared, pure model (wake-word / conversation-window / command-shape classification). |
 | **Interaction & personality** | `companion`, `curiosity`, `expressions` | Spoken conversation via Claude, now grounded in the robot's *own* recent experience so it speaks in the first person ("someone just picked me up", "I got stuck in the corner earlier"); questions about genuinely ambiguous sightings ("is that a chair or a speaker?"); and ambient personality — idle musings, curious head-tilts, greetings, notes-to-self, and an **affect layer** (decaying curiosity / frustration / satisfaction moods made legible as head gestures). |
 | **Observability** | `debug_monitor`, `heartbeat`, `behavior_metrics` | A unified per-module liveness heartbeat on one bus topic; an always-on `/proc`-based per-process CPU/telemetry log; and real-world collision/veto-rate instrumentation that (with the A/B experiment scaffolding) proves whether the self-training loop actually helps. |
-| **Practical tools** | `tools_registry`, `radio`, `reminder_daemon`, `follow_daemon`, `bluetooth_daemon`, `health_daemon`, `web_console` | A voice→topic command router, internet radio, reminders, person-following, Bluetooth, homeostatic low-power self-preservation, and a multi-page phone/laptop web console (dashboard, live camera + RC driving, object-training, people & places, audio/radio, and a browser-editable config page). |
+| **Practical tools** | `tools_registry`, `radio`, `reminder_daemon`, `follow_daemon`, `remote_assist`, `gesture_tracking`, `robot_state`, `bluetooth_daemon`, `health_daemon`, `web_console` | A voice→topic command router, internet radio, reminders, person-following, robot-owned SSH project assistance, bounded MediaPipe hand/head tracking, exclusive resource states, Bluetooth, homeostatic low-power self-preservation, and a multi-page phone/laptop web console (dashboard, live camera + RC driving, object-training, people & places, audio/radio, tools, and a browser-editable config page). |
 
 Two of these deserve a note because they define the robot's character:
 
@@ -139,8 +139,8 @@ Two of these deserve a note because they define the robot's character:
   flow to `picarx/memory/note`, which `reflection` — the sole writer to the
   memory database — persists.
 
-For the full history of how these capabilities were built, see
-[`ROADMAP_STATUS.md`](ROADMAP_STATUS.md).
+For the unified delivery plan and implementation status, see
+[`roadmap.md`](roadmap.md).
 
 ---
 
@@ -336,8 +336,8 @@ layer_b/
     curiosity.py     expressions.py  behavior_metrics.py  debug_monitor.py
     location_graph.py  explorer.py …
   web_ui/               the web console front-end (dashboard / drive / people /
-                        training / audio / config pages)
+                        training / audio / tools / config pages)
 tests/                  off-robot unittest suite + shared harness
 tools/                  developer tools (e.g. steering simulator)
-ROADMAP_STATUS.md       detailed build log of every capability
+roadmap.md              unified roadmap and implementation status
 ```

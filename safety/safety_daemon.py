@@ -488,11 +488,12 @@ def is_safe(action):
 
     return True, "ok"
 
-# Camera head servo limits - clamped here (the sole hardware gate)
-# so no upstream module can ever command the servos past their
-# physical range regardless of what arrives on the socket.
-CAM_PAN_RANGE = (-80, 80)
-CAM_TILT_RANGE = (-30, 60)
+# Camera head servo limits - clamped here (the sole hardware gate).  These are
+# the global mechanical safety envelope; individual behaviors may use a
+# narrower range. Gesture tracking intentionally stays inside pan +/-35 and
+# tilt +/-30 to reduce jitter and load while following a hand.
+CAM_PAN_RANGE = (-75, 75)
+CAM_TILT_RANGE = (-35, 35)
 
 
 def execute(action):

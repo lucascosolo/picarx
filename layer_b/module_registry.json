@@ -1,4 +1,7 @@
 [
+  {"name": "robot_state", "version": "0.1", "entrypoint": "robot_state.py", "enabled": true},
+  {"name": "gesture_tracking", "version": "0.1", "entrypoint": "gesture_tracking.py", "enabled": true},
+  {"name": "remote_assist", "version": "0.1", "entrypoint": "remote_assist.py", "enabled": true},
   {"name": "vision_basic", "version": "0.1", "entrypoint": "vision_basic.py", "enabled": true},
   {"name": "person_memory", "version": "0.1", "entrypoint": "person_memory.py", "enabled": true},
   {"name": "distance_sensor", "version": "0.1", "entrypoint": "distance_sensor.py", "enabled": true},

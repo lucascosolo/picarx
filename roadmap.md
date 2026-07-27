@@ -1,454 +1,345 @@
-# Validated navigation and memory roadmap
+# PiCar-X Unified Roadmap
 
-Generated: 2026-07-26  
+Generated: 2026-07-26
 Repository: <https://github.com/lucascosolo/picarx>
-
-This roadmap was validated against `master` at `f2aeb18`. The existing ownership boundary remains mandatory: `location_graph.py` is the only writer of `spatial.db`; `reflection.py` is the only writer of `semantic.db`; and `event_logger.py` is the only writer of `events.db`. UI and other modules request work over the bus and read databases fail-soft.
-
-## Recommended order and timeline
-
-Implement **7 → 1 → 2 → 3 → 5 (replacement) → 6 → 4**. Resolution telemetry and scan correlation make evidence and later operator actions auditable; configuration and directional history are low-risk foundations. The IMU proposal needs a safe motion-quality replacement rather than pose estimation. Merge/split and embeddings should follow once there is enough retained, measured evidence. Estimated total for the viable work is roughly **100–166 engineering hours**, excluding field calibration and model/data collection.
-
-## Current implementation state — 2026-07-26
-
-Roadmap item **7 (rich location-resolution telemetry) is implemented**. `SpatialStore.match_or_create()` now returns at most three ranked candidate scores for every resolution outcome. Room scans and location changes carry bounded UUID correlation fields (`scan_id`, `resolution_id`, `probe_id`, and `evidence_ids`); ambiguous matches publish one probe request, and `field_agent.py` owns the deduplicated quick-scan FSM that produces the correlated follow-up. `event_logger.py` persists disambiguation requests in `events.db` without relying on asynchronous SQLite row IDs. Focused store, location-graph, field-agent, and event-logger tests cover ordering, correlation, replay deduplication, and terminal resolved/unresolved outcomes.
-
-Roadmap item **1 (veto evidence and provenance) is now implemented**. Vetoes atomically increment the location aggregate and store bounded scan/action/result context in `spatial.db`; image-like fields are redacted and read-only evidence helpers are fail-soft. Reflection receives a recent sensor-evidence catalog, caps uncited LLM facts at 0.70, and copies validated citations into additive `fact_evidence` rows. The confidence-gate decision is published with a reason when a proposed promotion lacks corroboration.
-
-Items **2, 3, 5 (replacement), 6, and 4 remain pending**. Item 2 is next because it has no prerequisite and is the smallest low-risk foundation after telemetry/provenance; item 3 can follow independently, while the conservative IMU replacement remains intentionally later.
-
-## 1. Veto evidence and provenance
-
-**Verdict: viable.**
-
-- `locations.veto_count` is only an aggregate today (`layer_b/spatial_store.py:note_veto`); the event payload and the scan context are not retained together.
-- A sensor-evidence gate is compatible with the reflection writer model, but an LLM cannot reliably cite supporting evidence unless the reflection input/output contract carries stable evidence IDs.
-- Store compact/redacted metadata and an ID, not raw camera frames, in `spatial.db`.
-
-**required_changes**
-
-- `layer_b/spatial_store.py`: extend `_SCHEMA`; add idempotent `SpatialStore._migrate()` after `executescript`; extend `note_veto(location_id, evidence=None, now=None)` to update the count and evidence atomically; add read-only evidence query helpers.
-- `layer_b/modules/location_graph.py:on_room_scan`: retain a bounded latest scan context (fingerprint, flattened labels, distance, candidate scores, `scan_id`). `on_action_result` supplies that context plus action/result to `note_veto`. Add an optional fresh world snapshot cache only when a stable `snapshot_id` exists.
-- `layer_b/semantic_store.py`: add an additive fact-evidence relation and writer-only helpers. `layer_b/modules/reflection.py:try_reflect` must require/copy cited sensor evidence before an LLM-originated fact exceeds the configured high-confidence ceiling; deterministic analyses may retain their explicit `location_graph`/`self_model` sources.
-- `layer_b/modules/event_logger.py` and the room-scan producer must carry a UUID `scan_id`; do not depend on getting SQLite event IDs back across asynchronous broker delivery.
-
-**db_schema_changes**
-
-```sql
-CREATE TABLE IF NOT EXISTS veto_evidence (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  location_id INTEGER NOT NULL,
-  ts REAL NOT NULL,
-  snapshot_id TEXT,
-  snapshot_json TEXT,
-  labels_json TEXT NOT NULL DEFAULT '[]',
-  distance_cm REAL,
-  candidate_similarities_json TEXT NOT NULL DEFAULT '[]',
-  action_json TEXT NOT NULL DEFAULT '{}',
-  result_json TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_veto_evidence_location_ts
-  ON veto_evidence(location_id, ts DESC);
-
-CREATE TABLE IF NOT EXISTS fact_evidence (
-  fact_id INTEGER NOT NULL,
-  evidence_kind TEXT NOT NULL,
-  evidence_db TEXT NOT NULL,
-  evidence_id TEXT NOT NULL,
-  observed_at REAL,
-  PRIMARY KEY (fact_id, evidence_kind, evidence_db, evidence_id)
-);
-```
-
-Both are additive. `snapshot_id` stays nullable until cross-topic correlation exists. Apply the spatial migration through a new idempotent migration method; no table rebuild is required. Cap/redact `snapshot_json` and never persist image bytes there.
-
-**interactions_with_existing_code**
-
-- `location_graph.py` alone writes `veto_evidence` and `locations`; `event_logger.py` continues to own raw `events.db`; it must not write `spatial.db`.
-- `reflection.py` alone writes `fact_evidence` and facts after read-only lookup of spatial/event evidence. For `source='reflection'`, cap confidence (for example 0.70) unless at least the defined number of recent, matching sensor references are attached. Human-confirmed inputs need an explicit separate source policy.
-- Use one SQLite transaction for the aggregate counter and evidence row. The location-graph lock protects current-location/last-scan association; no database write belongs on an IMU callback.
-
-**tests_required**
-
-- `tests/test_spatial_store.py`: additive migration, atomic increment/evidence insert, nullable snapshot ID, redaction/size guard, and readonly refusal.
-- `tests/test_memory_voice_commands.py`: scan context is attached to a veto at the active location.
-- `tests/test_semantic_store.py` and `tests/test_reflection_self_model.py`: legacy facts remain readable; LLM-only high confidence is capped while corroborated facts promote.
-
-**backward_compatibility_risk: medium.** Existing databases remain usable, but changing confidence policy changes which facts companion users see as highly trusted. Deploy in observe-only mode first and record why a proposed promotion was denied.
-
-**approximate_effort: medium, 16–24 hours.**
-
-**prerequisites: 7 preferred.** `scan_id` and durable resolution telemetry make the evidence references reliable; the table itself can land first with nullable IDs.
-
-**suggested_pr:** `spatial: retain veto evidence and gate LLM fact confidence` — Persist compact veto context and require sensor provenance for high-confidence reflection facts.
-
-## 2. Runtime configuration for fingerprint matching
-
-**Verdict: viable.**
-
-- The matching constants are local module globals in `layer_b/spatial_store.py` (`MATCH_THRESHOLD`, `MATCH_MARGIN`, `MIN_DISTINCT_LANDMARKS`, `REVISIT_GAP_SEC`).
-- `layer_b/robot_config.py` already provides a single knob registry, atomic config writes, environment overrides, and Config-page rendering.
-- Read validated knobs at match time so a saved Config-page change affects the next scan; do not broaden the first PR to uncalibrated feature-weight knobs.
-
-**required_changes**
-
-- `layer_b/robot_config.py:KNOBS`: add `spatial.match_threshold`, `spatial.match_margin`, `spatial.min_distinct_landmarks`, and `spatial.revisit_gap_sec` with defaults and environment names.
-- `layer_b/config.json`: materialize the `spatial` defaults and add a concise `_readme` note.
-- `layer_b/spatial_store.py`: add `spatial_matching_config()` with numeric validation; use it in `fingerprint_is_distinctive()` and `SpatialStore.match_or_create()`. Keep the current constants as fallback/default names for imports and pure tests.
-
-**db_schema_changes: none.**
-
-**interactions_with_existing_code**
-
-- Matching remains entirely in the `location_graph.py` writer path; no ownership or locking change is needed.
-- `robot_config.merge_and_save()` atomically replaces and reloads the config. The helper should call `robot_config.get()` per match, so settings take effect without a location-graph restart; environment values still win.
-
-**tests_required**
-
-- `tests/test_spatial_store.py`: temporary config overrides change threshold, ambiguity margin, landmark minimum, and revisit behavior; malformed/out-of-range settings fall back safely.
-- `tests/test_robot_config.py`: registry/default materialization coverage; `tests/test_web_console_pages.py` already verifies that every knob is rendered and should continue to do so.
-
-**backward_compatibility_risk: low.** Defaults exactly reproduce current behavior; invalid user input falls back rather than disabling localization.
-
-**approximate_effort: small, 4–6 hours.**
-
-**prerequisites: none.**
-
-**suggested_pr:** `spatial: expose validated matching thresholds in robot config` — Make recognition and ambiguity thresholds editable without changing their defaults.
-
-## 3. Directed edges and traversal timestamps
-
-**Verdict: viable.**
-
-- `edges` currently canonicalizes endpoints, so it only represents an undirected aggregate and one final timestamp.
-- Location changes already identify transitions in `LocationGraph.on_room_scan`; recording directed history there preserves the single-writer rule.
-- Preserve the legacy undirected API because `goal_manager.py` and `reflection.py` use it for current behavior and connectivity facts.
-
-**required_changes**
-
-- `layer_b/spatial_store.py`: add spatial migrations; make `note_edge(a, b, now, from_scan_ts=None, to_scan_ts=None)` write the existing edge, a directed aggregate, and an append-only history in one transaction. Add `outgoing_neighbors()`, `directed_edge_list()`, and bounded `traversal_history()` readers.
-- `layer_b/modules/location_graph.py:on_room_scan`: pass scan timestamps when the resolved location changes. Do not create transitions for unresolved or same-place scans.
-- Keep `SpatialStore.neighbors()` and `edge_list()` unchanged; later routing/analytics can opt into directed readers.
-
-**db_schema_changes**
-
-```sql
-CREATE TABLE IF NOT EXISTS directed_edges (
-  from_location_id INTEGER NOT NULL,
-  to_location_id INTEGER NOT NULL,
-  traversals INTEGER NOT NULL DEFAULT 1,
-  last_traversed_at REAL NOT NULL,
-  PRIMARY KEY (from_location_id, to_location_id)
-);
-CREATE TABLE IF NOT EXISTS edge_traversals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_location_id INTEGER NOT NULL,
-  to_location_id INTEGER NOT NULL,
-  traversed_at REAL NOT NULL,
-  from_scan_ts REAL,
-  to_scan_ts REAL
-);
-CREATE INDEX IF NOT EXISTS idx_edge_traversals_route_time
-  ON edge_traversals(from_location_id, to_location_id, traversed_at DESC);
-```
-
-This is additive. Do not reinterpret existing `edges` rows as directed history; start directional observations at deployment and keep old aggregates intact.
-
-**interactions_with_existing_code**
-
-- `location_graph.py` is the sole spatial writer and owns all three writes atomically.
-- `layer_b/modules/goal_manager.py` keeps using undirected `neighbors()`. `layer_b/modules/reflection.py:try_analyze` must keep receiving the existing three-field `edge_list()` tuple, otherwise its connectivity fact loop breaks.
-
-**tests_required**
-
-- `tests/test_spatial_store.py`: A→B and B→A aggregate separately; every crossing adds a timestamp row; unchanged `neighbors()` and `edge_list()` results remain compatible.
-- `tests/test_memory_voice_commands.py` and `tests/test_location_graph_loop.py`: only distinct resolved transitions are recorded and unresolved scans do not create history.
-
-**backward_compatibility_risk: low.** The current undirected schema/read APIs are retained, and empty new tables are valid on upgrade.
-
-**approximate_effort: small/medium, 8–14 hours.**
-
-**prerequisites: none.**
-
-**suggested_pr:** `spatial: record directed traversal history` — Add direction and timestamps while preserving current neighbor and connectivity behavior.
-
-## 4. Embeddings for fingerprints and facts
-
-**Verdict: viable only as a staged, non-authoritative enhancement.**
-
-- `layer_b/embedding_util.py` already offers optional fail-soft MiniLM/ONNX text embeddings, configured in `robot_config.py`, but they are used only by `modules/coach.py` and persisted in its policy JSON.
-- MiniLM is appropriate for semantic facts and text recall. It is not a trustworthy replacement for the structured visual fingerprint fields (label/confidence/bin/area/range/motion); using it to auto-merge places would increase false merges.
-- At the current expected database size, brute-force cosine over persisted vectors is simpler and safer than an ANN dependency. Introduce ANN only after a measured scale/latency need.
-
-**required_changes**
-
-- First phase: `layer_b/semantic_store.py` gets fact-vector read/write helpers; `layer_b/modules/reflection.py` is the only component that embeds/backfills facts and writes the results. Add a read-only semantic retrieval caller only after an explicit product use case.
-- Second, gated phase: `layer_b/spatial_store.py` exposes a versioned handcrafted/camera-validated candidate vector; `layer_b/modules/location_graph.py` alone writes it. It may prefilter/rerank candidates but deterministic `fingerprint_similarity()` remains the resolution authority and ambiguity guard.
-- `layer_b/embedding_util.py` and `robot_config.py`: add feature enablement/model-version/max-vector controls and keep absence of model/dependencies a no-op. Document Pi memory/install requirements before enabling MiniLM.
-
-**db_schema_changes**
-
-```sql
--- semantic.db
-CREATE TABLE IF NOT EXISTS fact_embeddings (
-  fact_id INTEGER NOT NULL,
-  model_version TEXT NOT NULL,
-  vector_blob BLOB NOT NULL,
-  updated_at REAL NOT NULL,
-  PRIMARY KEY (fact_id, model_version)
-);
-
--- spatial.db (only after an evaluated visual/vector design exists)
-CREATE TABLE IF NOT EXISTS location_embeddings (
-  location_id INTEGER NOT NULL,
-  model_version TEXT NOT NULL,
-  vector_blob BLOB NOT NULL,
-  updated_at REAL NOT NULL,
-  PRIMARY KEY (location_id, model_version)
-);
-```
-
-Use L2-normalized float32 blobs and a model version, not JSON vectors. Do not backfill synchronously on the driving path; perform bounded idle/background batches through the respective sole writer. A failed/missing model leaves these tables empty and preserves exact matching.
-
-**interactions_with_existing_code**
-
-- `reflection.py` writes `semantic.db`; `location_graph.py` writes `spatial.db`; no shared embedding worker may write either database directly.
-- The current coach policy embedding flow stays independent. Avoid coupling its policy JSON to fact/location vector migrations.
-- An ANN index, if ever justified, is a disposable in-memory/read-only index rebuilt from the authoritative table; never make it the source of truth.
-
-**tests_required**
-
-- `tests/test_semantic_store.py`: legacy facts and empty embeddings work; model-version replacement/backfill is idempotent.
-- Add mocked-vector pure tests in `tests/test_spatial_store.py`: absent embedding preserves exact decisions, and an embedding candidate cannot override a below-threshold or ambiguous deterministic match.
-- Add a focused reflection/recall test when the fact retrieval consumer is defined. Benchmark precision/recall and Pi latency/memory on recorded scans before the location phase.
-
-**backward_compatibility_risk: medium.** Optional tables are safe, but model availability, vector drift, and accidental authority inversion can change recognition quality. Keep it feature-gated and shadow-evaluate first.
-
-**approximate_effort: large, 24–40 hours.**
-
-**prerequisites: 7 recommended.** Use telemetry to build an evaluation corpus; complete 2 and the conservative 5 replacement before considering location reranking.
-
-**suggested_pr:** `memory: add optional versioned fact embeddings` — Persist fail-soft semantic vectors first; defer location-vector matching pending measured validation.
-
-## 5. More aggressive IMU/pose delta integration
-
-**Verdict: not viable as proposed; use a conservative motion-quality and continuity policy instead.**
-
-- The IMU is head-mounted and deliberately publishes robust instantaneous motion/orientation signals, not calibrated body-frame translation or odometry (`layer_b/modules/imu.py`). There are no wheel encoders or SLAM.
-- Rich fingerprints can already accept `imu_delta`, and `location_graph.py:on_room_scan` forwards one if present, but `field_agent.py:_handle_scanning_tick` does not attach it. Persisting a dynamic IMU delta in the canonical fingerprint would make a motion value look like a property of a place.
-- Integrating raw gyro to choose a place would create false certainty and the exact teleportation problem it is intended to solve.
-
-**Viable replacement**
-
-- `layer_b/modules/location_graph.py`: subscribe to `picarx/sensors/imu`, retain a fresh bounded motion summary, and pass an ephemeral `motion_context` plus previous location into matching. During impact/body movement/stale data, return `motion_unreliable` or apply a small continuity policy rather than selecting a different room.
-- `layer_b/modules/field_agent.py:_handle_scanning_tick`: attach fresh scan-time motion metadata from world state only if it has a defined timestamp contract. `layer_b/spatial_store.py` gets a pure policy helper; no coordinates and no pose-derived nearest-place claims.
-- Keep the legacy fingerprint shape and absent-context behavior identical. Store motion only as optional scan/audit evidence, not as the saved location fingerprint.
-
-**db_schema_changes: none for the first safe phase.** A later `location_observations` audit table may retain motion context, owned by `location_graph.py`.
-
-**interactions_with_existing_code**
-
-- Only room-scan handling writes spatial data; IMU callbacks cache memory-only state and perform no database writes.
-- `location_graph.py` owns the conservative gate. `field_agent.py` remains the scan producer; `imu.py` need not change until a formal interval contract is necessary.
-
-**tests_required**
-
-- `tests/test_spatial_store.py`: pure continuity/motion policy cases and exact legacy behavior with no context.
-- `tests/test_memory_voice_commands.py`: a stationary rescan can reconfirm the current candidate; an impact/moving scan remains unresolved and cannot schedule a teleport.
-- `tests/test_imu.py`: preserve published motion/freshness fields used by the contract.
-
-**backward_compatibility_risk: medium.** Motion gating deliberately produces more unresolved scans in unstable motion; that is safer than false localization. Ship with counters/telemetry and tune after field observation.
-
-**approximate_effort: medium, 12–20 hours.**
-
-**prerequisites: 2 optional, 7 recommended.** Make policy thresholds configurable only after the initial behavior is measured.
-
-**suggested_pr:** `localization: gate room matches on scan motion quality` — Reject unreliable moving scans and apply temporal continuity without inventing pose estimates.
-
-## 6. Conservative merge/split tooling and web UI flows
-
-**Verdict: viable as an operator-mediated, phased feature.**
-
-- The web console intentionally opens both databases read-only; HTTP handlers must publish edit requests, never write SQLite directly.
-- Merge can be transactional with aliases and audit history. A reliable split is not currently safe because only one fingerprint and aggregate counters are retained per location.
-- Automated work may propose candidates, but must never mutate locations without operator confirmation and a reversible audit trail.
-
-**required_changes**
-
-- `layer_b/modules/web_console.py`: add read-only place detail/proposal endpoints and a confirmation-protected `POST /places/edit` that validates then publishes `picarx/exploration/place_edit_request`.
-- `layer_b/web_ui/places.html` (new) and navigation/assets in `web_console.py`: show location IDs, evidence, aliases, candidate merges, and explicit operator confirmation. The LAN console has no authentication, so destructive controls require a disabled-by-default config flag plus typed/second confirmation.
-- `layer_b/modules/location_graph.py`: subscribe to edit requests and own `on_place_edit_request`; remap its current location after a merge.
-- `layer_b/spatial_store.py`: add idempotent migrations and transactional `merge_locations()`; initially add only a constrained `split_location()` that requires operator-selected observations. Readers (`get_location`, `all_locations`, `neighbors`, name/object lookup) resolve aliases consistently.
-- `layer_b/modules/goal_manager.py`, `field_agent.py`, and `reflection.py`: consume canonical IDs through store APIs. Preserve `reflection.py:try_analyze`'s undirected `edge_list()` contract.
-
-**db_schema_changes**
-
-```sql
-ALTER TABLE locations ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
-ALTER TABLE locations ADD COLUMN merged_into_id INTEGER;
-
-CREATE TABLE IF NOT EXISTS location_aliases (
-  old_location_id INTEGER PRIMARY KEY,
-  canonical_location_id INTEGER NOT NULL,
-  reason TEXT NOT NULL,
-  operator TEXT,
-  created_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS location_edit_audit (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  operation TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  operator TEXT,
-  created_at REAL NOT NULL,
-  undone_at REAL
-);
-CREATE TABLE IF NOT EXISTS location_observations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  location_id INTEGER NOT NULL,
-  scan_id TEXT,
-  ts REAL NOT NULL,
-  fingerprint_json TEXT NOT NULL,
-  similarity REAL,
-  resolution_reason TEXT
-);
-```
-
-Check columns with `PRAGMA table_info` before each `ALTER TABLE`. A merge preserves the retired row as an alias/status record; it does not delete historical references. For an initial split, create a child from selected observations and keep historic aggregate visits/vetoes/edges on the parent until an explicit audited reassignment policy exists. Fallback is to disable the edit flag and retain all existing reads.
-
-**interactions_with_existing_code**
-
-- Web console remains read-only and publishes bus commands; `location_graph.py` remains the sole spatial writer and serializes edit transactions with its writer lock.
-- Merge must coalesce sightings, counters, legacy undirected edges, directed edges/history, and veto/observation foreign references, remove resulting self-loops, and retain aliases/audit records atomically.
-- Optional automatic merge/split logic publishes review-only proposal events. It never calls store mutation methods.
-
-**tests_required**
-
-- `tests/test_spatial_store.py` and `tests/test_spatial_sightings.py`: atomic merge totals/sightings/edges/aliases, invalid/self/unknown operation rejection, rollback, and alias-resolved reads.
-- `tests/test_memory_voice_commands.py` and `tests/test_location_graph_loop.py`: request routing, current-ID remap, and no direct writer bypass.
-- `tests/test_web_console_pages.py`: new route/assets, payload validation, confirmation gate, and read-only console behavior.
-- Split tests must prove selected observations only; do not test or implement inferred historical partitioning without retained evidence.
-
-**backward_compatibility_risk: high.** Location identity is referenced across goals, edges, facts, and speech. Begin with merge-only, manual confirmation, backups, and an append-only audit; defer split automation.
-
-**approximate_effort: large, 28–48 hours.** Merge-only is about 12–18 hours; robust evidence-backed split adds roughly 16–30 hours.
-
-**prerequisites: 7, then 1 recommended.** `location_observations`, correlated scans, and evidence make review/split defensible.
-
-**suggested_pr:** `places: add audited operator merge workflow` — Add read-only place inspection and confirmed, transactional merge requests; keep split as a later evidence-backed phase.
-
-## 7. Rich location-resolution telemetry
-
-**Verdict: viable.**
-
-- `location_change` already reaches `event_logger.py`, whose generic append-only event table needs no schema change; it currently lacks ranked candidates, scan/evidence IDs, and a terminal disambiguation record.
-- `SpatialStore.match_or_create()` has only best/second ambiguity information, so it must return a bounded scored candidate list before location graph can publish it.
-- The current head saccades in `LocationGraph._schedule_disambiguation` do not themselves produce a room scan: `field_agent.py` is the completed-scan producer and does not consume `disambiguation_needed` today.
-
-**required_changes**
-
-- `layer_b/spatial_store.py:match_or_create`: include top 2–3 `{location_id, similarity}` candidate scores in results, including ambiguous and rejected outcomes; never expose an unbounded location list.
-- `layer_b/modules/location_graph.py:on_room_scan` and `_schedule_disambiguation`: generate and propagate `scan_id`, `resolution_id`, `probe_id`, candidate scores, evidence IDs, and terminal disambiguation `{attempt, outcome}` on additive fields of `picarx/exploration/location_change`.
-- `layer_b/modules/field_agent.py`: subscribe to `picarx/exploration/disambiguation_needed` and queue exactly one bounded quick-scan FSM carrying the `probe_id`; make it, rather than an uncorrelated future scan, complete the active probe. Avoid duplicate direct sweeps once field agent owns that workflow.
-- `layer_b/modules/event_logger.py`: log `picarx/exploration/disambiguation_needed` as an event in addition to its existing room-scan/location-change logging. A dedicated resolution topic is optional; enriched existing events are sufficient initially.
-
-**db_schema_changes: none.** `events.db.events.payload_json` is append-only and accepts additional fields. Optional `location_observations` belongs to #6 and is not needed to ship telemetry.
-
-**interactions_with_existing_code**
-
-- `event_logger.py` remains the events-db writer; location graph must not attempt to obtain its SQLite ID synchronously. UUIDs carried across payloads provide correlation.
-- Existing consumers (`field_agent`, `goal_manager`, `reflection`, web console) retain the topic and existing keys. New fields are additive and must be bounded/redacted.
-- The quick-scan state machine must deduplicate redelivered requests and report a single terminal outcome, preserving current safety/arbiter ownership of motion.
-
-**tests_required**
-
-- `tests/test_memory_voice_commands.py:LocationGraphDisambiguationTest`: assert ranked candidates, scan/probe correlation, exactly one probe request, and exactly one terminal resolved/unresolved event.
-- Add `tests/test_event_logger.py`: resolution and disambiguation payloads persist as valid JSON.
-- Add field-agent quick-scan tests (new focused test or `tests/test_location_graph_loop.py`): a request produces one correlated room scan; duplicate/replayed requests do not.
-
-**backward_compatibility_risk: low for telemetry; medium for the active quick-scan handoff.** Existing event consumers ignore unknown keys, but scan-FSM integration must be bounded and safety-vetoable.
-
-**approximate_effort: small/medium, 8–14 hours.**
-
-**prerequisites: none.**
-
-**suggested_pr:** `telemetry: correlate location resolutions and disambiguation probes` — Add bounded candidate evidence to existing events and make active probes produce one identified rescan.
-
-## Suggested patches
-
-### #1: minimal spatial veto-evidence write
-
-```python
-# layer_b/spatial_store.py: add to _SCHEMA, then call a new idempotent
-# _migrate() from the writable constructor for existing databases.
-CREATE TABLE IF NOT EXISTS veto_evidence (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    location_id INTEGER NOT NULL, ts REAL NOT NULL,
-    snapshot_id TEXT, snapshot_json TEXT,
-    labels_json TEXT NOT NULL DEFAULT '[]', distance_cm REAL,
-    candidate_similarities_json TEXT NOT NULL DEFAULT '[]',
-    action_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_veto_evidence_location_ts
-    ON veto_evidence(location_id, ts DESC);
-
-# Writer-only: called by location_graph.py, never by event_logger.py.
-def note_veto(self, location_id, evidence=None, now=None):
-    self._assert_writer()
-    now = time.time() if now is None else now
-    e = evidence or {}
-    with self.conn:
-        self.conn.execute("UPDATE locations SET veto_count = veto_count + 1 WHERE id = ?",
-                          (location_id,))
-        self.conn.execute(
-            """INSERT INTO veto_evidence
-               (location_id, ts, snapshot_id, labels_json, distance_cm,
-                candidate_similarities_json, action_json, result_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (location_id, now, e.get("snapshot_id"),
-             json.dumps(e.get("labels", [])), e.get("distance_cm"),
-             json.dumps(e.get("candidate_similarities", [])),
-             json.dumps(e.get("action", {})), json.dumps(e.get("result", {}))))
-```
-
-Keep `snapshot_id` nullable and cap/redact any optional `snapshot_json`. The reflection-side confidence gate belongs in the later semantic-writer part of the same feature, after evidence IDs are available.
-
-### #2: validated matching knobs
-
-```python
-# layer_b/robot_config.py: KNOBS (also materialize these values in config.json)
-{"section": "spatial", "key": "match_threshold", "type": "float",
- "default": 0.70, "env": "SPATIAL_MATCH_THRESHOLD",
- "desc": "Minimum fingerprint similarity required to recognize a saved place."},
-{"section": "spatial", "key": "match_margin", "type": "float",
- "default": 0.15, "env": "SPATIAL_MATCH_MARGIN",
- "desc": "Minimum lead over the next place before a match is unambiguous."},
-{"section": "spatial", "key": "min_distinct_landmarks", "type": "int",
- "default": 2, "env": "SPATIAL_MIN_DISTINCT_LANDMARKS",
- "desc": "Minimum distinct landmarks needed to identify an existing place."},
-{"section": "spatial", "key": "revisit_gap_sec", "type": "float",
- "default": 120.0, "env": "SPATIAL_REVISIT_GAP_SEC",
- "desc": "Seconds before a matching scan counts as a new visit."},
-
-# layer_b/spatial_store.py: call this from fingerprint_is_distinctive() and
-# match_or_create(), so Config-page saves affect the next scan.
-def spatial_matching_config():
-    def number(key, default, env, low, high=None):
-        try:
-            value = float(robot_config.get("spatial", key, default, env=env))
-        except (TypeError, ValueError):
-            return default
-        return value if value >= low and (high is None or value <= high) else default
-    return {
-        "match_threshold": number("match_threshold", MATCH_THRESHOLD,
-                                  "SPATIAL_MATCH_THRESHOLD", 0.0, 1.0),
-        "match_margin": number("match_margin", MATCH_MARGIN,
-                               "SPATIAL_MATCH_MARGIN", 0.0, 1.0),
-        "min_distinct_landmarks": max(1, int(number(
-            "min_distinct_landmarks", MIN_DISTINCT_LANDMARKS,
-            "SPATIAL_MIN_DISTINCT_LANDMARKS", 1.0))),
-        "revisit_gap_sec": number("revisit_gap_sec", REVISIT_GAP_SEC,
-                                  "SPATIAL_REVISIT_GAP_SEC", 0.0),
-    }
-```
-
-Use `cfg = spatial_matching_config()` inside the matching path and preserve the existing constants as defaults. The first configuration PR should not expose fingerprint feature weights until they have field calibration data.
+Baseline: `master` at `fe260b9`
+
+This is the single source of truth for planned work and delivered roadmap
+features. The previous `ROADMAP_STATUS.md` build log has been folded into the
+completed-work inventory below. The database ownership boundary remains
+mandatory: `location_graph.py` is the only writer of `spatial.db`,
+`reflection.py` is the only writer of `semantic.db`, and `event_logger.py` is
+the only writer of `events.db`. UI and other modules request work over the bus
+and read databases fail-soft.
+
+## Current direction
+
+The immediate goal is to make the robot a more useful and playful companion,
+not to expand navigation sophistication first:
+
+1. **Remote project helper:** give the robot a host IP address, establish an
+   authenticated SSH session, and have the robot copy/run its own helper on
+   the host to inspect files, propose/apply code changes, run approved
+   commands, and return debugging output. No separate host-side installation
+   should be required.
+2. **Gesture-responsive head:** use MediaPipe Hands so the robot follows a
+   pointing or moving hand while keeping the tracked hand near the middle of
+   the camera frame, without overheating the Pi or exceeding servo limits.
+
+The existing navigation and memory work remains valuable, but it follows these
+user-facing capabilities unless a dependency or safety issue moves it forward.
+
+## Implementation snapshot — 2026-07-26
+
+The new work is underway in the current worktree:
+
+- **RobotState foundation:** implemented as lease-based exclusive claims with
+  `IDLE`, `GESTURE_TRACKING`, `OBJECT_DETECTION`, `SPEAKING`, `REMOTE_ASSIST`,
+  `RC`, and `SAFETY_STOP`; TTS, RC, vision camera handoff, gesture, remote
+  sessions, and the head-intent arbiter now participate in the state channel.
+- **Gesture tracking:** bounded controller, threaded latest-frame capture,
+  320×240 input, 10px deadzone, hard pan/tilt limits, adaptive frame skipping,
+  CPU/thermal guard, and optional MediaPipe integration are implemented. Target
+  Pi hardware and thermal validation remain outstanding.
+- **Remote assist:** voice and `/tools` web-console controls, scoped JSON-lines
+  helper, SSH host validation, explicit write/command confirmation, and
+  robot-side helper bootstrapping are implemented. A real provisioned-host
+  end-to-end test and host-key/user setup validation remain outstanding.
+- **Follow/perception feedback:** producer timestamps, bounded head
+  reacquisition, stale-track handling, human-correction dataset capture, and
+  COCO export are implemented. Detector-weight retraining is intentionally
+  still an offline, measured follow-up; current on-device correction is
+  `label_memory`, not weight training.
+- **Hardware boundary:** the safety daemon globally clamps pan to
+  `[-75°, +75°]` and tilt to `[-35°, +35°]`, while gesture tracking remains
+  intentionally narrower at pan `[-35°, +35°]` and tilt `[-30°, +30°]`.
+  Normal scan/expression producers stay within the global envelope. The
+  arbiter also suppresses competing head and drive intents while gesture, RC,
+  remote-assist, speaking, or safety-stop states own the robot.
+
+## Priority order
+
+### P0 — Shared safety and resource design gate
+
+This is the only foundation that should precede live integration of the new
+features. Add a small, explicit resource/state contract without changing the
+safety daemon's veto authority:
+
+- Specify the `RobotState` enum and transition table for `IDLE`,
+  `GESTURE_TRACKING`, `OBJECT_DETECTION`, `SPEAKING`, `REMOTE_ASSIST`, `RC`,
+  and `SAFETY_STOP`. Safety stop remains independently enforceable by the
+  safety daemon even if state management fails.
+- Specify camera, head-servo, speaker, and remote-shell ownership
+  or lease semantics. Only one mode may own a resource at a time; stale leases
+  expire to a safe idle/stop behavior.
+- Specify transition telemetry on the bus and in the decision/event journal.
+  Existing modules must continue to work when the state module is disabled.
+- Establish the test seam first: fake camera frames, fake MediaPipe results,
+  fake CPU/temperature readings, fake servos, and a fake SSH helper.
+
+The interfaces and safety tests are agreed here; the active implementation is
+Task 3 below. Tasks 1 and 2 may be developed with fakes, but neither is enabled
+on the robot until the state manager and its preemption tests land.
+
+### P0 — Remote project helper
+
+This track may proceed in parallel with gesture development. It must never
+turn unauthenticated speech into unrestricted remote code execution.
+
+1. **Robot-owned helper protocol.** Ship the helper in the robot repository
+   (`tools/picarx_host_helper.py`). It should expose bounded operations for
+   connection health, directory listing, file search, file read, unified-diff
+   preview, patch apply, command execution, test execution, and log retrieval.
+   Return structured JSON with exit status, stdout, stderr, truncation
+   markers, and a request ID.
+2. **Connection and IP intake.** Accept a validated IPv4/IPv6 or hostname
+   through the existing voice/web command pipeline (for example, “connect to
+   192.168.1.20”). Do not ask the user to speak a password. Use a
+   pre-provisioned SSH key, verify the host key, show the target and scope,
+   and require explicit confirmation before the first connection and before
+   writes or destructive commands.
+3. **Self-bootstrap over SSH.** After authentication, open a short-lived SSH
+   bootstrap command that streams the helper source from the robot to a
+   private, random host temp path, then start that file as the JSON-lines
+   helper in a second SSH channel. Require only a host Python 3 runtime; do
+   not require package installation, copying files by hand, shell-profile
+   edits, or a separately launched host service. Remove the temp helper on
+   disconnect when the host permits it.
+4. **Scoped filesystem exploration.** Start each session in a configured
+   project root. Support bounded tree/list, search, read, and metadata calls;
+   reject path traversal, symlink escapes, oversized files, and binary/image
+   reads unless explicitly requested through a bounded artifact path.
+5. **Code-change and debug loop.** Default to previewing a patch, then apply
+   only an approved diff. Permit an allowlisted command set for common project
+   workflows, with timeouts, output caps, cancellation, and a session log.
+   Add rollback by retaining the pre-change patch or using a host-side git
+   worktree/commit boundary.
+6. **Robot integration.** Add a `REMOTE_ASSIST` mode, spoken progress/error
+   summaries, web-console session controls, disconnect/kill commands, and
+   persistence of the last target without persisting private keys or secrets.
+   The robot should degrade to local explanation when SSH, the helper, or the
+   network is unavailable.
+
+**Acceptance:** a user can connect to a provisioned test host, explore a
+project, inspect a file, preview and approve a small patch, run its tests, and
+receive bounded results. An unapproved or malformed request cannot write or
+execute remotely.
+
+**Estimated effort:** 18–30 hours, excluding host-specific packaging.
+
+### P0 — Follow-me reliability and perception learning
+
+The existing follow daemon already routes movement through the arbiter and
+safety daemon, but its behavior needs a measured reliability pass before more
+follow features are added.
+
+1. **Reproduce the sit-still failure.** Correlate follow enablement, fresh
+   face/person detections, detector-pass timestamps, target age, selected
+   intent, arbiter winner, and safety result. Distinguish “no person in the
+   frame” from “vision is alive but the cached track is stale” and from “a
+   valid target exists but another intent wins.”
+2. **Make reacquisition explicit.** Keep the robot stationary when the target
+   is absent, slowly sweep the camera through bounded pan offsets, prefer a
+   fresh person track, and use a confirmed face as a centering fallback. Never
+   drive blind just because an old payload is still arriving. Add hysteresis,
+   target confidence/age telemetry, and a deterministic stop/reacquire/give-up
+   state machine.
+3. **Fix producer freshness contracts.** Vision must publish the time of the
+   actual detector/face pass separately from the time a cached payload is
+   republished. Follow must consume those timestamps and tolerate normal Pi
+   inference/MQTT jitter without accepting stale tracks indefinitely.
+4. **Audit the training claim.** Human corrections currently teach the
+   on-device visual-signature `label_memory` overlay; they do **not** update
+   MobileNet-SSD or YOLO weights. The system must say which tier learned the
+   correction instead of implying detector retraining occurred.
+5. **Capture real detector-training examples.** On a fresh human correction,
+   save a bounded, consented full-frame image, corrected class, detector
+   bounding box, timestamp, and provenance in an append-only dataset outside
+   the hot path. Add export/validation tooling and an offline training job
+   that can produce evaluated replacement weights. Never retrain on the Pi
+   while it is driving, and never replace production weights without a
+   precision/regression check and rollback copy.
+6. **Close the loop.** Measure whether new weights improve person recall and
+   reduce false labels against a held-out set. Keep `label_memory` as a fast
+   overlay even when a detector model is retrained; a correction should be
+   reflected immediately in memory and become a model-training sample for a
+   later offline round.
+
+**Acceptance:** a follow session either acquires a fresh person and produces
+bounded, safety-vetoable motion or reports why it is waiting; it does not sit
+silently because of a stale timestamp or hidden competing intent. A human
+correction can be traced to immediate label-memory behavior and to a durable
+training example, while model-weight changes are separately benchmarked and
+reversible.
+
+**Estimated effort:** 18–32 hours, plus field data collection and offline
+model training.
+
+### P0 — Gesture-responsive head
+
+Implement this in exactly three deployable tasks. All motion remains bounded,
+rate-limited, and independent of drive intents; the safety daemon remains the
+final motion veto.
+
+#### Task 1 — Tracking pipeline and bounded head control
+
+- Add a MediaPipe Hands adapter with a separate frame-capture thread and a
+  latest-frame/latest-result buffer. The capture path must not block the bus,
+  speech, safety, or servo-control loops.
+- Track one selected hand, derive a stable palm/pointing target from
+  landmarks, and map target displacement to pan/tilt corrections so the hand
+  is brought toward the frame center. Handle hand loss by holding briefly,
+  then returning to a neutral head pose or relinquishing control.
+- Enforce hard hardware limits of **pan −35° to +35°** and **tilt −30° to
+  +30°** at every command boundary. Add servo rate limiting, stale-result
+  expiry, and a **10-pixel center deadzone** so small movements do not cause
+  jitter.
+- Keep all camera and MediaPipe imports optional. If the model, camera, or
+  servo is unavailable, report a fail-soft capability error and leave existing
+  head behavior intact.
+
+**Tests:** landmark-to-angle mapping, exact limit clamping, deadzone behavior,
+hand loss, stale frames, capture-thread shutdown, and mocked servo commands.
+
+#### Task 2 — Pi performance and thermal protection
+
+- Downscale camera input to **320 × 240** before inference. Use a bounded
+  latest-frame queue rather than accumulating frames.
+- Skip every **third frame or more** when rate-limited; make the skip interval
+  adaptive to measured inference time and frame age.
+- Add dynamic CPU and thermal monitoring. If CPU usage remains above **90%**
+  for more than a few seconds, progressively increase frame skipping and/or
+  reduce inference frequency. Restore quality gradually after sustained
+  recovery rather than oscillating at the threshold.
+- Add configurable temperature thresholds, monitoring failure behavior, and
+  telemetry for effective resolution, skip rate, inference time, CPU, and
+  temperature. On an overheating or unreadable sensor condition, stop gesture
+  processing and release head ownership safely.
+- Benchmark on the target Pi with camera capture, MediaPipe, object detection,
+  and TTS separately and together. Do not assume desktop timings represent Pi
+  behavior.
+
+**Tests:** adaptive throttling, sustained-over-90% behavior, thermal shutdown,
+recovery hysteresis, queue bounds, and graceful absence of monitoring tools.
+
+#### Task 3 — Active exclusive `RobotState`
+
+- Implement the enum and transition manager described in P0. Gesture mode
+  owns the head/camera budget and turns off heavy object detection; object
+  detection mode cannot simultaneously run gesture inference.
+- While `SPEAKING`, drop or pause camera frames rather than letting a backlog
+  build. Resume with a fresh frame after TTS completes.
+- Make `RC`, `REMOTE_ASSIST`, and `SAFETY_STOP` preempt gesture tracking. RC
+  and safety behavior must continue to use ordinary vetoable intents and the
+  existing safety daemon.
+- Add mode-specific heartbeat/status output, transition reasons, timeout
+  recovery, and a single cleanup path that releases camera, servo, speaker,
+  and remote-session resources.
+- Gate the feature behind configuration and default it off until target-Pi
+  thermal, servo-limit, and recovery tests pass.
+
+**Acceptance:** no two heavy camera modes run concurrently, speech does not
+create an unbounded frame backlog, every head command stays inside the stated
+angles, and loss of a module or heartbeat returns the robot to a safe state.
+
+**Estimated effort:** 30–48 hours across the three tasks, plus Pi testing.
+
+## Navigation and memory backlog
+
+The following items were validated against the existing architecture. Items 1
+and 7 are complete. They remain below the new P0 work because neither blocks
+the remote helper, and the gesture feature now supplies its own resource-state
+priority.
+
+### 7. Rich location-resolution telemetry — **complete**
+
+`SpatialStore.match_or_create()` returns at most three ranked candidate scores.
+Room scans and location changes carry bounded `scan_id`, `resolution_id`,
+`probe_id`, and `evidence_ids` correlation fields. Ambiguous matches publish a
+single probe request; `field_agent.py` owns the deduplicated quick-scan FSM;
+`event_logger.py` persists the request and terminal outcome.
+
+### 1. Veto evidence and provenance — **complete**
+
+Vetoes atomically update the location aggregate and retain bounded,
+redacted scan/action/result context in `spatial.db`. Reflection receives a
+recent evidence catalog, caps uncited LLM facts at 0.70, and stores validated
+citations in additive `fact_evidence` rows.
+
+### 2. Runtime configuration for fingerprint matching — **next after P0**
+
+Expose validated runtime knobs for match threshold, ambiguity margin, minimum
+distinct landmarks, and revisit gap through `robot_config` and the Config page.
+Defaults must preserve current behavior; malformed values fall back safely.
+
+**Estimated effort:** 4–6 hours.
+
+### 3. Directed edges and traversal timestamps
+
+Add directed aggregates and append-only traversal history while preserving the
+legacy undirected `neighbors()` and `edge_list()` APIs. Record transitions only
+for distinct resolved places; unresolved or same-place scans create no edge.
+
+**Estimated effort:** 8–14 hours.
+
+### 5. Conservative IMU/motion-quality policy
+
+Do not integrate the head-mounted IMU into pose estimates. Cache a fresh,
+bounded motion summary, reject or retain continuity for scans taken during
+impact/motion/stale data, and store motion only as optional evidence. Preserve
+legacy matching when no motion context exists.
+
+**Estimated effort:** 12–20 hours.
+
+### 6. Audited operator merge/split tooling
+
+Add read-only place details and review proposals to the web console, then a
+disabled-by-default, confirmation-protected request path owned by
+`location_graph.py`. Begin with transactional merge, aliases, backups, and an
+append-only audit trail. Defer automated split until retained observations can
+support it. Never let the UI write SQLite directly.
+
+**Estimated effort:** 28–48 hours. High compatibility risk.
+
+### 4. Optional embeddings
+
+First add versioned, fail-soft fact embeddings owned by `reflection.py`. Defer
+location embeddings until an evaluation corpus exists; deterministic visual
+matching remains authoritative, and embeddings may only shadow-rerank or
+prefilter candidates after measured validation.
+
+**Estimated effort:** 24–40 hours. Gated on evidence and benchmarks.
+
+## Completed capabilities from the earlier exploration/memory roadmap
+
+These features were implemented before this unified roadmap and are retained
+as delivered scope rather than separate planning documents:
+
+- Topological location graph, curiosity-driven exploration, temporal pattern
+  mining, failure-mode-specific recovery, multi-modal situation context,
+  bounded hypothesis probes, long-horizon advisory goals, and uncertainty-map
+  output.
+- Emergence experiments, introspection/decision journaling, confidence-aware
+  coach suggestions, practical voice tools, internet radio and live station
+  search, the LAN web console, and the microphone kill-switch.
+- Smooth Ackermann steering, RC mode with dead-man protections, camera
+  overlays, speaker toggling, idle self-training with safety isolation, fluid
+  obstacle driving, and richer escape tactics.
+- Voice-band filtering and configurable radio dial aliases.
+
+The safety daemon's veto logic is unchanged; new behavior must continue to
+publish ordinary vetoable intents and must fail-soft when optional modules or
+dependencies are missing.
+
+## Verification and delivery rules
+
+- Keep one writer per SQLite database and make migrations idempotent.
+- Test all new behavior off-robot with fakes, then validate on the target Pi
+  with CPU, thermal, camera, servo, and TTS contention measurements.
+- Record resource-state transitions, remote commands, approved patches, and
+  gesture throttling reasons without storing credentials, private keys, or raw
+  camera frames by default.
+- Current baseline verification: `python3 -m unittest discover -s tests -p
+  'test_*.py'` passes 863 tests. `pytest` is not currently installed.
+- Field calibration, Pi thermal measurements, MediaPipe model packaging, and
+  host-helper installation are excluded from the engineering-hour estimates.

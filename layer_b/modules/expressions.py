@@ -128,7 +128,7 @@ GAZE_TILT = 0                      # look level at the subject while following (
 GAZE_DEADBAND_FRAC = 0.12          # don't twitch the head for a near-centred subject
 GAZE_PAN_GAIN_DEG = 28.0           # deg of pan per unit of normalised offset (~camera half-FOV)
 GAZE_MAX_STEP_DEG = 18             # cap one re-aim so the head eases rather than snaps
-GAZE_PAN_LIMIT = 65                # soft pan bound (the safety daemon clamps again at +-80)
+GAZE_PAN_LIMIT = 65                # below the safety daemon's +/-75 hardware gate
 
 # Ambient musings: generic, non-factual, never claim anything about the world
 # (so they can't mislead or pollute memory). One is picked at random.
