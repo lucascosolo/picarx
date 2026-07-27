@@ -25,6 +25,9 @@ flip follow_daemon's mode. Even start_following only sets a switch: follow_daemo
 generates the actual motion deterministically from vision and every command
 still flows through the safety daemon, so "motion never starts from raw LLM
 output" holds - the model chooses a behaviour, not a maneuver.
+The remote project tools likewise only publish typed requests to the SSH
+helper; they never execute host commands in the companion process, and
+writes/commands still require explicit confirmation.
 
 Each reply is grounded with a short snapshot of picarx/state/world
 (face/objects/distance/battery) folded into the prompt, so it can
@@ -256,6 +259,7 @@ FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
 BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 HEALTH_STATE_TOPIC = "picarx/health/state"
 LOWPOWER_REQUEST_TOPIC = "picarx/tools/lowpower/request"
+REMOTE_ASSIST_TOPIC = "picarx/tools/remote_assist"
 
 # ---------- talking about its own experience ----------
 # Beyond what it sees and who it's with, the companion grounds replies in the
@@ -342,6 +346,37 @@ TOOLS = [
                     "person tells you to conserve power. (A safety system also does "
                     "this on its own if the battery gets critically low.)",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "connect_remote_host",
+     "description": "Connect to a developer's computer over SSH using the robot's "
+                    "already-provisioned key. Use only when the person explicitly "
+                    "gives a host/IP and project scope; never invent a host or ask "
+                    "them to speak a password. The robot copies and runs its own "
+                    "bounded helper on the host, so no host installation is needed.",
+     "input_schema": {"type": "object", "properties": {
+         "host": {"type": "string", "description": "IPv4, IPv6, or hostname"},
+         "user": {"type": "string", "description": "optional SSH username"},
+         "project_root": {"type": "string",
+                           "description": "host project directory to scope access to"},
+         "port": {"type": "integer", "description": "optional SSH port"}},
+         "required": ["host"]}},
+    {"name": "remote_project_operation",
+     "description": "Use the connected host helper to inspect or debug the scoped "
+                    "project. Supported operations are status, list, read, search, "
+                    "preview_patch, apply_patch, run, and disconnect. Read/list/search/"
+                    "preview are safe. For apply_patch or run, set confirmed=true "
+                    "ONLY after the person explicitly approves that specific write "
+                    "or command; otherwise ask for approval first. Commands remain "
+                    "host-side allowlisted and bounded.",
+     "input_schema": {"type": "object", "properties": {
+         "operation": {"type": "string", "enum": ["status", "list", "read",
+                       "search", "preview_patch", "apply_patch", "run", "disconnect"]},
+         "path": {"type": "string"},
+         "pattern": {"type": "string"},
+         "patch": {"type": "string"},
+         "command": {"type": "string"},
+         "cwd": {"type": "string"},
+         "confirmed": {"type": "boolean"}},
+         "required": ["operation"]}},
 ]
 
 PEOPLE_DIR = f"{DATA_DIR}/people"
@@ -1250,6 +1285,41 @@ class Companion:
             if name == "register_low_power_intent":
                 self.bus.publish(LOWPOWER_REQUEST_TOPIC, {"active": True})
                 return "Entering low-power mode to conserve battery."
+            if name == "connect_remote_host":
+                host = str(tool_input.get("host") or "").strip()
+                if not host:
+                    return "I need the host IP address or hostname first."
+                request = {"command": "connect", "host": host}
+                for key in ("user", "project_root", "port"):
+                    value = tool_input.get(key)
+                    if value not in (None, ""):
+                        request[key] = value
+                self.bus.publish(REMOTE_ASSIST_TOPIC, request)
+                return ("Connecting to the host over verified SSH and starting my "
+                        "scoped helper there.")
+            if name == "remote_project_operation":
+                operation = str(tool_input.get("operation") or "").lower()
+                allowed = {"status", "list", "read", "search", "preview_patch",
+                            "apply_patch", "run", "disconnect"}
+                if operation not in allowed:
+                    return "That remote operation is not supported."
+                if operation in {"apply_patch", "run"} and \
+                        not bool(tool_input.get("confirmed")):
+                    return ("I need your explicit approval before I can apply a "
+                            "remote patch or run a remote command.")
+                request = {"command": operation}
+                fields = ("path", "pattern", "patch", "command", "cwd", "confirmed")
+                for key in fields:
+                    value = tool_input.get(key)
+                    if value not in (None, ""):
+                        if isinstance(value, str):
+                            value = value[:20000 if key == "patch" else 1000]
+                        # `command` names the remote operation on the bus;
+                        # the helper's run argument therefore travels as
+                        # argv to avoid overwriting that operation name.
+                        request["argv" if operation == "run" and key == "command" else key] = value
+                self.bus.publish(REMOTE_ASSIST_TOPIC, request)
+                return f"Remote {operation} request sent; I will report the result."
         except Exception as e:
             print(f"Companion: tool '{name}' failed: {e}")
             return "That didn't work."

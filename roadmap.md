@@ -42,9 +42,10 @@ The new work is underway in the current worktree:
   CPU/thermal guard, and optional MediaPipe integration are implemented. Target
   Pi hardware and thermal validation remain outstanding.
 - **Remote assist:** voice and `/tools` web-console controls, scoped JSON-lines
-  helper, SSH host validation, explicit write/command confirmation, and
-  robot-side helper bootstrapping are implemented. A real provisioned-host
-  end-to-end test and host-key/user setup validation remain outstanding.
+  helper, SSH host validation, typed companion tools for remote project
+  operations, explicit write/command confirmation, and robot-side helper
+  bootstrapping are implemented. A real provisioned-host end-to-end test and
+  host-key/user setup validation remain outstanding.
 - **Follow/perception feedback:** producer timestamps, bounded head
   reacquisition, stale-track handling, human-correction dataset capture, and
   COCO export are implemented. Detector-weight retraining is intentionally
@@ -340,6 +341,6 @@ dependencies are missing.
   gesture throttling reasons without storing credentials, private keys, or raw
   camera frames by default.
 - Current baseline verification: `python3 -m unittest discover -s tests -p
-  'test_*.py'` passes 863 tests. `pytest` is not currently installed.
+  'test_*.py'` passes 865 tests. `pytest` is not currently installed.
 - Field calibration, Pi thermal measurements, MediaPipe model packaging, and
   host-helper installation are excluded from the engineering-hour estimates.

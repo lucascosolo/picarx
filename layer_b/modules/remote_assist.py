@@ -226,6 +226,29 @@ class RemoteAssist:
             output = (result.get("stderr") or result.get("stdout") or "").strip()
             if output:
                 text += " " + " ".join(output.split())[:220]
+        elif message.get("command") == "list":
+            result = message.get("result") or {}
+            names = [str(entry.get("name")) for entry in result.get("entries", [])]
+            text = "Remote directory: " + (", ".join(names[:18]) or "empty")
+            if result.get("truncated"):
+                text += "; listing truncated"
+        elif message.get("command") == "read":
+            result = message.get("result") or {}
+            sample = " ".join(str(result.get("text") or "").split())[:260]
+            text = f"Remote file {result.get('path') or 'read'}: {sample or 'empty file'}."
+        elif message.get("command") == "search":
+            result = message.get("result") or {}
+            hits = result.get("results") or []
+            locations = [f"{h.get('path')} line {h.get('line')}" for h in hits[:8]]
+            text = "Remote search found " + (", ".join(locations) if locations else "no matches") + "."
+        elif message.get("command") == "preview_patch":
+            result = message.get("result") or {}
+            text = "Remote patch preview " + ("is valid." if result.get("valid") else "failed validation.")
+            if result.get("stderr"):
+                text += " " + " ".join(str(result["stderr"]).split())[:180]
+        elif message.get("command") == "apply_patch":
+            result = message.get("result") or {}
+            text = "Remote patch " + ("applied." if result.get("applied") else "was not applied.")
         else:
             text = "Remote operation complete. I sent the details to the tools console."
         self.bus.publish("picarx/audio/speak", {"text": text[:400], "ts": time.time()})
@@ -244,6 +267,7 @@ class RemoteAssist:
 
     def _handle(self, payload):
         command = str(payload.get("command") or payload.get("op") or "").lower()
+        request_id = str(payload.get("request_id") or uuid.uuid4().hex)[:80]
         try:
             with self.lock:
                 if command == "connect":
@@ -253,16 +277,19 @@ class RemoteAssist:
                                                   payload.get("project_root", "."))
                     self.target, self.connected = target, True
                     self._claim()
-                    response = {"ok": True, "command": command, "target": target}
+                    response = {"ok": True, "command": command, "request_id": request_id,
+                                "target": target}
                 elif command in {"disconnect", "stop"}:
                     self.session.close()
                     self.connected = False
                     self.target = None
                     self._release()
-                    response = {"ok": True, "command": "disconnect"}
+                    response = {"ok": True, "command": "disconnect",
+                                "request_id": request_id}
                 elif command == "status":
                     response = {"ok": True, "command": command,
-                                "connected": self.connected, "target": self.target}
+                                "request_id": request_id, "connected": self.connected,
+                                "target": self.target}
                 elif not self.connected:
                     raise RuntimeError("not connected; connect to a host first")
                 elif command in {"list", "read", "search", "stat", "preview_patch", "apply_patch", "run"}:
@@ -273,6 +300,7 @@ class RemoteAssist:
                     self._claim()
                     result = self.session.request(request)
                     response = {"ok": bool(result.get("ok")), "command": command,
+                                "request_id": request_id,
                                 "result": result.get("result"), "error": result.get("error")}
                 else:
                     raise ValueError(f"unsupported remote command: {command}")
@@ -288,7 +316,8 @@ class RemoteAssist:
                     pass
                 self.connected = False
                 self.target = None
-            self._publish({"ok": False, "command": command, "error": str(e)[:500]})
+            self._publish({"ok": False, "command": command, "request_id": request_id,
+                           "error": str(e)[:500]})
 
     def run(self):
         self.bus.subscribe(REQUEST_TOPIC, self.on_request)

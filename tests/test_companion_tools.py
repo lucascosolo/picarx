@@ -90,6 +90,31 @@ class CompanionToolTest(unittest.TestCase):
         self.assertIn("low-power", out.lower())
         self.assertEqual(self.c.bus.last(companion.LOWPOWER_REQUEST_TOPIC)["active"], True)
 
+    def test_remote_connection_tool_publishes_typed_request(self):
+        out = self.c._execute_tool(
+            "connect_remote_host",
+            {"host": "192.168.1.20", "user": "lucas", "project_root": "~/src/picarx"})
+        self.assertIn("SSH", out)
+        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(request["command"], "connect")
+        self.assertEqual(request["host"], "192.168.1.20")
+        self.assertEqual(request["project_root"], "~/src/picarx")
+        self.assertNotIn("password", request)
+
+    def test_remote_write_and_run_require_confirmation_before_publish(self):
+        out = self.c._execute_tool(
+            "remote_project_operation",
+            {"operation": "apply_patch", "patch": "diff --git ..."})
+        self.assertIn("explicit approval", out)
+        self.assertEqual(self.c.bus.of(companion.REMOTE_ASSIST_TOPIC), [])
+        self.c._execute_tool(
+            "remote_project_operation",
+            {"operation": "run", "command": "pytest", "confirmed": True})
+        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(request["command"], "run")
+        self.assertEqual(request["argv"], "pytest")
+        self.assertTrue(request["confirmed"])
+
     def test_on_health_caches(self):
         self.c.on_health({"battery_v": 8.0, "battery_pct": 90})
         self.assertEqual(self.c.latest_health["battery_pct"], 90)
