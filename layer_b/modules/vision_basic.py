@@ -126,6 +126,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", str(THREAD_LIMIT))
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+from camera_lock import CameraBusy, CameraLease
 import robot_config
 import label_memory
 from perception_feedback import PerceptionFeedbackStore
@@ -635,6 +636,7 @@ class CentroidTracker:
 def run():
     bus = Bus()
     picam2 = None
+    camera_lease = None
     # Subscribe before opening Picamera2 so a retained/current state or a
     # fast gesture claim can prevent a competing camera owner from starting.
     robot_state = {"state": "IDLE"}
@@ -659,13 +661,20 @@ def run():
             object_state_claimed = False
 
     def open_camera():
-        camera = Picamera2()
-        config = camera.create_preview_configuration(
-            main={"format": "RGB888", "size": CAPTURE_SIZE})
-        camera.configure(config)
-        camera.start()
-        time.sleep(1)
-        return camera
+        lease = CameraLease().acquire()
+        camera = None
+        try:
+            camera = Picamera2()
+            config = camera.create_preview_configuration(
+                main={"format": "RGB888", "size": CAPTURE_SIZE})
+            camera.configure(config)
+            camera.start()
+            time.sleep(1)
+            return camera, lease
+        except Exception:
+            close_camera(camera)
+            lease.release()
+            raise
 
     def close_camera(camera):
         if camera is None:
@@ -676,11 +685,18 @@ def run():
             except Exception:
                 pass
 
-    try:
-        picam2 = open_camera()
-    except Exception as e:
-        print(f"vision: camera failed to start ({e})")
-        return
+    while robot_state["state"] != "GESTURE_TRACKING":
+        try:
+            picam2, camera_lease = open_camera()
+            break
+        except CameraBusy:
+            print("vision: camera owned by another process; waiting")
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"vision: camera failed to start ({e}); retrying")
+            time.sleep(0.5)
+    if picam2 is None:
+        print("vision: gesture mode owns camera; waiting for handoff")
 
     face_cascade = cv2.CascadeClassifier(
         robot_config.base_path("modules", "cascades", "cascades.xml")
@@ -798,13 +814,16 @@ def run():
             if picam2 is not None:
                 close_camera(picam2)
                 picam2 = None
+                if camera_lease is not None:
+                    camera_lease.release()
+                    camera_lease = None
                 print("vision: released camera to gesture tracker")
             time.sleep(0.05)
             continue
         claim_object_state()
         if picam2 is None:
             try:
-                picam2 = open_camera()
+                picam2, camera_lease = open_camera()
                 print("vision: reacquired camera after gesture mode")
             except Exception as e:
                 print(f"vision: camera reacquire failed ({e})")

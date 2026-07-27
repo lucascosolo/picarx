@@ -24,6 +24,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+from camera_lock import CameraBusy, CameraLease
 
 try:
     import robot_config
@@ -313,7 +314,12 @@ class GestureTracker:
         self.state = str(payload.get("state") or "IDLE")
 
     def _capture_loop(self):
+        lease = None
+        camera = None
         try:
+            # RobotState closes the normal race, while this non-blocking
+            # kernel lock protects the short MQTT handoff window too.
+            lease = CameraLease().acquire()
             from picamera2 import Picamera2
             camera = Picamera2()
             config = camera.create_preview_configuration(
@@ -324,6 +330,9 @@ class GestureTracker:
             time.sleep(0.3)
             while self.running and self.enabled and self.state == STATE_NAME:
                 self.frames.put(camera.capture_array())
+        except CameraBusy:
+            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "camera_wait",
+                                             "error": "camera owned by another process", "ts": time.time()})
         except Exception as e:
             self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "camera_error",
                                              "error": str(e)[:200], "ts": time.time()})
@@ -336,6 +345,8 @@ class GestureTracker:
                         getattr(camera, method)()
                     except Exception:
                         pass
+            if lease is not None:
+                lease.release()
 
     def _ensure_capture(self):
         if self._capture_thread is None or not self._capture_thread.is_alive():
