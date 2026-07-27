@@ -42,6 +42,7 @@ CPU_HIGH_HOLD_SEC = 3.0
 THERMAL_LIMIT_C = 80.0
 THERMAL_RECOVER_C = 72.0
 HAND_LOSS_HOLD_SEC = 1.0
+CLAIM_RENEW_INTERVAL_SEC = 0.5
 STATE_TOPIC = "picarx/state/current"
 CONTROL_TOPIC = "picarx/gesture/control"
 STATUS_TOPIC = "picarx/gesture/status"
@@ -301,11 +302,16 @@ class GestureTracker:
         self._hands_backend = None
         self._mediapipe = None
         self._model_error = None
+        self._last_claim_at = 0.0
         self._last_pose = None
         self._last_hand_at = 0.0
         self._last_camera_wait_at = 0.0
 
-    def _claim(self):
+    def _claim(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_claim_at < CLAIM_RENEW_INTERVAL_SEC:
+            return
+        self._last_claim_at = now
         self.bus.publish(STATE_CLAIM_TOPIC, {
             "owner": OWNER, "state": STATE_NAME, "ttl": 1.5,
             "reason": "gesture tracking enabled", "ts": time.time()})
@@ -324,7 +330,7 @@ class GestureTracker:
                 self._last_pose = None
                 self._last_hand_at = 0.0
                 self._last_camera_wait_at = 0.0
-            self._claim()
+            self._claim(force=True)
             self.bus.publish(STATUS_TOPIC, {"enabled": True, "state": "starting",
                                              "ts": time.time()})
         else:
@@ -579,10 +585,18 @@ class GestureTracker:
                 # wait for RobotState to acknowledge that this process owns
                 # the camera/head. This closes the startup race with
                 # vision_basic on brokers without retained state messages.
-                if self.enabled and self.state == STATE_NAME:
-                    self._ensure_capture()
-                    self.process_once()
-                elif self.enabled:
+                if self.enabled:
+                    # Renew independently of the currently winning state. A
+                    # higher-priority owner may temporarily preempt gesture;
+                    # keeping this lower-priority lease alive lets gesture
+                    # reclaim the camera when that owner releases it.
+                    self._claim()
+                    if self.state == STATE_NAME:
+                        self._ensure_capture()
+                        self.process_once()
+                    else:
+                        self.frames.clear()
+                else:
                     self.frames.clear()
                 time.sleep(0.01)
             except Exception as e:
