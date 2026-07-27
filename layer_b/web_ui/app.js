@@ -7,6 +7,7 @@ const PX = (() => {
   const NAV = [
     ["/", "Dashboard"], ["/drive", "Drive & Cam"], ["/training", "Training"],
     ["/people", "People"], ["/audio", "Audio"], ["/tools", "Tools"],
+    ["/notes", "Notes"],
     ["/config", "Config"],
   ];
   const pollers = [];

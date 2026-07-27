@@ -35,6 +35,9 @@ import re
 import time
 
 REMOTE_TOPIC = "picarx/tools/remote_assist"
+REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
+REMINDER_CONTROL_TOPIC = "picarx/tools/reminder/control"
+NOTES_TOPIC = "picarx/tools/notes"
 
 # ---------- spoken-number → dial string ----------
 # Vosk transcribes a frequency as WORDS ("ninety eight point seven",
@@ -50,6 +53,22 @@ _TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
 _TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
          "seventy": 70, "eighty": 80, "ninety": 90}
 _NUMWORD = {**_ONES, **_TEENS, **_TENS, "hundred": 100, "a": 1}
+
+
+def _spoken_amount(value):
+    """Parse the small numeric vocabulary used by reminder phrases."""
+    value = str(value or "").strip().lower()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    if value in _ONES:
+        return float(_ONES[value])
+    if value in _TEENS:
+        return float(_TEENS[value])
+    if value in _TENS:
+        return float(_TENS[value])
+    return None
 
 
 def _side_to_digits(tokens):
@@ -146,10 +165,74 @@ def _remote_payload(m, text):
     return {"command": "connect", "host": host}
 
 
+def _reminder_payload(m, text):
+    amount = _spoken_amount(m.group("amount")) if m and m.group("amount") else None
+    if amount is not None:
+        unit = m.group("unit").lower()
+        minutes = amount / 60.0 if unit.startswith("second") else amount
+        if unit.startswith("hour"):
+            minutes = amount * 60.0
+        message = m.group("message").strip(" .,!?")
+        if message and minutes > 0:
+            return {"message": message, "delay_minutes": minutes}
+    if m and m.group("clock"):
+        hour, minute = m.group("clock").split()
+        message = m.group("clock_message").strip(" .,!?")
+        if message:
+            return {"message": message, "at": f"{int(hour):02d}:{int(minute):02d}"}
+    return None
+
+
+def _note_payload(m, text):
+    body = (m.group("body") if m else "").strip(" .,!?")
+    return {"command": "create", "text": body, "source": "voice"} if body else None
+
+
+def _query_payload(m, text):
+    query = (m.group("query") if m and m.groupdict().get("query") else "").strip(" .,!?")
+    query = re.sub(r"^(?:about|for|named|called)\s+", "", query)
+    return {"command": "delete", "query": query, "confirmed": True,
+            "source": "voice"} if query else None
+
+
 # Patterns run against speech_match.canonicalize()d text ("play the
 # radio for me please" arrives here as "play radio"), so they only need
 # to cover meaningful word variants, not filler permutations.
 RULES = [
+    # Explicit, deterministic reminder phrases.  More ambiguous requests
+    # such as "remind me to call mom" remain available to the companion LLM,
+    # which can ask for a time instead of inventing one.
+    (re.compile(r"\bremind(?:\s+me)?\s+in\s+(?P<amount>\d+(?:\.\d+)?|"
+                r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+                r"twelve|thirteen|fourteen|fifteen|twenty|thirty|forty|"
+                r"fifty|sixty)\s+(?P<unit>seconds?|minutes?|hours?)\s+"
+                r"(?:to\s+)?(?P<message>.+)$|"
+                r"\bremind(?:\s+me)?\s+at\s+(?P<clock>\d{1,2}\s+\d{2})\s+"
+                r"(?:to\s+)?(?P<clock_message>.+)$"),
+     REMINDER_SET_TOPIC, _reminder_payload),
+    (re.compile(r"\b(?:list|show|what are)\b.*\breminders?\b|"
+                r"\bwhat reminders\b"),
+     REMINDER_CONTROL_TOPIC, lambda m, t: {"command": "list", "source": "voice"}),
+    (re.compile(r"\b(?:cancel|delete|remove)\b\s+reminders?\s+(?P<query>.+)$"),
+     REMINDER_CONTROL_TOPIC, _query_payload),
+    # A note with content is a single memory entry; a bare "take notes" is a
+    # consented continuous meeting session.
+    (re.compile(r"\b(?:take|make|write|add)\s+(?:a\s+)?note\b"
+                r"(?:\s+(?:that|saying|about))?\s*(?P<body>.+)$"),
+     NOTES_TOPIC, _note_payload),
+    (re.compile(r"\b(?:start|begin)\s+(?:taking\s+)?(?:meeting\s+)?notes?\b|"
+                r"\btake\s+(?:meeting\s+)?notes?\b"),
+     NOTES_TOPIC, lambda m, t: {"command": "start", "confirmed": True,
+                                "source": "voice"}),
+    (re.compile(r"\b(?:pause|resume|stop|end|finish)\b.*\bmeeting\s+notes?\b"),
+     NOTES_TOPIC,
+     lambda m, t: {"command": ("pause" if "pause" in m.group(0) else
+                                "resume" if "resume" in m.group(0) else "stop"),
+                    "source": "voice"}),
+    (re.compile(r"\b(?:list|show|search)\b.*\bnotes?\b"),
+     NOTES_TOPIC, lambda m, t: {"command": "list", "source": "voice"}),
+    (re.compile(r"\b(?:delete|remove)\s+notes?\s+(?P<query>.+)$"),
+     NOTES_TOPIC, _query_payload),
     # Remote project assistance. Require ssh/remote/host/computer wording or
     # an unmistakable "ssh into" phrase so this never captures a place goal.
     (re.compile(r"\b(?:revoke|remove|disable)\b.*\b(?:remote|ssh|host|project)\b"
@@ -205,6 +288,13 @@ RULES = [
 ]
 
 TOOL_DESCRIPTIONS = [
+    {"name": "notes", "topic": NOTES_TOPIC,
+     "say": "take a note <text> / start, pause, resume, stop meeting notes / "
+            "list or delete notes",
+     "description": "stores local user notes and consented meeting transcripts"},
+    {"name": "reminders", "topic": REMINDER_CONTROL_TOPIC,
+     "say": "remind me in <time> to <text> / list or cancel reminders",
+     "description": "persists bounded local reminders and speaks them at the requested time"},
     {"name": "remote_assist", "topic": REMOTE_TOPIC,
      "say": "ssh into <host> / give or revoke remote write access / disconnect remote assist",
      "description": "connects to a provisioned host helper over verified SSH so I can inspect a project, preview approved patches, and run bounded debugging commands"},

@@ -293,6 +293,27 @@ class SemanticStore:
                 (fact_id, kind, db, evidence, observed_at))
         return True
 
+    def archive_fact(self, subject, fact):
+        """Archive one exact active fact for an explicit user deletion.
+
+        The row remains in semantic.db as an auditable tombstone; ordinary
+        readers exclude it because its status is no longer ``active``.  This
+        is intentionally writer-only, matching the database ownership rule.
+        """
+        if self.readonly:
+            raise RuntimeError("SemanticStore opened readonly - only reflection.py writes")
+        subject = str(subject or "").strip()[:80]
+        fact = str(fact or "").strip()[:300]
+        if not subject or not fact:
+            return 0
+        now = time.time()
+        cursor = self.conn.execute(
+            "UPDATE facts SET status = 'superseded', updated_at = ? "
+            "WHERE subject = ? AND fact = ? AND status = 'active'",
+            (now, subject, fact))
+        self.conn.commit()
+        return cursor.rowcount
+
     def replace_subject(self, subject, facts, source="reflection"):
         """Make `facts` the COMPLETE active set for `subject`, atomically.
 

@@ -142,7 +142,7 @@ class RouteTableTest(unittest.TestCase):
                             f"{fname} referenced by a route but missing on disk")
 
     def test_core_pages_are_routed(self):
-        for path in ("/", "/drive", "/training", "/people", "/audio", "/tools", "/config"):
+        for path in ("/", "/drive", "/training", "/people", "/audio", "/tools", "/notes", "/config"):
             self.assertIn(path, web_console.PAGES)
 
     def test_tools_page_exposes_feature_commands(self):
@@ -153,6 +153,15 @@ class RouteTableTest(unittest.TestCase):
                        "remotePatch('preview_patch')", "remotePatch('apply_patch')",
                        "remoteRun()", "authorizeRemoteWrites()", "revoke_write",
                        "remote-confirm", "argv: document.getElementById('remote-command')"):
+            self.assertIn(marker, page)
+
+    def test_notes_page_exposes_note_meeting_and_reminder_controls(self):
+        with open(os.path.join(harness.LAYER_B, "web_ui", "notes.html"),
+                  encoding="utf-8") as stream:
+            page = stream.read()
+        for marker in ("saveNote()", "meeting('start')", "meeting('stop')",
+                       "deleteNote", "setReminder", "deleteReminder",
+                       "meeting-consent", "delete-confirm"):
             self.assertIn(marker, page)
 
 

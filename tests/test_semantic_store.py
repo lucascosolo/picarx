@@ -110,6 +110,14 @@ class SemanticStoreTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ro.attach_fact_evidence(fid, "veto", "spatial", "13")
 
+    def test_archive_fact_hides_exact_deleted_user_note_but_keeps_history(self):
+        self.s.upsert_fact("note:abc", "buy milk", 0.7, source="user_note")
+        self.assertEqual(self.s.archive_fact("note:abc", "buy milk"), 1)
+        self.assertEqual(self.s.facts_for("note:abc"), [])
+        history = self.s.facts_for("note:abc", include_superseded=True)
+        self.assertEqual(history[0]["status"], "superseded")
+        self.assertEqual(self.s.archive_fact("note:abc", "buy milk"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

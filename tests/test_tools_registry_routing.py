@@ -85,5 +85,40 @@ class RemoteRuleTest(unittest.TestCase):
                          {"command": "revoke_write"})
 
 
+class NotesReminderRuleTest(unittest.TestCase):
+    def _route(self, text, topic):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": text})
+        return registry.bus.last(topic)
+
+    def test_relative_reminder_example_routes_without_llm(self):
+        payload = self._route("remind me in 10 minutes to take out the trash",
+                              tr.REMINDER_SET_TOPIC)
+        self.assertEqual(payload["message"], "take out trash")
+        self.assertEqual(payload["delay_minutes"], 10.0)
+
+    def test_spoken_relative_reminder_and_clock_time(self):
+        payload = self._route("remind me in ten minutes to call Sam",
+                              tr.REMINDER_SET_TOPIC)
+        self.assertEqual(payload["delay_minutes"], 10.0)
+        payload = self._route("remind me at 18:30 to call Sam", tr.REMINDER_SET_TOPIC)
+        self.assertEqual(payload["at"], "18:30")
+
+    def test_single_note_and_meeting_controls_are_distinct(self):
+        note = self._route("take a note buy milk", tr.NOTES_TOPIC)
+        self.assertEqual(note["command"], "create")
+        self.assertEqual(note["text"], "buy milk")
+        start = self._route("start taking meeting notes", tr.NOTES_TOPIC)
+        self.assertEqual(start["command"], "start")
+        self.assertTrue(start["confirmed"])
+
+    def test_delete_reminder_is_explicitly_confirmed(self):
+        payload = self._route("cancel reminder about trash",
+                              tr.REMINDER_CONTROL_TOPIC)
+        self.assertEqual(payload["command"], "delete")
+        self.assertEqual(payload["query"], "trash")
+        self.assertTrue(payload["confirmed"])
+
+
 if __name__ == "__main__":
     unittest.main()

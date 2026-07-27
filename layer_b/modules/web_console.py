@@ -13,6 +13,7 @@ top nav, a common stylesheet (web_ui/app.css) and helper script (web_ui/app.js):
   /people    People      - face enrolment, following, places & navigation
   /audio     Audio+Radio - mic/speaker kill-switches, internet radio
   /config    Config      - every config.json knob, editable in the browser
+  /notes     Notes       - notes, meeting sessions, and reminders
   /tools     Tools       - gesture mode and remote project helper
 
 One design rule keeps most of this honest: the console does NOT get its own
@@ -29,7 +30,7 @@ browser is actually fetching /camera.jpg (with an idle watchdog), so the camera
 costs nothing unless someone is on the Drive page watching it.
 
 HTTP endpoints (JSON unless noted):
-  GET  /,/drive,/training,/people,/audio,/config,/tools   the pages (HTML)
+  GET  /,/drive,/training,/people,/audio,/config,/tools,/notes   the pages (HTML)
   GET  /app.css /app.js                            shared static assets
   GET  /state         status cache + speak/heard log + places/people
   GET  /boxes         camera-overlay boxes for the current frame
@@ -38,6 +39,7 @@ HTTP endpoints (JSON unless noted):
   GET  /facts[?q=]    recent (or searched) semantic-memory facts
   GET  /config/data   the full config tree + per-knob help + env note
   POST /say /mic /speaker /feedback /label /rc /rc/drive /camera /gesture /remote
+       /notes /reminders
   POST /config/save   {"config": {section: {key: value}}} -> config.json
 
 Serves plain HTTP on the LAN with no authentication - anyone on your network
@@ -83,6 +85,7 @@ PAGES = {
     "/audio": "audio.html",
     "/config": "config.html",
     "/tools": "tools.html",
+    "/notes": "notes.html",
 }
 # Shared static assets, whitelisted (never serve an arbitrary path from disk).
 ASSETS = {
@@ -141,6 +144,8 @@ class ConsoleState:
         self.robot_state = {}
         self.gesture = {}
         self.remote = {}
+        self.notes = {}
+        self.reminders = {}
         self.log = deque(maxlen=LOG_LINES)
         # Most recent user text ("you" or "heard") - each robot log line
         # records it as "re", so the check/X feedback buttons know which
@@ -235,6 +240,8 @@ class ConsoleState:
                 "robot_state": self.robot_state,
                 "gesture": self.gesture,
                 "remote": self.remote,
+                "notes": self.notes,
+                "reminders": self.reminders,
                 "log": list(self.log),
             }
 
@@ -633,6 +640,35 @@ class Handler(BaseHTTPRequestHandler):
                 "enabled": bool(body.get("enabled", False)), "source": "web",
                 "ts": time.time()})
             self._send(200, {"ok": True})
+        elif self.path == "/notes":
+            command = str(body.get("command") or "").lower()
+            allowed = {"create", "start", "pause", "resume", "stop", "list",
+                       "status", "get", "export", "delete"}
+            if command not in allowed:
+                self._send(400, {"error": "unsupported notes command"})
+                return
+            fields = {"command", "text", "title", "id", "query", "limit",
+                      "confirmed", "source"}
+            request = {k: v for k, v in body.items() if k in fields}
+            request["source"] = "web"
+            BUS.publish("picarx/tools/notes", request)
+            self._send(200, {"ok": True})
+        elif self.path == "/reminders":
+            command = str(body.get("command") or "").lower()
+            allowed = {"set", "list", "status", "delete", "cancel"}
+            if command not in allowed:
+                self._send(400, {"error": "unsupported reminder command"})
+                return
+            fields = {"command", "message", "delay_minutes", "at", "id", "query",
+                      "confirmed", "source"}
+            request = {k: v for k, v in body.items() if k in fields}
+            request["source"] = "web"
+            if command == "set":
+                request["command"] = "set"
+                BUS.publish("picarx/tools/reminder/set", request)
+            else:
+                BUS.publish("picarx/tools/reminder/control", request)
+            self._send(200, {"ok": True})
         elif self.path == "/remote":
             command = str(body.get("command") or "").lower()
             allowed = {"connect", "disconnect", "status", "list", "read", "search",
@@ -742,6 +778,22 @@ def on_remote_result(p):
     with STATE.lock:
         STATE.remote = p
 
+def on_notes_state(p):
+    with STATE.lock:
+        STATE.notes = {**STATE.notes, **p}
+
+def on_notes_result(p):
+    with STATE.lock:
+        STATE.notes = {**STATE.notes, **p}
+
+def on_reminder_state(p):
+    with STATE.lock:
+        STATE.reminders = {**STATE.reminders, **p}
+
+def on_reminder_result(p):
+    with STATE.lock:
+        STATE.reminders = {**STATE.reminders, **p}
+
 def on_vision_frame(p):
     b64 = p.get("jpeg")
     if not b64:
@@ -780,6 +832,10 @@ def main():
     BUS.subscribe("picarx/state/current", on_robot_state)
     BUS.subscribe("picarx/gesture/status", on_gesture_status)
     BUS.subscribe("picarx/tools/remote_assist/result", on_remote_result)
+    BUS.subscribe("picarx/tools/notes/state", on_notes_state)
+    BUS.subscribe("picarx/tools/notes/result", on_notes_result)
+    BUS.subscribe("picarx/tools/reminder/state", on_reminder_state)
+    BUS.subscribe("picarx/tools/reminder/result", on_reminder_result)
     BUS.subscribe(VISION_FRAME_TOPIC, on_vision_frame)
 
     try:

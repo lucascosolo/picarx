@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PiCarX · Notes &amp; Reminders</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div class="card">
+  <h2>Single note</h2>
+  <div class="hint">“Take a note” saves one user-authored memory entry. It is
+    kept locally and mirrored into the robot's searchable memory.</div>
+  <input id="note-title" placeholder="optional title">
+  <textarea id="note-text" rows="4" placeholder="note text"></textarea>
+  <button class="primary" onclick="saveNote()">Save note</button>
+</div>
+
+<div class="card">
+  <h2>Meeting notes</h2>
+  <div class="hint">Meeting transcription starts only after explicit consent.
+    Each speech segment is flushed locally as it arrives and is not sent to the
+    LLM.</div>
+  <div class="row"><input id="meeting-title" placeholder="meeting title">
+    <label><input type="checkbox" id="meeting-consent"> I consent to local recording</label></div>
+  <div class="grid">
+    <button class="primary" onclick="meeting('start')">Start</button>
+    <button onclick="meeting('pause')">Pause</button>
+    <button onclick="meeting('resume')">Resume</button>
+    <button class="danger" onclick="meeting('stop')">Stop</button>
+  </div>
+  <div class="stat"><span>Session</span><span id="meeting-state">not recording</span></div>
+</div>
+
+<div class="card">
+  <h2>Saved notes</h2>
+  <div class="row"><input id="note-search" placeholder="search notes">
+    <button onclick="listNotes()">Refresh</button></div>
+  <div id="notes-list" class="hint">No notes loaded.</div>
+  <pre id="note-output" class="hint"></pre>
+</div>
+
+<div class="card">
+  <h2>Reminders</h2>
+  <div class="row"><input id="reminder-message" placeholder="take out the trash">
+    <input id="reminder-minutes" type="number" min="0.01" step="1" placeholder="minutes">
+    <input id="reminder-at" placeholder="or local time, e.g. 18:30"></div>
+  <button class="primary" onclick="setReminder()">Set reminder</button>
+  <label><input type="checkbox" id="delete-confirm"> confirm deletes</label>
+  <div id="reminder-list" class="hint">No reminders loaded.</div>
+</div>
+
+<script src="/app.js"></script>
+<script>
+async function postNotes(command, extra) {
+  await PX.post('/notes', Object.assign({command}, extra || {}));
+  setTimeout(PX.poll, 150);
+}
+function saveNote() {
+  const text = document.getElementById('note-text').value.trim();
+  if (!text) return;
+  postNotes('create', {text,
+    title: document.getElementById('note-title').value.trim()});
+  document.getElementById('note-text').value = '';
+}
+function meeting(action) {
+  const extra = {source: 'web'};
+  if (action === 'start') {
+    if (!document.getElementById('meeting-consent').checked) {
+      alert('Confirm local recording first.'); return;
+    }
+    extra.confirmed = true;
+    extra.title = document.getElementById('meeting-title').value.trim();
+  }
+  postNotes(action, extra);
+}
+function listNotes() {
+  postNotes('list', {query: document.getElementById('note-search').value.trim()});
+}
+function deleteNote(id) {
+  if (!document.getElementById('delete-confirm').checked) {
+    alert('Check confirm deletes first.'); return;
+  }
+  postNotes('delete', {id, confirmed: true});
+}
+function exportNote(id) {
+  postNotes('export', {id});
+}
+async function setReminder() {
+  const message = document.getElementById('reminder-message').value.trim();
+  if (!message) return;
+  const body = {command: 'set', message, source: 'web'};
+  const minutes = document.getElementById('reminder-minutes').value;
+  const at = document.getElementById('reminder-at').value.trim();
+  if (minutes) body.delay_minutes = Number(minutes);
+  else if (at) body.at = at;
+  else return;
+  await PX.post('/reminders', body); setTimeout(PX.poll, 150);
+}
+function deleteReminder(id) {
+  if (!document.getElementById('delete-confirm').checked) {
+    alert('Check confirm deletes first.'); return;
+  }
+  PX.post('/reminders', {command: 'delete', id, confirmed: true, source: 'web'});
+  setTimeout(PX.poll, 150);
+}
+function renderNotes(s) {
+  const data = (s.notes || {}).result || {};
+  const rows = data.notes || [];
+  const active = (s.notes || {}).active_meeting || data.active_meeting;
+  document.getElementById('meeting-state').textContent = active
+    ? `${active.state || 'active'} · ${active.segment_count || 0} segments`
+    : 'not recording';
+  const el = document.getElementById('notes-list');
+  el.innerHTML = rows.length ? rows.map(n =>
+    `<div class="stat"><span>${PX.esc(n.kind)}: ${PX.esc(n.preview || '(empty)')}</span>` +
+    `<span><button onclick="exportNote('${PX.esc(n.id)}')">Export</button>` +
+    `<button class="danger" onclick="deleteNote('${PX.esc(n.id)}')">Delete</button></span></div>`
+  ).join('') : 'No matching notes.';
+  if (data.text) document.getElementById('note-output').textContent = data.text;
+}
+function renderReminders(s) {
+  const rows = ((s.reminders || {}).result || {}).reminders || [];
+  const el = document.getElementById('reminder-list');
+  el.innerHTML = rows.length ? rows.map(r =>
+    `<div class="stat"><span>${PX.esc(r.message)}</span>` +
+    `<span>${Math.max(0, Math.round(r.remaining_sec / 60))} min · ` +
+    `<button class="danger" onclick="deleteReminder('${PX.esc(r.id)}')">Delete</button></span></div>`
+  ).join('') : 'No pending reminders.';
+}
+PX.onPoll(s => { renderNotes(s); renderReminders(s); });
+PX.startPolling(2000);
+</script>
+</body>
+</html>

@@ -257,6 +257,23 @@ class Reflection:
         except Exception as e:
             print(f"Reflection: failed to store note: {e}")
 
+    def on_note_delete(self, payload):
+        """Archive the exact semantic mirror of a user-deleted note.
+
+        The JSON notes store is the user-facing source of truth; this handler
+        keeps semantic recall from resurrecting a note that was explicitly
+        removed.  The operation is idempotent and leaves an auditable row.
+        """
+        subject = (payload.get("subject") or "").strip()
+        fact = (payload.get("fact") or "").strip()
+        if not subject or not fact:
+            return
+        try:
+            archived = self.store.archive_fact(subject, fact)
+            print(f"Reflection: archived {archived} deleted user note mirror(s)")
+        except Exception as e:
+            print(f"Reflection: failed to archive deleted note: {e}")
+
     # ---------- mined patterns handed over for storage ----------
 
     def on_pattern(self, payload):
@@ -830,6 +847,7 @@ class Reflection:
         self.bus.subscribe("picarx/audio/heard", self.on_activity)
         self.bus.subscribe("picarx/perception/label", self.on_label)
         self.bus.subscribe("picarx/memory/note", self.on_note)
+        self.bus.subscribe("picarx/memory/note/delete", self.on_note_delete)
         self.bus.subscribe("picarx/memory/pattern", self.on_pattern)
         self.bus.set_heartbeat_status(self._heartbeat_status)
 

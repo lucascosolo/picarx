@@ -111,6 +111,36 @@ class ReminderDaemonTest(unittest.TestCase):
             for r in d2.reminders.values():
                 r["timer"].cancel()
 
+    def test_list_and_delete_require_confirmation(self):
+        self.d.on_set({"message": "trash", "delay_minutes": 30, "source": "web"})
+        rid = next(iter(self.d.reminders))
+        listed = self.d.on_control({"command": "list", "source": "web"})
+        self.assertTrue(listed["ok"])
+        self.assertEqual(listed["result"]["reminders"][0]["id"], rid)
+        denied = self.d.on_control({"command": "delete", "id": rid,
+                                     "source": "web"})
+        self.assertFalse(denied["ok"])
+        deleted = self.d.on_control({"command": "delete", "id": rid,
+                                     "confirmed": True, "source": "web"})
+        self.assertTrue(deleted["ok"])
+        self.assertEqual(self.d.reminders, {})
+
+    def test_boot_briefing_is_bounded_and_only_announced_once(self):
+        for message in ("one", "two"):
+            self.d.on_set({"message": message, "delay_minutes": 30,
+                           "source": "web"})
+        self.assertTrue(self.d.announce_pending())
+        self.assertFalse(self.d.announce_pending())
+        spoken = self.d.bus.of(rd.SPEAK_TOPIC)
+        self.assertEqual(len(spoken), 1)
+        self.assertIn("one", spoken[0]["text"])
+
+    def test_boot_briefing_waits_for_safety_owner(self):
+        self.d.on_set({"message": "safe", "delay_minutes": 30, "source": "web"})
+        self.d.on_robot_state({"state": "SAFETY_STOP"})
+        self.assertFalse(self.d.announce_pending())
+        self.assertFalse(self.d.boot_announced)
+
 
 if __name__ == "__main__":
     unittest.main()

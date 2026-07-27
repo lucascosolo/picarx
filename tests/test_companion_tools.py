@@ -101,6 +101,22 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(request["project_root"], "~/src/picarx")
         self.assertNotIn("password", request)
 
+    def test_note_and_meeting_tools_publish_typed_requests(self):
+        out = self.c._execute_tool("create_note", {"text": "buy milk"})
+        self.assertIn("saved", out.lower())
+        self.assertEqual(self.c.bus.last(companion.NOTES_TOPIC)["command"], "create")
+        self.c._execute_tool("control_meeting_notes",
+                             {"action": "start", "confirmed": True})
+        request = self.c.bus.last(companion.NOTES_TOPIC)
+        self.assertEqual(request["command"], "start")
+        self.assertTrue(request["confirmed"])
+
+    def test_reminder_delete_requires_confirmation(self):
+        out = self.c._execute_tool("manage_reminders",
+                                   {"operation": "delete", "query": "trash"})
+        self.assertIn("approval", out.lower())
+        self.assertEqual(self.c.bus.of(companion.REMINDER_CONTROL_TOPIC), [])
+
     def test_remote_write_access_is_granted_once_but_commands_stay_confirmed(self):
         out = self.c._execute_tool(
             "remote_project_operation",

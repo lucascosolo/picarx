@@ -131,6 +131,12 @@ class FieldAgentMemoryCommandTest(unittest.TestCase):
                      if "Hello, lucas" in p["text"]]
         self.assertEqual(len(greetings), 1)
 
+    def test_meeting_recording_suppresses_robot_commands(self):
+        self.fa.on_notes_state({"active_meeting": {"state": "recording"}})
+        self.fa.on_heard({"text": "go to the kitchen"})
+        self.assertIsNone(self.fa.bus.last("picarx/exploration/goal_request"))
+        self.assertEqual(self.fa.bus.of("picarx/audio/speak"), [])
+
 
 class GoalRequestTest(unittest.TestCase):
     def setUp(self):

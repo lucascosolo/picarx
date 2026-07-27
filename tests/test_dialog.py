@@ -48,6 +48,15 @@ class DialogBrokerTest(unittest.TestCase):
         self._heard("it's a speaker")
         self.assertIsNone(self.d.bus.last(ANSWER))
 
+    def test_meeting_recording_owns_heard_speech(self):
+        self._ask()
+        self.d.on_notes_state({"active_meeting": {"state": "recording"}})
+        self._heard("it's a speaker")
+        self.d.on_directed({"text": "what is the agenda"})
+        self.assertIsNone(self.d.bus.last(ANSWER))
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+        self.assertIsNone(self.d.bus.last(UNCERTAIN))
+
     # ---- the regression that motivated looks_like_label_answer ----
 
     def test_command_is_not_swallowed_as_a_label(self):

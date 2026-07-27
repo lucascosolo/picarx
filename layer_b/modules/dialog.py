@@ -111,6 +111,7 @@ class DialogBroker:
         self.question = None            # the single live attention.Question, or None
         self.last_directed_at = 0.0     # last wake/command-shaped utterance (window base)
         self._answered = None           # (text_lower, ts) of the last routed answer
+        self.meeting_recording = False  # notes daemon owns heard speech while active
 
     # ---------- question registry ----------
 
@@ -146,11 +147,20 @@ class DialogBroker:
 
     # ---------- utterance routing ----------
 
+    def on_notes_state(self, payload):
+        active = payload.get("active_meeting") or {}
+        with self.lock:
+            self.meeting_recording = active.get("state") == "recording"
+
     def on_heard(self, payload):
         """Route one heard utterance IF it answers the live question; otherwise
         leave it alone for the normal command/chat pipeline. Repaired text and
         console-correction echoes are never answers (same guard the old capture
         paths used)."""
+        with self.lock:
+            meeting_recording = self.meeting_recording
+        if meeting_recording:
+            return
         if payload.get("source") in ("intent_repair", "user_correction"):
             return
         text = (payload.get("text") or "").strip()
@@ -214,6 +224,9 @@ class DialogBroker:
         An utterance just routed as an ANSWER to an open question (on_heard) is
         also dropped here, so it reaches its asker only and isn't re-forwarded to
         chat. Fail-soft and stdlib-only, same as the rest of the broker."""
+        with self.lock:
+            if self.meeting_recording:
+                return
         now = time.time()
         if payload.get("handled"):
             with self.lock:
@@ -276,6 +289,7 @@ class DialogBroker:
     def run(self):
         self.bus.subscribe(ASK_TOPIC, self.on_ask)
         self.bus.subscribe(HEARD_TOPIC, self.on_heard)
+        self.bus.subscribe("picarx/tools/notes/state", self.on_notes_state)
         self.bus.subscribe(DIRECTED_TOPIC, self.on_directed)
         print(f"Dialog broker active - one open question at a time, and the sole "
               f"turn-taking router (wake={list(WAKE_PHRASES)}, "

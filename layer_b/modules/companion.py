@@ -255,6 +255,8 @@ EPISODE_TRIGGERS = (
 # motion at all.
 MAX_TOOL_ROUNDS = 3          # bound the tool<->model round-trips per utterance
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
+REMINDER_CONTROL_TOPIC = "picarx/tools/reminder/control"
+NOTES_TOPIC = "picarx/tools/notes"
 FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
 BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 HEALTH_STATE_TOPIC = "picarx/health/state"
@@ -288,6 +290,36 @@ TOOLS = [
                 "description": "exact local time instead of a delay, e.g. '18:30' "
                                "or '2026-07-15 18:30'"}},
          "required": ["message"]}},
+    {"name": "manage_reminders",
+     "description": "List or cancel pending reminders. Cancellation is a "
+                    "destructive action: set confirmed=true only after the "
+                    "person explicitly approves deleting the selected reminder.",
+     "input_schema": {"type": "object", "properties": {
+         "operation": {"type": "string", "enum": ["list", "delete"]},
+         "id": {"type": "string"}, "query": {"type": "string"},
+         "confirmed": {"type": "boolean"}}, "required": ["operation"]}},
+    {"name": "create_note",
+     "description": "Save one user-authored note in durable memory. Use for "
+                    "'take a note ...', not for an ongoing meeting transcript.",
+     "input_schema": {"type": "object", "properties": {
+         "text": {"type": "string"}, "title": {"type": "string"}},
+         "required": ["text"]}},
+    {"name": "manage_notes",
+     "description": "List, read, export, search, or delete saved notes and "
+                    "meeting logs. Deletion requires explicit confirmation.",
+     "input_schema": {"type": "object", "properties": {
+         "operation": {"type": "string", "enum": ["list", "get", "search",
+                       "export", "delete"]}, "id": {"type": "string"},
+         "query": {"type": "string"}, "confirmed": {"type": "boolean"}},
+         "required": ["operation"]}},
+    {"name": "control_meeting_notes",
+     "description": "Start, pause, resume, or stop a consented meeting-note "
+                    "transcript. Starting requires confirmed=true after the "
+                    "person explicitly consents; the transcript stays local.",
+     "input_schema": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["start", "pause", "resume", "stop"]},
+         "title": {"type": "string"}, "id": {"type": "string"},
+         "confirmed": {"type": "boolean"}}, "required": ["action"]}},
     {"name": "start_following",
      "description": "Start physically following the person around, driving to keep "
                     "them centered in view. This MOVES the robot, so only call it "
@@ -1240,6 +1272,53 @@ class Companion:
                     return "Need either a delay in minutes or an exact time."
                 self.bus.publish(REMINDER_SET_TOPIC, req)
                 return "Reminder scheduled."
+            if name == "manage_reminders":
+                operation = str(tool_input.get("operation") or "").lower()
+                if operation not in {"list", "delete"}:
+                    return "I can list or delete pending reminders."
+                if operation == "delete" and not bool(tool_input.get("confirmed")):
+                    return ("I need explicit approval before deleting a reminder. "
+                            "Tell me which one to remove and confirm it.")
+                request = {"command": operation}
+                for key in ("id", "query", "confirmed"):
+                    if tool_input.get(key) not in (None, ""):
+                        request[key] = tool_input[key]
+                self.bus.publish(REMINDER_CONTROL_TOPIC, request)
+                return f"Reminder {operation} request sent."
+            if name == "create_note":
+                text = str(tool_input.get("text") or "").strip()
+                if not text:
+                    return "No note text was provided."
+                request = {"command": "create", "text": text, "source": "voice"}
+                if tool_input.get("title"):
+                    request["title"] = str(tool_input["title"])[:120]
+                self.bus.publish(NOTES_TOPIC, request)
+                return "Note saved."
+            if name == "manage_notes":
+                operation = str(tool_input.get("operation") or "").lower()
+                if operation not in {"list", "get", "search", "export", "delete"}:
+                    return "That notes operation is not supported."
+                if operation == "delete" and not bool(tool_input.get("confirmed")):
+                    return ("I need explicit approval before deleting a note or meeting log.")
+                request = {"command": "list" if operation == "search" else operation,
+                           "source": "voice"}
+                for key in ("id", "query", "confirmed"):
+                    if tool_input.get(key) not in (None, ""):
+                        request[key] = tool_input[key]
+                self.bus.publish(NOTES_TOPIC, request)
+                return f"Notes {operation} request sent."
+            if name == "control_meeting_notes":
+                action = str(tool_input.get("action") or "").lower()
+                if action not in {"start", "pause", "resume", "stop"}:
+                    return "I can start, pause, resume, or stop meeting notes."
+                if action == "start" and not bool(tool_input.get("confirmed")):
+                    return "I need explicit consent before starting meeting notes."
+                request = {"command": action, "source": "voice"}
+                for key in ("title", "id", "confirmed"):
+                    if tool_input.get(key) not in (None, ""):
+                        request[key] = tool_input[key]
+                self.bus.publish(NOTES_TOPIC, request)
+                return f"Meeting notes {action} request sent."
             if name == "start_following":
                 self.bus.publish(FOLLOW_CONTROL_TOPIC, {"enabled": True})
                 return "Following started; movement is safety-checked."

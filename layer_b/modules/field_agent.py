@@ -150,7 +150,8 @@ INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
 # radio synonyms AND escalates its own unparsed radio-ish utterances -
 # without them here both modules would escalate the same text twice.
 TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
-                 "music", "song", "ssh", "remote assist", "remote", "host")
+                 "music", "song", "ssh", "remote assist", "remote", "host",
+                 "remind", "reminder", "note", "notes", "meeting")
 
 # Person identity (person_memory.py, optional): greet a recognized person
 # by name, but not every time their face is re-confirmed - once per
@@ -726,6 +727,7 @@ class FieldAgent:
     def __init__(self):
         self.bus = Bus()
         self.lock = threading.Lock()
+        self.meeting_recording = False
 
         self.last_interaction_at = 0.0  # last time speech was clearly for us
         self.explore_mode = False
@@ -1266,7 +1268,20 @@ class FieldAgent:
 
     # ---------- inbound: voice ----------
 
+    def on_notes_state(self, payload):
+        active = payload.get("active_meeting") or {}
+        with self.lock:
+            self.meeting_recording = active.get("state") == "recording"
+
     def on_heard(self, payload):
+        with self.lock:
+            meeting_recording = self.meeting_recording
+        if meeting_recording:
+            # The notes daemon owns the transcript while recording.  Do not
+            # let ordinary meeting sentences become drive commands, chat, or
+            # intent-repair prompts; explicit start/stop controls still reach
+            # the notes daemon on the shared heard topic.
+            return
         text = payload.get("text", "").lower().strip()
         if not text:
             return
@@ -2757,6 +2772,7 @@ class FieldAgent:
 
     def run(self):
         self.bus.subscribe("picarx/audio/heard", self.on_heard)
+        self.bus.subscribe("picarx/tools/notes/state", self.on_notes_state)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe("picarx/action/result", self.on_action_result)
         self.bus.subscribe("picarx/coach/suggestion", self.on_coach_suggestion)
