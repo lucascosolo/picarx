@@ -2,7 +2,7 @@
 
 Generated: 2026-07-26
 Repository: <https://github.com/lucascosolo/picarx>
-Baseline: `master` at `fe260b9`
+Baseline: `master` at `3f33224`
 
 This is the single source of truth for planned work and delivered roadmap
 features. The previous `ROADMAP_STATUS.md` build log has been folded into the
@@ -25,6 +25,15 @@ not to expand navigation sophistication first:
 2. **Gesture-responsive head:** use MediaPipe Hands so the robot follows a
    pointing or moving hand while keeping the tracked hand near the middle of
    the camera frame, without overheating the Pi or exceeding servo limits.
+3. **Notes and reminders:** make “remind me”, “take a note”, and “take notes”
+   first-class, persistent interactions. A one-off note should land in the
+   memory bank; a meeting session should continuously append timestamped
+   transcript segments until the user stops it. The robot must be able to
+   list and delete reminders and notes, announce pending reminders after boot,
+   and speak each reminder at its scheduled time.
+4. **Reliable LLM access:** put all Claude calls behind one complexity-aware
+   helper and use an optional OpenAI API fallback when Claude is unavailable,
+   without moving tool or safety authority out of the robot modules.
 
 The existing navigation and memory work remains valuable, but it follows these
 user-facing capabilities unless a dependency or safety issue moves it forward.
@@ -43,14 +52,22 @@ The new work is underway in the current worktree:
   Pi hardware and thermal validation remain outstanding.
 - **Remote assist:** voice and `/tools` web-console controls, scoped JSON-lines
   helper, SSH host validation, typed companion tools for remote project
-  operations, explicit write/command confirmation, and robot-side helper
-  bootstrapping are implemented. A real provisioned-host end-to-end test and
-  host-key/user setup validation remain outstanding.
+  operations, robot-side helper bootstrapping, bounded session logs, rollback
+  of the last applied patch, and session-scoped write authorization are
+  implemented. A real provisioned-host end-to-end test and host-key/user setup
+  validation remain outstanding.
 - **Follow/perception feedback:** producer timestamps, bounded head
   reacquisition, stale-track handling, human-correction dataset capture, and
-  COCO export are implemented. Detector-weight retraining is intentionally
-  still an offline, measured follow-up; current on-device correction is
-  `label_memory`, not weight training.
+  COCO export are implemented. A deterministic Darknet training-bundle
+  builder, optional offline training runner, evaluation-metric promotion gate,
+  and rollback-backed candidate promotion tool are implemented. No candidate
+  weights have been trained or promoted in this environment; current on-device
+  correction remains `label_memory`, not weight training.
+- **Notes/reminders:** relative and clock-time reminders already persist,
+  re-arm after restart, and speak when due. User-facing single-note capture,
+  continuous meeting logging, deletion, reminder listing, and the bounded boot
+  briefing are still roadmap work; the existing `picarx/memory/note` topic is
+  not yet a complete user notes product.
 - **Hardware boundary:** the safety daemon globally clamps pan to
   `[-75°, +75°]` and tilt to `[-35°, +35°]`, while gesture tracking remains
   intentionally narrower at pan `[-35°, +35°]` and tilt `[-30°, +30°]`.
@@ -98,7 +115,10 @@ turn unauthenticated speech into unrestricted remote code execution.
    192.168.1.20”). Do not ask the user to speak a password. Use a
    pre-provisioned SSH key, verify the host key, show the target and scope,
    and require explicit confirmation before the first connection and before
-   writes or destructive commands.
+   writes or destructive commands. A confirmed “grant remote write access”
+   action may authorize patch/rollback writes for the connected session;
+   revoke or disconnect clears that grant. Individual remote commands remain
+   separately confirmed.
 3. **Self-bootstrap over SSH.** After authentication, open a short-lived SSH
    bootstrap command that streams the helper source from the robot to a
    private, random host temp path, then start that file as the JSON-lines
@@ -112,9 +132,9 @@ turn unauthenticated speech into unrestricted remote code execution.
    reads unless explicitly requested through a bounded artifact path.
 5. **Code-change and debug loop.** Default to previewing a patch, then apply
    only an approved diff. Permit an allowlisted command set for common project
-   workflows, with timeouts, output caps, cancellation, and a session log.
-   Add rollback by retaining the pre-change patch or using a host-side git
-   worktree/commit boundary.
+   workflows, with timeouts, output caps, cancellation, and a metadata-only
+   session log. Add rollback by retaining the last applied patch or using a
+   host-side git worktree/commit boundary.
 6. **Robot integration.** Add a `REMOTE_ASSIST` mode, spoken progress/error
    summaries, web-console session controls, disconnect/kill commands, and
    persistence of the last target without persisting private keys or secrets.
@@ -245,6 +265,105 @@ angles, and loss of a module or heartbeat returns the robot to a safe state.
 
 **Estimated effort:** 30–48 hours across the three tasks, plus Pi testing.
 
+### P0 — Notes, meeting logging, and reminder lifecycle
+
+This is the next user-facing utility track after the shared state/safety gate.
+Every new command must have both a voice path and an equivalent typed web
+console control; the console must publish typed, allowlisted requests rather
+than arbitrary bus messages.
+
+1. **Reminder lifecycle.** Preserve the existing example flow — “remind me in
+   10 minutes to take out the trash” — while adding deterministic parsing for
+   relative and exact local times, a bounded list/status view, stable IDs, and
+   delete/cancel operations that disarm the timer and persist immediately.
+   Re-arm surviving reminders after restart, announce a short list of pending
+   reminders once the robot is ready after boot, and continue speaking each
+   reminder at its due time. Invalid, duplicate, or over-capacity requests
+   must fail visibly instead of silently creating timers.
+2. **Single notes.** Add “take a note …” / “remember …” as an explicit user
+   command that writes a timestamped, user-authored memory entry. Provide
+   list/search, inspect, and delete/archive operations. Deletion should be a
+   reversible or auditable lifecycle state where practical, rather than
+   pretending that an immutable event-journal row disappeared.
+3. **Continuous meeting notes.** Add explicit `start`, `pause`, `resume`, and
+   `stop` controls with a session ID and a consent acknowledgement before
+   recording. While active, append bounded transcript segments from the speech
+   recognizer with timestamps, speaker/source metadata when available, and
+   periodic flushes so a crash loses only the current small segment. Do not
+   send every segment through the LLM or let an unbounded meeting consume the
+   semantic-fact table; finalize into a searchable note or exportable text
+   artifact, with retention and delete controls.
+4. **Boot and notification behavior.** Announce at most a small, configurable
+   number of due-soon/pending reminders at boot, suppress or defer the briefing
+   while RC, safety stop, or another higher-priority speech owner is active,
+   and expose notification state in telemetry. A fired reminder should be
+   acknowledged as delivered and never repeat after a restart.
+5. **Web console and verification.** Add a Notes/Reminders page or a clearly
+   scoped section in `/tools` with create/list/search/delete, meeting-session
+   controls, transcript preview/export, and explicit confirmation for deletes
+   or recording. Test parser edge cases, timer cancellation and persistence,
+   boot idempotence, crash-safe segment flushing, deletion semantics, privacy
+   boundaries, and parity between voice and web requests.
+
+**Acceptance:** a user can say or submit the example reminder, see and cancel
+it, reboot without losing it, and hear it exactly once at the requested time.
+They can create one memory note, remove it, and start/stop a consented meeting
+log whose bounded transcript is searchable afterward. No note or transcript is
+silently sent to the cloud merely because it was recorded.
+
+**Estimated effort:** 14–24 hours, excluding a full speech-recognition quality
+pass.
+
+### P0 — Unified LLM gateway with Claude routing and OpenAI fallback
+
+The current LLM users (`companion.py`, `coach.py`, and `reflection.py`) each
+own an Anthropic client and call Claude directly. Replace those provider
+boundaries with one small, fail-soft helper while keeping prompts, safety
+policy, and tool authorization in the calling modules.
+
+1. **Common request contract.** Create a shared LLM helper that accepts a
+   request ID, task name, complexity (`low`, `standard`, or `high`), system
+   and user content, optional images, optional tool schemas, token/time limits,
+   and a privacy classification. Return normalized text, structured/tool-call
+   content, usage, provider, model, latency, and failure metadata. The helper
+   must not execute a tool or publish motion; it only selects a provider and
+   returns a response.
+2. **Preserve the present Claude behavior.** Route simple/fast intent,
+   reflection, and coaching work to the existing Claude Haiku configuration;
+   route open-ended companion work and other high-complexity requests to the
+   existing Claude Sonnet configuration. Keep model IDs configurable and do
+   not silently upgrade or downgrade a task merely because a provider failed.
+   Modules declare complexity rather than embedding provider/model selection.
+3. **OpenAI fallback.** Add an optional OpenAI adapter using only the
+   `OPENAI_API_KEY` environment variable, with configurable fallback model IDs
+   and no secrets in `config.json`, logs, MQTT payloads, or the web console.
+   If Claude reports quota/usage exhaustion, token exhaustion, timeout, or a
+   transient API/package failure, retry the same idempotent request through
+   OpenAI and mark the response as a fallback. Do not duplicate side effects
+   from tool calls, and do not fall back around a safety/policy refusal without
+   an explicit policy decision.
+4. **Dependency and privacy behavior.** Keep both SDK imports optional. If
+   neither provider is usable, callers retain their current local fail-soft
+   behavior. Make image/audio/transcript forwarding explicit by privacy class,
+   expose provider/model/fallback/error telemetry, and bound retained prompts
+   and response logs.
+5. **Migration and verification.** Migrate conversation/tool loops, intent
+   repair, object identification, coach planning, and reflection extraction
+   without changing their output parsers. Add fake-provider tests for
+   complexity routing, Claude success, quota/error fallback, missing keys or
+   SDKs, normalized tool/image responses, timeout bounds, and no duplicate
+   tool execution. Surface gateway health/configuration in the web console;
+   no new provider command may bypass the helper.
+
+**Acceptance:** every production LLM call passes through the shared helper;
+the helper selects the existing Claude model family from declared task
+complexity, and a configured `OPENAI_API_KEY` transparently handles eligible
+Claude failures with an auditable provider/fallback marker. Missing providers
+still leave the robot operational in its existing degraded mode.
+
+**Estimated effort:** 16–26 hours, including provider-adapter tests and a
+careful tool-loop migration.
+
 ## Navigation and memory backlog
 
 The following items were validated against the existing architecture. Items 1
@@ -341,6 +460,6 @@ dependencies are missing.
   gesture throttling reasons without storing credentials, private keys, or raw
   camera frames by default.
 - Current baseline verification: `python3 -m unittest discover -s tests -p
-  'test_*.py'` passes 865 tests. `pytest` is not currently installed.
+  'test_*.py'` passes 873 tests. `pytest` is not currently installed.
 - Field calibration, Pi thermal measurements, MediaPipe model packaging, and
   host-helper installation are excluded from the engineering-hour estimates.
