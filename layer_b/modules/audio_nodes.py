@@ -639,6 +639,16 @@ class AudioNode:
         self-mic mute around playback (the mic sits next to the speaker, so
         without this the robot decodes its own voice and holds the gate open)."""
         print(f"PiCar Speaking: {text}")
+        # SPEAKING is an exclusive resource state: vision/gesture consumers
+        # drop camera work while the speaker is active instead of competing
+        # for the Pi CPU and allowing a frame backlog to form.  Keep this
+        # optional so older/off-robot bare AudioNode test fixtures and
+        # installations without robot_state continue to speak normally.
+        state_bus = getattr(self, "bus", None)
+        if state_bus is not None:
+            state_bus.publish("picarx/state/claim", {
+                "owner": "audio_nodes", "state": "SPEAKING", "ttl": 30.0,
+                "reason": "TTS playback", "ts": time.time()})
         # Re-assert the speaker amp right before speaking (throttled) so a
         # HAT init or GPIO reset at ANY point after boot can't leave the
         # robot permanently mute - see the SPEAKER_REASSERT_INTERVAL note.
@@ -663,6 +673,9 @@ class AudioNode:
                 print(f"TTS failed entirely ({e}); staying silent.")
         finally:
             self.mute_until = time.time() + SELF_SPEECH_MUTE_TAIL_SEC
+            if state_bus is not None:
+                state_bus.publish("picarx/state/release", {
+                    "owner": "audio_nodes", "ts": time.time()})
 
     def _speak_espeak(self, text, voice=None):
         """Shell espeak --stdout into aplay on the robot speaker (the proven

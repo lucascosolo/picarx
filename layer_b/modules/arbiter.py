@@ -45,6 +45,7 @@ SOCKET_PATH = "/tmp/picarx_safety.sock"
 TICK_HZ = 10  # how often we resolve intents and send to the daemon
 DEFAULT_TTL = 1.0
 STOP_ACTION = {"direction": "stop"}
+STATE_TOPIC = "picarx/state/current"
 
 
 class Arbiter:
@@ -55,6 +56,12 @@ class Arbiter:
         self.intents = {}
         self.last_sent_action = None
         self.last_look_sent = None
+        # Optional resource-state gate.  If robot_state is not running this
+        # stays None and the legacy look channel remains functional; when a
+        # state is present, exclusive modes are enforced at the last Layer-B
+        # boundary before a look reaches the safety daemon.
+        self.state_lock = threading.Lock()
+        self.robot_state = None
 
     # ---------- intent bookkeeping ----------
 
@@ -63,6 +70,8 @@ class Arbiter:
         action = payload.get("action")
         if not source or not action:
             print(f"Arbiter: dropping malformed intent {payload}")
+            return
+        if not self._motion_allowed(payload):
             return
 
         priority = payload.get("priority", 0)
@@ -81,6 +90,56 @@ class Arbiter:
         with self.lock:
             self.intents.pop(source, None)
 
+    def on_robot_state(self, payload):
+        if isinstance(payload, dict):
+            with self.state_lock:
+                self.robot_state = dict(payload)
+            mode = str(payload.get("state") or "")
+            if mode in {"GESTURE_TRACKING", "REMOTE_ASSIST", "SAFETY_STOP"}:
+                with self.lock:
+                    self.intents.clear()
+                    self.last_sent_action = None
+            elif mode == "RC":
+                # The RC controller publishes drive intents as source `rc`;
+                # clear autonomous winners immediately when manual control
+                # takes ownership rather than waiting for their TTLs.
+                with self.lock:
+                    self.intents = {s: intent for s, intent in self.intents.items()
+                                    if s == "rc"}
+                    self.last_sent_action = None
+
+    def _state_snapshot(self):
+        with self.state_lock:
+            return dict(self.robot_state or {})
+
+    def _motion_allowed(self, payload):
+        """Gate wheel intents when an exclusive state owns the robot."""
+        state = self._state_snapshot()
+        mode = str(state.get("state") or "")
+        source = str(payload.get("source") or "")
+        if mode == "RC":
+            return source == "rc"
+        if mode in {"GESTURE_TRACKING", "REMOTE_ASSIST", "SAFETY_STOP"}:
+            return False
+        return True
+
+    def _look_allowed(self, payload):
+        """Enforce exclusive head ownership without breaking old installs."""
+        state = self._state_snapshot()
+        mode = str(state.get("state") or "")
+        if not mode:
+            return True
+        source = str(payload.get("source") or "")
+        owner = str(state.get("owner") or "")
+        if mode == "GESTURE_TRACKING":
+            return source == owner == "gesture_tracking"
+        # Speech, RC, remote assistance, and an active safety stop own the
+        # robot exclusively. None of those modes should move the head from a
+        # competing module while they are active.
+        if mode in {"SPEAKING", "RC", "REMOTE_ASSIST", "SAFETY_STOP"}:
+            return source == owner and mode == "SPEAKING" and owner == "audio_nodes"
+        return True
+
     def on_look(self, payload):
         """
         Camera head (pan/tilt) channel - deliberately OUTSIDE the
@@ -92,6 +151,8 @@ class Arbiter:
         """
         action = payload.get("action") or {}
         if action.get("direction") != "look":
+            return
+        if not self._look_allowed(payload):
             return
         key = (action.get("pan", 0), action.get("tilt", 0))
         if key == self.last_look_sent:
@@ -133,6 +194,7 @@ class Arbiter:
         self.bus.subscribe("picarx/intent/move", self.on_intent)
         self.bus.subscribe("picarx/intent/cancel", self.on_cancel)
         self.bus.subscribe("picarx/intent/look", self.on_look)
+        self.bus.subscribe(STATE_TOPIC, self.on_robot_state)
         print("Arbiter active. Waiting for motion intents.")
 
         period = 1.0 / TICK_HZ
