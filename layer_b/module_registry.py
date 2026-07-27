@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Load the tracked module defaults plus an optional robot-local overlay.
+"""Load the tracked module catalog plus an optional robot-local overlay.
 
-``module_registry.json`` is intentionally safe to version and deploy.  A
-robot can keep machine-specific enablement in the ignored
-``module_registry.local.json`` file instead, so changing a module's state no
-longer dirties the tracked manifest or creates pull conflicts.
+``module_registry.json`` is intentionally safe to version and deploy. The
+``activation`` field describes need-driven lifecycle policy; the orchestrator
+normally decides when a module runs. A robot can keep machine-specific
+availability overrides in the ignored ``module_registry.local.json`` file
+instead, so changing the catalog no longer dirties the tracked manifest or
+creates pull conflicts.
 """
 import json
 import os

@@ -1,34 +1,326 @@
 [
-  {"name": "robot_state", "version": "0.1", "entrypoint": "robot_state.py", "enabled": true},
-  {"name": "gesture_tracking", "version": "0.1", "entrypoint": "gesture_tracking.py", "enabled": true},
-  {"name": "remote_assist", "version": "0.1", "entrypoint": "remote_assist.py", "enabled": true},
-  {"name": "vision_basic", "version": "0.1", "entrypoint": "vision_basic.py", "enabled": true},
-  {"name": "person_memory", "version": "0.1", "entrypoint": "person_memory.py", "enabled": true},
-  {"name": "distance_sensor", "version": "0.1", "entrypoint": "distance_sensor.py", "enabled": true},
-  {"name": "imu", "version": "0.1", "entrypoint": "imu.py", "enabled": true},
-  {"name": "audio_nodes", "version": "0.1", "entrypoint": "audio_nodes.py", "enabled": true},
-  {"name": "dialog", "version": "0.1", "entrypoint": "dialog.py", "enabled": true},
-  {"name": "arbiter", "version": "0.1", "entrypoint": "arbiter.py", "enabled": true},
-  {"name": "world_state", "version": "0.1", "entrypoint": "world_state.py", "enabled": true},
-  {"name": "event_logger", "version": "0.1", "entrypoint": "event_logger.py", "enabled": true},
-  {"name": "coach", "version": "0.1", "entrypoint": "coach.py", "enabled": true},
-  {"name": "companion", "version": "0.1", "entrypoint": "companion.py", "enabled": true},
-  {"name": "field_agent", "version": "0.1", "entrypoint": "field_agent.py", "enabled": true},
-  {"name": "debug_monitor", "version": "0.1", "entrypoint": "debug_monitor.py", "enabled": true},
-  {"name": "behavior_metrics", "version": "0.1", "entrypoint": "behavior_metrics.py", "enabled": true},
-  {"name": "reflection", "version": "0.1", "entrypoint": "reflection.py", "enabled": true},
-  {"name": "self_trainer", "version": "0.1", "entrypoint": "self_trainer.py", "enabled": false},
-  {"name": "location_graph", "version": "0.1", "entrypoint": "location_graph.py", "enabled": true},
-  {"name": "explorer", "version": "0.1", "entrypoint": "explorer.py", "enabled": true},
-  {"name": "goal_manager", "version": "0.1", "entrypoint": "goal_manager.py", "enabled": true},
-  {"name": "tools_registry", "version": "0.1", "entrypoint": "tools_registry.py", "enabled": true},
-  {"name": "radio", "version": "0.1", "entrypoint": "radio.py", "enabled": true},
-  {"name": "curiosity", "version": "0.1", "entrypoint": "curiosity.py", "enabled": true},
-  {"name": "expressions", "version": "0.1", "entrypoint": "expressions.py", "enabled": true},
-  {"name": "reminder_daemon", "version": "0.1", "entrypoint": "tools/reminder_daemon.py", "enabled": true},
-  {"name": "notes_daemon", "version": "0.1", "entrypoint": "tools/notes_daemon.py", "enabled": true},
-  {"name": "follow_daemon", "version": "0.1", "entrypoint": "tools/follow_daemon.py", "enabled": true},
-  {"name": "bluetooth_daemon", "version": "0.1", "entrypoint": "tools/bluetooth_daemon.py", "enabled": true},
-  {"name": "health_daemon", "version": "0.1", "entrypoint": "tools/health_daemon.py", "enabled": true},
-  {"name": "web_console", "version": "0.1", "entrypoint": "web_console.py", "enabled": true}
+  {
+    "name": "robot_state",
+    "version": "0.1",
+    "entrypoint": "robot_state.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "gesture_tracking",
+    "version": "0.1",
+    "entrypoint": "gesture_tracking.py",
+    "enabled": true,
+    "activation": {
+      "mode": "demand",
+      "topic": "picarx/gesture/control",
+      "enabled_field": "enabled",
+      "persistent": true
+    }
+  },
+  {
+    "name": "remote_assist",
+    "version": "0.1",
+    "entrypoint": "remote_assist.py",
+    "enabled": true,
+    "activation": {
+      "mode": "demand",
+      "topic": "picarx/tools/remote_assist",
+      "persistent": true,
+      "stop_commands": [
+        "disconnect",
+        "close",
+        "stop"
+      ]
+    }
+  },
+  {
+    "name": "vision_basic",
+    "version": "0.1",
+    "entrypoint": "vision_basic.py",
+    "enabled": true,
+    "activation": {
+      "mode": "state",
+      "states": [
+        "IDLE",
+        "OBJECT_DETECTION",
+        "SPEAKING",
+        "REMOTE_ASSIST",
+        "RC"
+      ]
+    }
+  },
+  {
+    "name": "person_memory",
+    "version": "0.1",
+    "entrypoint": "person_memory.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "distance_sensor",
+    "version": "0.1",
+    "entrypoint": "distance_sensor.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "imu",
+    "version": "0.1",
+    "entrypoint": "imu.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "audio_nodes",
+    "version": "0.1",
+    "entrypoint": "audio_nodes.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "dialog",
+    "version": "0.1",
+    "entrypoint": "dialog.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "arbiter",
+    "version": "0.1",
+    "entrypoint": "arbiter.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "world_state",
+    "version": "0.1",
+    "entrypoint": "world_state.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "event_logger",
+    "version": "0.1",
+    "entrypoint": "event_logger.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "coach",
+    "version": "0.1",
+    "entrypoint": "coach.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "companion",
+    "version": "0.1",
+    "entrypoint": "companion.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "field_agent",
+    "version": "0.1",
+    "entrypoint": "field_agent.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "debug_monitor",
+    "version": "0.1",
+    "entrypoint": "debug_monitor.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "behavior_metrics",
+    "version": "0.1",
+    "entrypoint": "behavior_metrics.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "reflection",
+    "version": "0.1",
+    "entrypoint": "reflection.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "self_trainer",
+    "version": "0.1",
+    "entrypoint": "self_trainer.py",
+    "enabled": false,
+    "activation": {
+      "mode": "demand",
+      "topic": "picarx/system/training",
+      "enabled_field": "active",
+      "persistent": true
+    }
+  },
+  {
+    "name": "location_graph",
+    "version": "0.1",
+    "entrypoint": "location_graph.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "explorer",
+    "version": "0.1",
+    "entrypoint": "explorer.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "goal_manager",
+    "version": "0.1",
+    "entrypoint": "goal_manager.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "tools_registry",
+    "version": "0.1",
+    "entrypoint": "tools_registry.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "radio",
+    "version": "0.1",
+    "entrypoint": "radio.py",
+    "enabled": true,
+    "activation": {
+      "mode": "demand",
+      "topic": "picarx/tools/radio",
+      "state_topic": "picarx/tools/radio_state",
+      "state_field": "playing",
+      "ttl_sec": 180,
+      "stop_commands": [
+        "stop"
+      ]
+    }
+  },
+  {
+    "name": "curiosity",
+    "version": "0.1",
+    "entrypoint": "curiosity.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "expressions",
+    "version": "0.1",
+    "entrypoint": "expressions.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "reminder_daemon",
+    "version": "0.1",
+    "entrypoint": "tools/reminder_daemon.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "notes_daemon",
+    "version": "0.1",
+    "entrypoint": "tools/notes_daemon.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "follow_daemon",
+    "version": "0.1",
+    "entrypoint": "tools/follow_daemon.py",
+    "enabled": true,
+    "activation": {
+      "mode": "demand",
+      "topic": "picarx/tools/follow/set",
+      "enabled_field": "enabled",
+      "state_topic": "picarx/tools/follow/state",
+      "state_field": "enabled",
+      "persistent": true
+    }
+  },
+  {
+    "name": "bluetooth_daemon",
+    "version": "0.1",
+    "entrypoint": "tools/bluetooth_daemon.py",
+    "enabled": true,
+    "activation": {
+      "mode": "demand",
+      "topic": "picarx/tools/bluetooth/connect",
+      "state_topic": "picarx/tools/bluetooth/state",
+      "state_field": "online",
+      "ttl_sec": 120
+    }
+  },
+  {
+    "name": "health_daemon",
+    "version": "0.1",
+    "entrypoint": "tools/health_daemon.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "web_console",
+    "version": "0.1",
+    "entrypoint": "web_console.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  }
 ]
