@@ -77,6 +77,26 @@ class GestureTrackingTests(unittest.TestCase):
         self.assertEqual(look["action"], {"direction": "look", "pan": 0.0, "tilt": 0.0})
         self.assertEqual(tracker.controller.pose(), (0.0, 0.0))
 
+    def test_model_import_failure_reports_missing_dependency(self):
+        tracker = GestureTracker()
+        original_import = __import__
+
+        def missing_mediapipe(name, *args, **kwargs):
+            if name == "mediapipe":
+                raise ModuleNotFoundError("No module named 'mediapipe'", name="mediapipe")
+            return original_import(name, *args, **kwargs)
+
+        import builtins
+        builtins.__import__, saved = missing_mediapipe, builtins.__import__
+        try:
+            self.assertFalse(tracker._load_hands())
+        finally:
+            builtins.__import__ = saved
+        status = tracker.bus.last("picarx/gesture/status")
+        self.assertEqual(status["state"], "model_error")
+        self.assertIn("mediapipe", status["error"])
+        self.assertIn(sys.executable, status["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

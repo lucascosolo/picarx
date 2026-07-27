@@ -277,6 +277,7 @@ class GestureTracker:
         self._capture_thread = None
         self._camera = None
         self._hands = None
+        self._model_error = None
         self._last_pose = None
         self._last_hand_at = 0.0
 
@@ -363,9 +364,22 @@ class GestureTracker:
                 static_image_mode=False, max_num_hands=1,
                 model_complexity=0, min_detection_confidence=0.55,
                 min_tracking_confidence=0.55)
-        except Exception as e:
+            self._model_error = None
+        except ModuleNotFoundError as e:
+            missing = e.name or "an import"
+            self._model_error = (
+                f"missing Python package '{missing}'; install the gesture "
+                "runtime dependencies with the same interpreter running "
+                f"the module ({sys.executable})"
+            )
             self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "model_error",
-                                             "error": str(e)[:200], "ts": time.time()})
+                                             "error": self._model_error, "exception": str(e),
+                                             "ts": time.time()})
+            self._hands = False
+        except Exception as e:
+            self._model_error = f"{type(e).__name__}: {e}"
+            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "model_error",
+                                             "error": self._model_error[:200], "ts": time.time()})
             self._hands = False
         return self._hands
 
