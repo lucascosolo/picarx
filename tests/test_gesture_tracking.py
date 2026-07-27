@@ -66,6 +66,12 @@ class GestureTrackingTests(unittest.TestCase):
         self.assertEqual(hand_target(result, 320, 240), (256.0, 60.0))
         self.assertIsNone(hand_target(types.SimpleNamespace(multi_hand_landmarks=[]), 320, 240))
 
+    def test_hand_target_accepts_tasks_api_landmarks(self):
+        points = [types.SimpleNamespace(x=0.5, y=0.5) for _ in range(21)]
+        points[8] = types.SimpleNamespace(x=0.25, y=0.75)
+        result = types.SimpleNamespace(hand_landmarks=[points])
+        self.assertEqual(hand_target(result, 320, 240), (80.0, 180.0))
+
     def test_hand_loss_recenters_after_short_hold(self):
         tracker = GestureTracker()
         tracker.enabled = True

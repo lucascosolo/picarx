@@ -289,6 +289,10 @@ stack runs without it (it degrades to vision + ultrasonic). Vision uses
 `picamera2` + OpenCV; speech uses Vosk (STT) and eSpeak/MBROLA (TTS). Internet
 radio needs `mpv` (optional).
 
+Gesture tracking uses MediaPipe's Tasks API. On its first enable, the hand
+landmarker asset is downloaded to the ignored `layer_b/data/models/mediapipe/`
+directory; it can also be placed there manually on an offline robot.
+
 > The code resolves its own paths relative to the `layer_b/` directory it lives
 > in, so the tree can be checked out or deployed anywhere — no fixed install
 > location. Set `LAYER_B_HOME` to override the root (e.g. a symlinked install, or

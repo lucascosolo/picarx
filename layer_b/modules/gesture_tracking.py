@@ -51,6 +51,17 @@ LOOK_TOPIC = "picarx/intent/look"
 OWNER = "gesture_tracking"
 STATE_NAME = "GESTURE_TRACKING"
 
+# MediaPipe removed the legacy ``mp.solutions`` Python API in 0.10.30.  The
+# replacement Tasks API needs a separate .task model asset; keep it beside the
+# other ignored, install-time vision models and fetch it lazily on first use.
+HAND_MODEL_DIR = robot_config.data_path("models", "mediapipe") \
+    if robot_config is not None else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "models", "mediapipe")
+HAND_MODEL_PATH = os.path.join(HAND_MODEL_DIR, "hand_landmarker.task")
+HAND_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task")
+
 
 def _clamp(value, low, high):
     return max(low, min(high, float(value)))
@@ -249,11 +260,21 @@ def hand_target(results, frame_width, frame_height):
     The index fingertip is preferred for pointing. For an open/partially
     occluded hand, the palm landmarks provide a less jumpy fallback.
     """
-    hands = getattr(results, "multi_hand_landmarks", None) or []
+    # Legacy Solutions returns ``multi_hand_landmarks``.  Tasks returns
+    # ``hand_landmarks`` as a list of plain landmark lists.  Both contain the
+    # same normalized x/y coordinates, so keep the controller independent of
+    # which MediaPipe generation supplied the result.
+    hands = getattr(results, "multi_hand_landmarks", None)
+    if hands is None:
+        hands = getattr(results, "hand_landmarks", None)
+    hands = hands or []
     if not hands:
         return None
     hand = hands[0]
-    landmarks = getattr(hand, "landmark", None) or []
+    landmarks = getattr(hand, "landmark", None)
+    if landmarks is None and isinstance(hand, (list, tuple)):
+        landmarks = hand
+    landmarks = landmarks or []
     if len(landmarks) < 18:
         return None
     point = landmarks[8]  # index fingertip
@@ -277,6 +298,8 @@ class GestureTracker:
         self._capture_thread = None
         self._camera = None
         self._hands = None
+        self._hands_backend = None
+        self._mediapipe = None
         self._model_error = None
         self._last_pose = None
         self._last_hand_at = 0.0
@@ -377,10 +400,33 @@ class GestureTracker:
             return self._hands
         try:
             import mediapipe as mp
-            self._hands = mp.solutions.hands.Hands(
-                static_image_mode=False, max_num_hands=1,
-                model_complexity=0, min_detection_confidence=0.55,
-                min_tracking_confidence=0.55)
+            legacy = getattr(getattr(mp, "solutions", None), "hands", None)
+            if legacy is not None:
+                self._hands = legacy.Hands(
+                    static_image_mode=False, max_num_hands=1,
+                    model_complexity=0, min_detection_confidence=0.55,
+                    min_tracking_confidence=0.55)
+                self._hands_backend = "solutions"
+            else:
+                # MediaPipe >= 0.10.30 no longer ships mp.solutions.  Use the
+                # supported Tasks API instead of requiring users to downgrade
+                # the package or install a distro-specific replacement.
+                if not self._ensure_hand_model():
+                    self._hands = False
+                    return self._hands
+                from mediapipe.tasks import python as mp_python
+                from mediapipe.tasks.python import vision
+                options = vision.HandLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(
+                        model_asset_path=HAND_MODEL_PATH),
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_hands=1,
+                    min_hand_detection_confidence=0.55,
+                    min_hand_presence_confidence=0.55,
+                    min_tracking_confidence=0.55)
+                self._hands = vision.HandLandmarker.create_from_options(options)
+                self._hands_backend = "tasks"
+            self._mediapipe = mp
             self._model_error = None
         except ModuleNotFoundError as e:
             missing = e.name or "an import"
@@ -399,6 +445,40 @@ class GestureTracker:
                                              "error": self._model_error[:200], "ts": time.time()})
             self._hands = False
         return self._hands
+
+    def _ensure_hand_model(self):
+        """Ensure the MediaPipe Tasks hand model exists, downloading it once."""
+        if os.path.isfile(HAND_MODEL_PATH):
+            return True
+        try:
+            from urllib.request import urlopen
+            os.makedirs(HAND_MODEL_DIR, exist_ok=True)
+            temporary = HAND_MODEL_PATH + ".tmp"
+            try:
+                with urlopen(HAND_MODEL_URL, timeout=30) as response, \
+                        open(temporary, "wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                if os.path.getsize(temporary) < 1024:
+                    raise ValueError("downloaded file is unexpectedly small")
+                os.replace(temporary, HAND_MODEL_PATH)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+            return True
+        except Exception as e:
+            self._model_error = (
+                f"MediaPipe hand model unavailable at {HAND_MODEL_PATH}: {e}. "
+                f"Download it from {HAND_MODEL_URL}")
+            self.bus.publish(STATUS_TOPIC, {
+                "enabled": self.enabled, "state": "model_error",
+                "error": self._model_error[:500], "ts": time.time()})
+            return False
 
     def process_once(self, now=None):
         now = time.monotonic() if now is None else float(now)
@@ -430,7 +510,12 @@ class GestureTracker:
         try:
             # Picamera2 is configured as RGB888 and MediaPipe expects RGB;
             # avoid an unnecessary conversion (and its extra Pi CPU cost).
-            results = hands.process(frame)
+            if self._hands_backend == "tasks":
+                image = self._mediapipe.Image(
+                    image_format=self._mediapipe.ImageFormat.SRGB, data=frame)
+                results = hands.detect(image)
+            else:
+                results = hands.process(frame)
         except Exception as e:
             self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "process_error",
                                              "error": str(e)[:200], "ts": time.time()})
