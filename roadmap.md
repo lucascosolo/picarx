@@ -2,7 +2,7 @@
 
 Generated: 2026-07-26
 Repository: <https://github.com/lucascosolo/picarx>
-Baseline: `master` at `1ebd6a8`
+Baseline: `master` at `fb16ffc`
 
 This is the single source of truth for planned work and delivered roadmap
 features. The previous `ROADMAP_STATUS.md` build log has been folded into the
@@ -63,11 +63,11 @@ The new work is underway in the current worktree:
   and rollback-backed candidate promotion tool are implemented. No candidate
   weights have been trained or promoted in this environment; current on-device
   correction remains `label_memory`, not weight training.
-- **Notes/reminders:** relative and clock-time reminders already persist,
-  re-arm after restart, and speak when due. User-facing single-note capture,
-  continuous meeting logging, deletion, reminder listing, and the bounded boot
-  briefing are still roadmap work; the existing `picarx/memory/note` topic is
-  not yet a complete user notes product.
+- **Notes/reminders:** relative and clock-time reminders persist, re-arm after
+  restart, list/delete through voice, companion, and web console controls, and
+  speak when due. Single notes, auditable deletion, consented continuous meeting
+  logging, transcript export, and the bounded boot briefing are implemented in
+  the current worktree. Full target-Pi speech/privacy validation remains.
 - **Hardware boundary:** the safety daemon globally clamps pan to
   `[-75°, +75°]` and tilt to `[-35°, +35°]`, while gesture tracking remains
   intentionally narrower at pan `[-35°, +35°]` and tilt `[-30°, +30°]`.
@@ -268,6 +268,11 @@ angles, and loss of a module or heartbeat returns the robot to a safe state.
 ### P0 — Notes, meeting logging, and reminder lifecycle
 
 This is the next user-facing utility track after the shared state/safety gate.
+The first implementation is now in the worktree: `notes_store.py` owns bounded
+durable JSON records, `notes_daemon.py` owns meeting capture and mirrors only
+finalized notes to the semantic-memory writer, and reminder/notes controls are
+available through voice, typed companion tools, and the web console. Remaining
+work is field validation and the hardening items in the acceptance tests below.
 Every new command must have both a voice path and an equivalent typed web
 console control; the console must publish typed, allowlisted requests rather
 than arbitrary bus messages.
@@ -363,6 +368,73 @@ still leave the robot operational in its existing degraded mode.
 
 **Estimated effort:** 16–26 hours, including provider-adapter tests and a
 careful tool-loop migration.
+
+### P1 — High-confidence LLM tool disambiguation and recovery
+
+This track follows the unified LLM gateway. The existing companion intent
+arbiter repairs a small set of unparsed phrases and caches successful mappings,
+but it does not systematically inspect failed or misinterpreted tool calls.
+Expand it only after all provider calls use the shared gateway above.
+
+1. **Tool catalog and evidence.** Give the disambiguator a machine-readable
+   catalog of tool names, required fields, safety class, expected result shape,
+   and valid voice/web aliases. Feed it the original utterance, the router's
+   attempted interpretation, tool-result errors/timeouts, and current robot
+   state. Never infer a motion primitive from free-form model text.
+2. **Confidence-gated correction.** Ask the LLM for a structured candidate
+   tool call, confidence, rationale, and whether clarification is required.
+   Auto-retry only when confidence clears a high threshold, the candidate is
+   non-motion or read-only, the request is idempotent, and the failed attempt
+   provides matching evidence. For writes, deletes, remote commands, meeting
+   recording, or any movement-affecting tool, require explicit confirmation
+   rather than treating confidence as consent. At most one repair attempt is
+   allowed per request to prevent loops and duplicate side effects.
+3. **Failure learning.** Record redacted attempted route, correction, outcome,
+   and confidence in the existing phrase cache/decision journal. A human
+   correction may promote a deterministic alias; an uncertain or conflicting
+   correction must remain a clarification rather than silently changing a
+   safety-relevant command. Expire stale aliases and provide an operator
+   review/delete path.
+4. **Integration and tests.** Route failures from tools registry, companion
+   tool execution, reminders/notes, remote assist, radio, and future clip
+   tools through one bounded recovery path. Add fake-provider tests for high
+   confidence, low confidence, ambiguity, provider fallback, failed retries,
+   duplicate prevention, state/safety gating, cache promotion, and web-console
+   telemetry. The disambiguator must degrade to the existing local behavior
+   when no LLM provider is available.
+
+**Acceptance:** a malformed or failed read-only tool request can be repaired
+once when evidence and confidence are strong; risky actions stop for explicit
+approval; no repair can emit raw drive/safety commands or execute twice; and
+the operator can see why a repair happened.
+
+**Estimated effort:** 12–20 hours after the LLM gateway migration.
+
+### P1 — Short local media clips
+
+Add a small media tool with commands such as “record a 5 second clip” and
+“playback that clip.” The first implementation should make the media type
+explicit (`video` from the Pi camera and/or `audio` from the microphone) rather
+than silently assuming what “clip” means, with a documented default. Store one
+or a small bounded number of clips locally, rotate old files, and never upload
+them automatically.
+
+- Use a dedicated capture/playback owner coordinated with `RobotState`; cap
+  duration at five seconds, reject concurrent capture, and release camera,
+  microphone, and speaker resources on timeout, cancellation, or crash.
+- Add privacy feedback and explicit recording confirmation where a live
+  microphone/camera is involved. Playback must be local, bounded, and
+  interruptible by stop/safety/TTS controls.
+- Expose voice aliases, typed companion tools, and web-console record/play/stop
+  controls. Show clip age, duration, media type, storage usage, and delete
+  controls; add tests with fake camera/audio devices and bounded file storage.
+
+**Acceptance:** a user can record exactly one bounded five-second local clip,
+play it back, stop it, and delete it through voice or the web console without
+an unbounded queue or accidental network transfer.
+
+**Estimated effort:** 6–12 hours, depending on whether audio and video ship in
+the first slice.
 
 ## Navigation and memory backlog
 
@@ -460,6 +532,6 @@ dependencies are missing.
   gesture throttling reasons without storing credentials, private keys, or raw
   camera frames by default.
 - Current baseline verification: `python3 -m unittest discover -s tests -p
-  'test_*.py'` passes 873 tests. `pytest` is not currently installed.
+  'test_*.py'` passes 891 tests. `pytest` is not currently installed.
 - Field calibration, Pi thermal measurements, MediaPipe model packaging, and
   host-helper installation are excluded from the engineering-hour estimates.
