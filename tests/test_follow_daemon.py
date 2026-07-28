@@ -141,6 +141,46 @@ class FollowDaemonBehaviourTest(unittest.TestCase):
         self.d._tick(100.0 + fd.FRESH_TARGET_SEC + 0.1)
         self.assertEqual(self._intents()[-1]["action"], {"direction": "stop"})
 
+    def test_status_distinguishes_live_empty_detector_pass(self):
+        self.d.on_control({"enabled": True})
+        self.d.bus.clear()
+        self.d.on_objects({"objects": [], "objects_updated_at": 100.0,
+                           "frame_ts": 100.1})
+        self.d._tick(100.5)
+        status = self.d.bus.last(fd.STATUS_TOPIC)
+        self.assertEqual(status["state"], "acquiring")
+        self.assertIn("person_not_detected", status["reason"])
+        self.assertIsNone(status["target"])
+        self.assertFalse(status["sources"]["person"]["last_pass_had_target"])
+        self.assertEqual(status["sources"]["person"]["last_pass_at"], 100.0)
+
+    def test_status_exposes_stale_target_and_arbiter_result(self):
+        self.d.on_control({"enabled": True})
+        self.d.on_robot_state({"state": "OBJECT_DETECTION", "owner": "vision_basic"})
+        self.d.on_action_result({"source": "obstacle_reflex",
+                                 "action": {"direction": "stop"},
+                                 "result": {"status": "vetoed",
+                                             "reason_code": "cliff"}})
+        self.d.person = (120, 640, 0.1, 100.0)
+        self.d._tick(100.0 + fd.LOST_HOLD_SEC + 0.1)
+        status = self.d.bus.last(fd.STATUS_TOPIC)
+        self.assertEqual(status["state"], "reacquiring")
+        self.assertTrue(status["sources"]["person"]["cached"])
+        self.assertFalse(status["sources"]["person"]["fresh"])
+        self.assertEqual(status["arbiter"]["source"], "obstacle_reflex")
+        self.assertEqual(status["arbiter"]["result"]["reason_code"], "cliff")
+        self.assertEqual(status["robot_state"]["state"], "OBJECT_DETECTION")
+
+    def test_face_fallback_status_identifies_source(self):
+        self.d.on_control({"enabled": True})
+        self.d.on_faces({"detected": True, "frame_center_offset": -20,
+                         "frame_width": 640, "updated_at": 200.0})
+        self.d._tick(200.2)
+        status = self.d.bus.last(fd.STATUS_TOPIC)
+        self.assertEqual(status["state"], "tracking")
+        self.assertEqual(status["reason"], "fresh_face_track")
+        self.assertEqual(status["target"]["source"], "face")
+
     def test_enable_clears_stale_sightings(self):
         # A person box from a previous session must not seed the new one.
         self.d.person = (0, 640, 0.1, 12345.0)

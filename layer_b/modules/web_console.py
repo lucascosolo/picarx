@@ -779,7 +779,11 @@ def on_goal(p):
 
 def on_follow_state(p):
     with STATE.lock:
-        STATE.follow = p
+        STATE.follow = {**STATE.follow, **p}
+
+def on_follow_status(p):
+    with STATE.lock:
+        STATE.follow = {**STATE.follow, **p}
 
 def on_robot_state(p):
     with STATE.lock:
@@ -846,6 +850,7 @@ def main():
     BUS.subscribe("picarx/exploration/location_change", on_location)
     BUS.subscribe("picarx/exploration/active_goal", on_goal)
     BUS.subscribe("picarx/tools/follow/state", on_follow_state)
+    BUS.subscribe("picarx/tools/follow/status", on_follow_status)
     BUS.subscribe("picarx/state/current", on_robot_state)
     BUS.subscribe("picarx/gesture/status", on_gesture_status)
     BUS.subscribe("picarx/tools/remote_assist/result", on_remote_result)

@@ -40,9 +40,12 @@ import time
 
 CONTROL_TOPIC = "picarx/tools/follow/set"
 STATE_TOPIC = "picarx/tools/follow/state"
+STATUS_TOPIC = "picarx/tools/follow/status"
 OBJECTS_TOPIC = "picarx/vision/objects"
 FACES_TOPIC = "picarx/vision/faces"
 HEARD_TOPIC = "picarx/audio/heard"
+ROBOT_STATE_TOPIC = "picarx/state/current"
+ACTION_RESULT_TOPIC = "picarx/action/result"
 INTENT_TOPIC = "picarx/intent/move"
 SPEAK_TOPIC = "picarx/audio/speak"
 
@@ -73,6 +76,7 @@ LOST_HOLD_SEC = 3.0        # target stale this long -> hold still (stop)
 LOST_GIVEUP_SEC = 15.0     # ...this long -> give up and switch follow off
 REACQUIRE_INTERVAL_SEC = 1.0
 REACQUIRE_PANS = (-25, 0, 25)
+STATUS_HEARTBEAT_SEC = 1.0
 
 
 def steer_angle(offset, frame_width):
@@ -113,6 +117,11 @@ class FollowDaemon:
         # Latest target info: (offset_px, frame_width, area_ratio_or_None, ts)
         self.person = None
         self.face = None
+        # Last producer pass is tracked independently from the cached target.
+        # This lets status distinguish "vision is alive but no person was
+        # found" from "the last person box is stale".
+        self._person_pass = None
+        self._face_pass = None
         self.lost_announced = False
         # Steering state. _cmd_angle mirrors what we have actually
         # COMMANDED the servo to (the daemon's MotionSmoother holds the
@@ -128,6 +137,11 @@ class FollowDaemon:
         self._last_tick_ts = None
         self._last_reacquire_at = 0.0
         self._reacquire_index = 0
+        self._last_intent = None
+        self._robot_state = None
+        self._last_action_result = None
+        self._last_status_at = 0.0
+        self._last_status_signature = None
 
     # ---------- inbound ----------
 
@@ -154,6 +168,8 @@ class FollowDaemon:
                 self.enabled_at = time.time()
                 self.person = None
                 self.face = None
+                self._person_pass = None
+                self._face_pass = None
         if want and not was:
             # Recenter the camera head: the follow geometry assumes the
             # frame looks where the body points, and a head left panned
@@ -166,12 +182,14 @@ class FollowDaemon:
         elif was and not want:
             self._release()
             self.bus.publish(SPEAK_TOPIC, {"text": "Okay, I'll stop following.", "ts": time.time()})
-        self.bus.publish(STATE_TOPIC, {"enabled": want, "ts": time.time()})
+        now = time.time()
+        self.bus.publish(STATE_TOPIC, {"enabled": want, "ts": now})
+        self._publish_status("acquiring" if want else "off",
+                             "enabled_waiting_for_target" if want else "disabled",
+                             now, force=True)
 
     def on_objects(self, payload):
         person = pick_person(payload)
-        if person is None:
-            return
         # vision_basic republishes a cached object payload between detector
         # passes. Prefer the producer's detection timestamp when present so a
         # healthy MQTT stream cannot make a genuinely old person box look
@@ -183,24 +201,50 @@ class FollowDaemon:
         except (TypeError, ValueError):
             observed_at = time.time()
         with self.lock:
-            self.person = (person.get("center_offset", 0),
-                           person.get("frame_width"),
-                           person.get("area_ratio"),
-                           observed_at)
+            self._person_pass = {"observed_at": observed_at,
+                                 "present": person is not None,
+                                 "frame_ts": payload.get("frame_ts")}
+            if person is not None:
+                self.person = (person.get("center_offset", 0),
+                               person.get("frame_width"),
+                               person.get("area_ratio"),
+                               observed_at)
 
     def on_faces(self, payload):
-        if not payload.get("detected"):
-            return
         observed_at = payload.get("updated_at")
         try:
             observed_at = float(observed_at) if observed_at is not None else time.time()
         except (TypeError, ValueError):
             observed_at = time.time()
         with self.lock:
-            self.face = (payload.get("frame_center_offset", 0),
-                         payload.get("frame_width"),
-                         None,                      # a face gives no distance proxy
-                         observed_at)
+            detected = bool(payload.get("detected"))
+            self._face_pass = {"observed_at": observed_at,
+                               "present": detected,
+                               "frame_ts": payload.get("frame_ts")}
+            if detected:
+                self.face = (payload.get("frame_center_offset", 0),
+                             payload.get("frame_width"),
+                             None,  # a face gives no distance proxy
+                             observed_at)
+
+    def on_robot_state(self, payload):
+        if isinstance(payload, dict):
+            with self.lock:
+                self._robot_state = dict(payload)
+
+    def on_action_result(self, payload):
+        if not isinstance(payload, dict):
+            return
+        # Keep the latest arbiter result, including results for competing
+        # sources. A follow status stream should make an arbitration loss or
+        # safety veto visible instead of looking like a silent pause.
+        with self.lock:
+            self._last_action_result = {
+                "source": payload.get("source"),
+                "action": payload.get("action"),
+                "result": payload.get("result") or {},
+                "ts": time.time(),
+            }
 
     def on_heard(self, payload):
         # Literal spoken kill switch - never depends on the LLM. Matches the
@@ -212,7 +256,9 @@ class FollowDaemon:
             with self.lock:
                 self.enabled = False
             self._release()
-            self.bus.publish(STATE_TOPIC, {"enabled": False, "ts": time.time()})
+            now = time.time()
+            self.bus.publish(STATE_TOPIC, {"enabled": False, "ts": now})
+            self._publish_status("off", "spoken_stop", now, force=True)
             print("Follow daemon: stopped by spoken command")
 
     # ---------- motion ----------
@@ -223,10 +269,90 @@ class FollowDaemon:
         self._publish_intent({"direction": "stop"})
         self.bus.publish("picarx/intent/cancel", {"source": SOURCE_NAME})
 
-    def _publish_intent(self, action):
+    def _publish_intent(self, action, now=None):
+        now = time.time() if now is None else float(now)
+        with self.lock:
+            self._last_intent = {"action": dict(action), "ts": now}
         self.bus.publish(INTENT_TOPIC, {
             "source": SOURCE_NAME, "priority": FOLLOW_PRIORITY,
             "action": action, "ttl": INTENT_TTL})
+
+    @staticmethod
+    def _age(now, observed_at):
+        if observed_at is None:
+            return None
+        return round(max(0.0, now - float(observed_at)), 3)
+
+    def _source_status(self, source, target, producer_pass, now):
+        observed_at = target[3] if target else None
+        return {
+            "cached": bool(target),
+            "observed_at": observed_at,
+            "age_sec": self._age(now, observed_at),
+            "fresh": bool(target and now - target[3] < FRESH_TARGET_SEC),
+            "last_pass_at": (producer_pass or {}).get("observed_at"),
+            "last_pass_age_sec": self._age(
+                now, (producer_pass or {}).get("observed_at")),
+            "last_pass_had_target": (producer_pass or {}).get("present"),
+        }
+
+    def _publish_status(self, state, reason, now, target=None, force=False):
+        with self.lock:
+            person, face = self.person, self.face
+            person_pass, face_pass = self._person_pass, self._face_pass
+            last_intent = dict(self._last_intent) if self._last_intent else None
+            robot_state = dict(self._robot_state) if self._robot_state else None
+            action_result = (dict(self._last_action_result)
+                             if self._last_action_result else None)
+            enabled = self.enabled
+
+        selected = None
+        if target:
+            selected = {
+                "source": target["source"],
+                "center_offset": target["offset"],
+                "frame_width": target["frame_width"],
+                "area_ratio": target["area_ratio"],
+                "observed_at": target["observed_at"],
+                "age_sec": round(target["age_sec"], 3),
+            }
+        winner = None
+        if action_result:
+            winner = {
+                "source": action_result.get("source"),
+                "action": action_result.get("action"),
+                "result": action_result.get("result") or {},
+                "ts": action_result.get("ts"),
+            }
+        payload = {
+            "enabled": enabled,
+            "state": state,
+            "reason": reason,
+            "target": selected,
+            "sources": {
+                "person": self._source_status("person", person, person_pass, now),
+                "face": self._source_status("face", face, face_pass, now),
+            },
+            "last_intent": last_intent,
+            "arbiter": winner,
+            "robot_state": robot_state,
+            "reacquire": {
+                "last_pan_at": self._last_reacquire_at,
+                "next_index": self._reacquire_index,
+                "pans": list(REACQUIRE_PANS),
+            },
+            "ts": now,
+        }
+        signature = (state, reason, (selected or {}).get("source"),
+                     repr((last_intent or {}).get("action")),
+                     (winner or {}).get("source"),
+                     (winner or {}).get("result", {}).get("status"))
+        if (not force and self._last_status_signature == signature
+                and now - self._last_status_at < STATUS_HEARTBEAT_SEC):
+            return
+        self._last_status_signature = signature
+        self._last_status_at = now
+        self.bus.publish(STATUS_TOPIC, payload)
 
     def _fresh_target(self, now):
         """Prefer a fresh person track (has distance); else a fresh face
@@ -239,23 +365,41 @@ class FollowDaemon:
             return face[:3]
         return None
 
+    def _target_info(self, now):
+        with self.lock:
+            person, face = self.person, self.face
+        for source, item in (("person", person), ("face", face)):
+            if item and now - item[3] < FRESH_TARGET_SEC:
+                return {
+                    "source": source,
+                    "offset": item[0],
+                    "frame_width": item[1],
+                    "area_ratio": item[2],
+                    "observed_at": item[3],
+                    "age_sec": max(0.0, now - item[3]),
+                }
+        return None
+
     def _tick(self, now):
         dt = (1.0 / CONTROL_HZ) if self._last_tick_ts is None else \
             min(DT_MAX, max(DT_MIN, now - self._last_tick_ts))
         self._last_tick_ts = now
-        target = self._fresh_target(now)
-        if target is None:
+        target_info = self._target_info(now)
+        if target_info is None:
             self._handle_lost(now)
             return
         self.lost_announced = False
-        offset, frame_width, area_ratio = target
+        offset = target_info["offset"]
+        frame_width = target_info["frame_width"]
+        area_ratio = target_info["area_ratio"]
         drive, speed = drive_decision(area_ratio)
         if drive == "stop":
             # Close enough - hold position (still gated by the safety
             # daemon). Turned wheels while stopped are harmless; the
             # straighten below only matters before we actually drive.
             self._steered_last_tick = False
-            self._publish_intent({"direction": "stop"})
+            self._publish_intent({"direction": "stop"}, now)
+            self._publish_status("tracking", "target_close_stop", now, target_info)
             return
         # Before the FIRST drive of a session, explicitly zero the servo
         # so the _cmd_angle mirror starts true whatever angle the last
@@ -264,7 +408,9 @@ class FollowDaemon:
             self._pending_straighten = False
             self._steered_last_tick = True
             self._cmd_angle = 0.0
-            self._publish_intent({"direction": "turn", "angle": 0})
+            self._publish_intent({"direction": "turn", "angle": 0}, now)
+            self._publish_status("tracking", "fresh_" + target_info["source"] + "_track",
+                                 now, target_info)
             return
         # Slew the commanded angle toward the proportional target instead
         # of jumping there - fluid corrections, no full-lock swerves.
@@ -280,10 +426,14 @@ class FollowDaemon:
                 and abs(desired - self._cmd_angle) >= STEER_SEND_DEADBAND):
             self._cmd_angle = desired
             self._steered_last_tick = True
-            self._publish_intent({"direction": "turn", "angle": desired})
+            self._publish_intent({"direction": "turn", "angle": desired}, now)
+            self._publish_status("tracking", "fresh_" + target_info["source"] + "_track",
+                                 now, target_info)
             return
         self._steered_last_tick = False
-        self._publish_intent({"direction": "forward", "speed": speed})
+        self._publish_intent({"direction": "forward", "speed": speed}, now)
+        self._publish_status("tracking", "fresh_" + target_info["source"] + "_track",
+                             now, target_info)
 
     def _handle_lost(self, now):
         # Find the freshest sighting timestamp to measure how long it's been.
@@ -301,13 +451,25 @@ class FollowDaemon:
             self._release()
             self.bus.publish(STATE_TOPIC, {"enabled": False, "reason": "target_lost",
                                            "ts": now})
+            self._publish_status("off", "target_lost_giveup", now, force=True)
             self.bus.publish(SPEAK_TOPIC, {"text": "I lost you, so I'll stop following.",
                                            "ts": now})
             print("Follow daemon: target lost, disabling")
             return
         # Briefly lost: hold still and wait to reacquire.
-        self._publish_intent({"direction": "stop"})
+        self._publish_intent({"direction": "stop"}, now)
         self._reacquire_head(now)
+        source_missing = []
+        with self.lock:
+            if self._person_pass and not self._person_pass.get("present"):
+                source_missing.append("person_not_detected")
+            if self._face_pass and not self._face_pass.get("present"):
+                source_missing.append("face_not_detected")
+        reason = ("target_stale" if stamps else "waiting_for_first_detection")
+        if source_missing:
+            reason += ":" + ",".join(source_missing)
+        self._publish_status("reacquiring" if gone_for >= LOST_HOLD_SEC
+                             else "acquiring", reason, now)
         if gone_for >= LOST_HOLD_SEC and not self.lost_announced:
             self.lost_announced = True
             self.bus.publish(SPEAK_TOPIC, {"text": "Where did you go?", "ts": now})
@@ -338,6 +500,8 @@ class FollowDaemon:
         self.bus.subscribe(OBJECTS_TOPIC, self.on_objects)
         self.bus.subscribe(FACES_TOPIC, self.on_faces)
         self.bus.subscribe(HEARD_TOPIC, self.on_heard)
+        self.bus.subscribe(ROBOT_STATE_TOPIC, self.on_robot_state)
+        self.bus.subscribe(ACTION_RESULT_TOPIC, self.on_action_result)
         print(f"Follow daemon active, waiting for {CONTROL_TOPIC} (motion via {INTENT_TOPIC})")
         period = 1.0 / CONTROL_HZ
         while True:

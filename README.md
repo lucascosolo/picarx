@@ -344,6 +344,9 @@ the actual import. Set `PICARX_MEDIAPIPE_PACKAGE` when deploying a separately
 built ARM wheel. The downloaded Tasks asset is stored in the ignored
 `layer_b/data/models/mediapipe/` directory.
 
+For follow-mode target freshness, reacquisition, arbitration, and safety
+debugging, see [FOLLOW_TROUBLESHOOTING.md](FOLLOW_TROUBLESHOOTING.md).
+
 > The code resolves its own paths relative to the `layer_b/` directory it lives
 > in, so the tree can be checked out or deployed anywhere — no fixed install
 > location. Set `LAYER_B_HOME` to override the root (e.g. a symlinked install, or

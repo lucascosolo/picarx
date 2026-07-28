@@ -62,7 +62,10 @@ The new work is underway in the current worktree:
   builder, optional offline training runner, evaluation-metric promotion gate,
   and rollback-backed candidate promotion tool are implemented. No candidate
   weights have been trained or promoted in this environment; current on-device
-  correction remains `label_memory`, not weight training.
+  correction remains `label_memory`, not weight training. Follow now also
+  publishes bounded status telemetry for detector freshness, selected target,
+  arbiter/safety results, and RobotState ownership on
+  `picarx/tools/follow/status`.
 - **Notes/reminders:** relative and clock-time reminders persist, re-arm after
   restart, list/delete through voice, companion, and web console controls, and
   speak when due. Single notes, auditable deletion, consented continuous meeting
