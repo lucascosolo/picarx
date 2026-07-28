@@ -21,6 +21,7 @@ import os
 import sys
 import threading
 import time
+import faulthandler
 import importlib.metadata
 import platform
 
@@ -51,6 +52,7 @@ MODEL_LOAD_TIMEOUT_SEC = max(1.0, float(robot_config.get(
     "gesture_tracking", "model_load_timeout_sec", 45.0,
     env="GESTURE_MODEL_LOAD_TIMEOUT"))) if robot_config is not None else 45.0
 MODEL_STATUS_HEARTBEAT_SEC = 1.0
+MODEL_CONSTRUCTOR_DIAGNOSTIC_SEC = 10.0
 STATE_TOPIC = "picarx/state/current"
 CONTROL_TOPIC = "picarx/gesture/control"
 STATUS_TOPIC = "picarx/gesture/status"
@@ -339,6 +341,7 @@ class GestureTracker:
         self._model_failed = False
         self._model_loading = False
         self._model_load_thread = None
+        self._model_constructor_dumped = False
         self._model_load_started_at = 0.0
         self._model_load_last_status_at = 0.0
         self._model_load_phase = "idle"
@@ -595,6 +598,7 @@ class GestureTracker:
             self._model_load_frame_age = frame_age
             self._model_diagnostics = self._model_runtime_diagnostics()
             self._model_load_last_status_at = 0.0
+            self._model_constructor_dumped = False
             thread = threading.Thread(target=self._model_load_worker,
                                       args=(generation,),
                                       name="gesture-model-loader", daemon=True)
@@ -607,6 +611,12 @@ class GestureTracker:
             if not self._model_loading:
                 return
             elapsed = time.monotonic() - self._model_load_started_at
+            phase = self._model_load_phase
+            dump_stack = (phase == "constructing" and
+                          elapsed >= MODEL_CONSTRUCTOR_DIAGNOSTIC_SEC and
+                          not self._model_constructor_dumped)
+            if dump_stack:
+                self._model_constructor_dumped = True
             if elapsed < MODEL_LOAD_TIMEOUT_SEC:
                 timed_out = False
             else:
@@ -614,6 +624,18 @@ class GestureTracker:
                 self._model_loading = False
                 self._model_load_generation += 1
                 self._model_load_cancel.set()
+        if dump_stack:
+            # The Tasks constructor enters native code and cannot emit a
+            # Python exception while it is stuck. Dumping all thread stacks
+            # once gives journalctl an actionable location without changing
+            # the model path or blocking the control loop.
+            try:
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            except Exception:
+                pass
+            self._publish_model_status(
+                "model_loading", force=True,
+                diagnostic="native_constructor_stack_dumped")
         if not timed_out:
             self._publish_model_status("model_loading")
             return
