@@ -8,7 +8,7 @@ import harness  # noqa: E402
 
 from gesture_tracking import (AdaptiveFrameScheduler, CpuThermalMonitor,
                               GestureHeadController, GestureTracker, HeadLimits,
-                              LatestFrame, hand_target)  # noqa: E402
+                              LatestFrame, hand_bbox, hand_target)  # noqa: E402
 
 
 class GestureTrackingTests(unittest.TestCase):
@@ -71,6 +71,17 @@ class GestureTrackingTests(unittest.TestCase):
         points[8] = types.SimpleNamespace(x=0.25, y=0.75)
         result = types.SimpleNamespace(hand_landmarks=[points])
         self.assertEqual(hand_target(result, 320, 240), (80.0, 180.0))
+
+    def test_hand_bbox_accepts_tasks_api_landmarks(self):
+        points = [types.SimpleNamespace(x=0.5, y=0.5) for _ in range(21)]
+        points[0] = types.SimpleNamespace(x=0.2, y=0.25)
+        points[20] = types.SimpleNamespace(x=0.8, y=0.75)
+        result = types.SimpleNamespace(hand_landmarks=[points])
+        x, y, w, h = hand_bbox(result, 320, 240)
+        self.assertLess(x, 64.0)
+        self.assertLess(y, 60.0)
+        self.assertGreater(w, 192.0)
+        self.assertGreater(h, 120.0)
 
     def test_hand_loss_recenters_after_short_hold(self):
         tracker = GestureTracker()

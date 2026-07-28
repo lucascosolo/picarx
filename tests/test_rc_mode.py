@@ -125,6 +125,18 @@ class BuildBoxesTest(unittest.TestCase):
     def test_empty_world(self):
         self.assertEqual(web_console.build_boxes({})["boxes"], [])
 
+    def test_tracking_hand_is_in_camera_overlay(self):
+        out = web_console.build_boxes({}, {
+            "state": "tracking", "ts": time.time(),
+            "frame_width": 640, "frame_height": 480,
+            "bbox": {"x": 100, "y": 80, "w": 220, "h": 180},
+        })
+        self.assertEqual(out["frame_w"], 640)
+        self.assertEqual(out["boxes"], [{
+            "x": 100, "y": 80, "w": 220, "h": 180,
+            "label": "hand", "kind": "hand",
+        }])
+
 
 class RcObserverTest(unittest.TestCase):
     def setUp(self):

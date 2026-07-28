@@ -256,6 +256,42 @@ class AdaptiveFrameScheduler:
         return self._frame_no % max(3, self.skip_factor) == 0
 
 
+def _first_hand_landmarks(results):
+    """Return the first hand's landmarks across both MediaPipe APIs."""
+    hands = getattr(results, "multi_hand_landmarks", None)
+    if hands is None:
+        hands = getattr(results, "hand_landmarks", None)
+    hands = hands or []
+    if not hands:
+        return []
+    hand = hands[0]
+    landmarks = getattr(hand, "landmark", None)
+    if landmarks is None and isinstance(hand, (list, tuple)):
+        landmarks = hand
+    return landmarks or []
+
+
+def hand_bbox(results, frame_width, frame_height, margin=0.03):
+    """Return the first hand's pixel bounding box as ``(x, y, w, h)``."""
+    landmarks = _first_hand_landmarks(results)
+    if len(landmarks) < 18:
+        return None
+    try:
+        xs = [float(point.x) * float(frame_width) for point in landmarks]
+        ys = [float(point.y) * float(frame_height) for point in landmarks]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        mx, my = (x2 - x1) * float(margin), (y2 - y1) * float(margin)
+        x1 = _clamp(x1 - mx, 0, frame_width)
+        y1 = _clamp(y1 - my, 0, frame_height)
+        x2 = _clamp(x2 + mx, 0, frame_width)
+        y2 = _clamp(y2 + my, 0, frame_height)
+        return (round(x1, 2), round(y1, 2), round(x2 - x1, 2),
+                round(y2 - y1, 2))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def hand_target(results, frame_width, frame_height):
     """Extract one stable pixel target from MediaPipe Hands output.
 
@@ -266,17 +302,7 @@ def hand_target(results, frame_width, frame_height):
     # ``hand_landmarks`` as a list of plain landmark lists.  Both contain the
     # same normalized x/y coordinates, so keep the controller independent of
     # which MediaPipe generation supplied the result.
-    hands = getattr(results, "multi_hand_landmarks", None)
-    if hands is None:
-        hands = getattr(results, "hand_landmarks", None)
-    hands = hands or []
-    if not hands:
-        return None
-    hand = hands[0]
-    landmarks = getattr(hand, "landmark", None)
-    if landmarks is None and isinstance(hand, (list, tuple)):
-        landmarks = hand
-    landmarks = landmarks or []
+    landmarks = _first_hand_landmarks(results)
     if len(landmarks) < 18:
         return None
     point = landmarks[8]  # index fingertip
@@ -488,6 +514,7 @@ class GestureTracker:
         if target is None:
             self._handle_hand_loss(now)
             return None
+        bbox = hand_bbox(results, width, height)
         pan, tilt = self.controller.update(target[0], target[1], width, height)
         self._last_hand_at = now
         pose = (pan, tilt)
@@ -498,6 +525,9 @@ class GestureTracker:
                 "ts": time.time()})
         self.bus.publish(STATUS_TOPIC, {
             "enabled": True, "state": "tracking", "target": {"x": target[0], "y": target[1]},
+            "bbox": {"x": bbox[0], "y": bbox[1], "w": bbox[2], "h": bbox[3]}
+            if bbox else None,
+            "frame_width": width, "frame_height": height,
             "pan": pan, "tilt": tilt, "throttle": self.scheduler.skip_factor,
             "cpu_percent": self.scheduler.last_sample.get("cpu_percent"),
             "temperature_c": self.scheduler.last_sample.get("temperature_c"),

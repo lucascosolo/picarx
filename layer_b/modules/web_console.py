@@ -244,7 +244,7 @@ class ConsoleState:
             }
 
 
-def build_boxes(world):
+def build_boxes(world, gesture=None):
     """Camera-overlay payload from a world snapshot: the freshest tracked
     objects (and confirmed face) in frame-pixel coordinates for the
     client to scale onto the displayed JPEG. A recognized person's name
@@ -271,6 +271,17 @@ def build_boxes(world):
         frame_w = frame_w or face.get("frame_width")
         boxes.append({"x": face["x"], "y": face["y"], "w": face["w"], "h": face["h"],
                       "label": person_name or "face", "kind": "face"})
+    gesture = gesture or {}
+    bbox = gesture.get("bbox") or {}
+    gesture_ts = gesture.get("ts")
+    fresh_gesture = (gesture.get("state") == "tracking" and
+                     all(k in bbox for k in ("x", "y", "w", "h")) and
+                     (not gesture_ts or time.time() - float(gesture_ts) <= 2.0))
+    if fresh_gesture:
+        frame_w = frame_w or gesture.get("frame_width")
+        frame_h = frame_h or gesture.get("frame_height")
+        boxes.append({"x": bbox["x"], "y": bbox["y"], "w": bbox["w"], "h": bbox["h"],
+                      "label": "hand", "kind": "hand"})
     return {"frame_w": frame_w or 320, "frame_h": frame_h or 240, "boxes": boxes}
 
 
@@ -519,7 +530,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/boxes":
             with STATE.lock:
                 world = dict(STATE.world)
-            self._send(200, build_boxes(world))
+                gesture = dict(STATE.gesture)
+            self._send(200, build_boxes(world, gesture))
         elif self.path == "/objects":
             with STATE.lock:
                 world = dict(STATE.world)
