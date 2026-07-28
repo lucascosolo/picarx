@@ -83,6 +83,7 @@ from llm_gateway import LLMGateway
 from semantic_store import SemanticStore
 from spatial_store import SpatialStore
 import speech_match
+import tool_catalog
 
 import threading
 import queue
@@ -146,6 +147,10 @@ LEARNED_INTENTS_STATUS_TOPIC = "picarx/intent/learned/status"
 INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls
 INTENT_TIMEOUT = 6.0
 INTENT_MAX_TOKENS = 80
+INTENT_REPAIR_MIN_CONFIDENCE = min(1.0, max(0.0, float(robot_config.get(
+    "companion", "intent_repair_min_confidence", 0.90,
+    env="INTENT_REPAIR_MIN_CONFIDENCE"))))
+INTENT_RECOVERY_STATUS_TOPIC = "picarx/intent/recovery/status"
 
 # ---------- intent feedback (the user grading interpretations) ----------
 # picarx/intent/feedback carries explicit judgments - the web console's
@@ -207,10 +212,17 @@ what's in <place>  (asks what objects it has seen at a named place),
 call this place <name>  (names the robot's current location).
 
 Reply with JSON only, one of:
-{"command": "<one known command, with its parameter filled in if it takes one>"}
+{"command": "<one known command, with its parameter filled in if it takes one>",
+ "confidence": 0.0, "rationale": "short evidence-based reason"}
   - only if the transcript was clearly an attempt at that command
 {"chat": true}   - it was speech directed at the robot, but not one of the commands
 {"ignore": true} - background noise, TV, or speech not meant for the robot
+
+For a command, confidence must be a number from 0 to 1. Do not inflate it:
+use a low value when words or parameters are ambiguous. The local catalog
+below marks which commands may be auto-repaired; the robot will refuse to
+execute a guessed state-changing, destructive, remote, or movement command.
+Catalog: """ + tool_catalog.prompt_text() + """
 
 NEVER return a movement command: requests to explore, drive, turn, go somewhere, or
 follow someone must be answered with {"chat": true}, not a command. Never return a
@@ -708,6 +720,8 @@ class Companion:
                     "count": int(entry.get("count", 0) or 0),
                     "confirmed": bool(entry.get("confirmed")),
                     "taught": bool(entry.get("taught")),
+                    "confidence": entry.get("confidence"),
+                    "source": entry.get("source"),
                     "last": last,
                     "expires_at": (last + LEARNED_INTENTS_TTL_SEC
                                    if last > 0 else None),
@@ -787,6 +801,23 @@ class Companion:
             "source": "companion", "kind": "intent_repair",
             "choice": {"command": command, "cached": learned},
             "reason": f"unparsed utterance: '{original_text}'", "ts": time.time()})
+
+    def _publish_recovery_status(self, state, original_text, verdict=None,
+                                 reason=None, spec=None):
+        """Publish bounded, non-secret diagnostics for intent recovery."""
+        verdict = verdict if isinstance(verdict, dict) else {}
+        payload = {
+            "state": state,
+            "text": str(original_text or "")[:240],
+            "candidate": str(verdict.get("command") or "")[:160] or None,
+            "confidence": verdict.get("confidence"),
+            "rationale": str(verdict.get("rationale") or "")[:240] or None,
+            "reason": reason,
+            "safety_class": (spec or {}).get("safety_class"),
+            "auto_repair_min_confidence": INTENT_REPAIR_MIN_CONFIDENCE,
+            "ts": time.time(),
+        }
+        self.bus.publish(INTENT_RECOVERY_STATUS_TOPIC, payload)
 
     @staticmethod
     def _intent_allowed(command):
@@ -1155,6 +1186,22 @@ class Companion:
                 entry["count"] = entry.get("count", 0) + 1
                 entry["last"] = time.time()
         if entry:
+            spec = tool_catalog.command_spec(entry.get("command"))
+            # Entries created by the old arbiter had no provenance and could
+            # include state-changing tool guesses. Never replay those after
+            # the confidence gate was introduced. User-taught aliases remain
+            # valid because they came from an explicit correction path.
+            if not entry.get("taught") and (spec is None or not spec["auto_repair"]):
+                with self.lock:
+                    self.learned_intents.pop(key, None)
+                self._save_learned_intents()
+                self._publish_recovery_status(
+                    "rejected", text,
+                    {"command": entry.get("command"),
+                     "confidence": entry.get("confidence"),
+                     "rationale": entry.get("rationale")},
+                    reason="unsafe_cached_alias", spec=spec)
+                return
             self._dispatch_repaired(entry["command"], text, learned=True)
             self._save_learned_intents()
             return
@@ -1367,7 +1414,16 @@ class Companion:
                 if raw.startswith("json"):
                     raw = raw[4:]
             verdict = json.loads(raw)
-            return verdict if isinstance(verdict, dict) else None
+            if not isinstance(verdict, dict):
+                return None
+            if "command" in verdict:
+                try:
+                    confidence = float(verdict.get("confidence"))
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                verdict["confidence"] = min(1.0, max(0.0, confidence))
+                verdict["rationale"] = str(verdict.get("rationale") or "")[:240]
+            return verdict
         except Exception as e:
             print(f"Companion arbiter: LLM verdict failed ({e})")
             return None
@@ -1379,21 +1435,54 @@ class Companion:
         verdict = self._arbiter_verdict(f"Transcript: {text}")
         if verdict is None:
             print(f"Companion arbiter: repair failed, dropping '{text}'")
+            self._publish_recovery_status("failed", text, reason="no_valid_verdict")
             return
 
         command = (verdict.get("command") or "").strip().lower()
         if command and self._intent_allowed(command):
+            spec = tool_catalog.command_spec(command)
+            confidence = float(verdict.get("confidence") or 0.0)
+            if spec is None:
+                self._publish_recovery_status(
+                    "rejected", text, verdict,
+                    reason="command_missing_from_catalog")
+                print(f"Companion arbiter: catalog rejected '{command}'")
+                return
+            if not spec["auto_repair"]:
+                self._publish_recovery_status(
+                    "confirmation_required", text, verdict,
+                    reason="state_changing_or_external_command", spec=spec)
+                print(f"Companion arbiter: refusing guessed {spec['safety_class']} "
+                      f"command '{command}'")
+                return
+            if confidence < INTENT_REPAIR_MIN_CONFIDENCE:
+                self._publish_recovery_status(
+                    "low_confidence", text, verdict,
+                    reason="below_auto_repair_threshold", spec=spec)
+                print(f"Companion arbiter: low confidence {confidence:.2f} for "
+                      f"'{command}', dropping")
+                return
             with self.lock:
                 self.learned_intents[speech_match.canonicalize(text)] = {
-                    "command": command, "count": 1, "last": time.time()}
+                    "command": command, "count": 1, "last": time.time(),
+                    "confidence": confidence,
+                    "rationale": str(verdict.get("rationale") or "")[:240],
+                    "source": "llm_repair"}
             self._save_learned_intents()
             self._dispatch_repaired(command, text, learned=False)
+            self._publish_recovery_status(
+                "accepted", text, verdict, reason="read_only_confident",
+                spec=spec)
         elif verdict.get("chat"):
+            self._publish_recovery_status("chat", text, verdict,
+                                          reason="model_classified_as_chat")
             self._handle_utterance(text)
         else:
             # ignore verdict, disallowed command, or junk output - all
             # end the same way: silently not acting on garbled audio.
             print(f"Companion arbiter: no action for '{text}' ({verdict})")
+            self._publish_recovery_status("rejected", text, verdict,
+                                          reason="no_safe_command")
 
     # ---------- camera ----------
 

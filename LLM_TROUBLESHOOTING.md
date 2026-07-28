@@ -31,3 +31,17 @@ The model IDs are configurable under the `llm` section of
 variables. Missing keys, SDKs, malformed responses, privacy blocks, and
 telemetry failures are fail-soft; they must not stop `picarx-safety.service`
 or the orchestrator.
+
+Intent-repair diagnostics are separate from provider health:
+
+```bash
+mosquitto_sub -v -t picarx/intent/recovery/status
+```
+
+`accepted` means a high-confidence, idempotent read-only command was cached
+and dispatched. `low_confidence`, `confirmation_required`, and
+`rejected` mean no repaired command was executed. The configured threshold is
+`companion.intent_repair_min_confidence` or
+`INTENT_REPAIR_MIN_CONFIDENCE`; state-changing, destructive, remote, and
+movement commands cannot pass this automatic gate regardless of model
+confidence.

@@ -75,8 +75,11 @@ The new work is underway in the current worktree:
   coaching, and reflection now use the shared fail-soft gateway. Complexity
   selects the configured Claude family; eligible idempotent failures can use
   the optional OpenAI fallback, with redacted provider telemetry on
-  `picarx/llm/status`. No tool execution or motion authority moved into the
-  gateway.
+  `picarx/llm/status`. Intent repair now also uses a machine-readable safety
+  catalog, requires structured confidence, automatically repairs only
+  high-confidence read-only requests, and reports refusals/ambiguity on
+  `picarx/intent/recovery/status`. No tool execution or motion authority
+  moved into the gateway.
 - **Hardware boundary:** the safety daemon globally clamps pan to
   `[-75°, +75°]` and tilt to `[-35°, +35°]`, while gesture tracking remains
   intentionally narrower at pan `[-35°, +35°]` and tilt `[-30°, +30°]`.
@@ -416,10 +419,11 @@ careful tool-loop migration.
 
 ### P1 — High-confidence LLM tool disambiguation and recovery
 
-This track follows the unified LLM gateway. The existing companion intent
-arbiter repairs a small set of unparsed phrases and caches successful mappings,
-but it does not systematically inspect failed or misinterpreted tool calls.
-Expand it only after all provider calls use the shared gateway above.
+This track follows the unified LLM gateway. Its first slice is implemented:
+the companion arbiter has a machine-readable safety catalog, structured
+confidence output, a high-confidence read-only gate, bounded diagnostics, and
+safe replay behavior for legacy cached aliases. Broader failed-tool evidence
+and one-shot retry integration remain.
 
 1. **Tool catalog and evidence.** Give the disambiguator a machine-readable
    catalog of tool names, required fields, safety class, expected result shape,
@@ -448,7 +452,13 @@ Expand it only after all provider calls use the shared gateway above.
    telemetry. The disambiguator must degrade to the existing local behavior
    when no LLM provider is available.
 
-**Acceptance:** a malformed or failed read-only tool request can be repaired
+**Current slice acceptance:** an uncertain voice request can be repaired only
+when its catalog entry is read-only, idempotent, and above the configured
+confidence threshold; state-changing, remote, destructive, and movement
+commands are refused with an operator-visible reason, and old unsafe aliases
+are not replayed automatically.
+
+**Full-track acceptance:** a malformed or failed read-only tool request can be repaired
 once when evidence and confidence are strong; risky actions stop for explicit
 approval; no repair can emit raw drive/safety commands or execute twice; and
 the operator can see why a repair happened.

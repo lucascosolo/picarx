@@ -177,6 +177,9 @@ KNOBS = [
     {"section": "companion", "key": "learned_intent_ttl_sec", "type": "float",
      "default": 30 * 86400, "env": "LEARNED_INTENT_TTL_SEC",
      "desc": "Seconds before a learned voice alias expires."},
+    {"section": "companion", "key": "intent_repair_min_confidence", "type": "float",
+     "default": 0.90, "env": "INTENT_REPAIR_MIN_CONFIDENCE",
+     "desc": "Minimum structured confidence for an LLM to repair a read-only voice intent automatically."},
     # ---- repository updater (orchestrator.py) ----
     {"section": "repository_updater", "key": "enabled", "type": "bool",
      "default": False, "env": "PICARX_UPDATE_ENABLED",
