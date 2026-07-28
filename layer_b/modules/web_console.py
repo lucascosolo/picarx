@@ -142,6 +142,7 @@ class ConsoleState:
         self.robot_state = {}
         self.gesture = {}
         self.remote = {}
+        self.llm = {}
         self.notes = {}
         self.reminders = {}
         self.log = deque(maxlen=LOG_LINES)
@@ -238,6 +239,7 @@ class ConsoleState:
                 "robot_state": self.robot_state,
                 "gesture": self.gesture,
                 "remote": self.remote,
+                "llm": self.llm,
                 "notes": self.notes,
                 "reminders": self.reminders,
                 "log": list(self.log),
@@ -797,6 +799,10 @@ def on_remote_result(p):
     with STATE.lock:
         STATE.remote = p
 
+def on_llm_status(p):
+    with STATE.lock:
+        STATE.llm = p
+
 def on_notes_state(p):
     with STATE.lock:
         STATE.notes = {**STATE.notes, **p}
@@ -854,6 +860,7 @@ def main():
     BUS.subscribe("picarx/state/current", on_robot_state)
     BUS.subscribe("picarx/gesture/status", on_gesture_status)
     BUS.subscribe("picarx/tools/remote_assist/result", on_remote_result)
+    BUS.subscribe("picarx/llm/status", on_llm_status)
     BUS.subscribe("picarx/tools/notes/state", on_notes_state)
     BUS.subscribe("picarx/tools/notes/result", on_notes_result)
     BUS.subscribe("picarx/tools/reminder/state", on_reminder_state)

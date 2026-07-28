@@ -64,8 +64,9 @@ giving it open-vocabulary sight beyond the on-board detector's labels;
 those exchanges ride picarx/audio/heard into events.db, where
 reflection.py later consolidates them into durable semantic facts.
 
-Requires ANTHROPIC_API_KEY in the environment, same as coach.py. If
-it's missing, or a request fails/times out, this module just replies
+Requires a configured LLM provider (ANTHROPIC_API_KEY is preferred and
+OPENAI_API_KEY is an optional fallback). If both are missing, or a request
+fails/times out, this module just replies
 with a short apology instead of raising - a quiet, unhelpful companion
 is fine; a crashed process that stops handling any future messages is
 not.
@@ -78,6 +79,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
+from llm_gateway import LLMGateway
 from semantic_store import SemanticStore
 from spatial_store import SpatialStore
 import speech_match
@@ -549,6 +551,7 @@ class Companion:
         self.work_queue = queue.Queue()
         self._client = None
         self._warned_no_key = False
+        self.gateway = LLMGateway(bus=self.bus)
         # Read-only view of what reflection.py has learned; fail-soft
         # (returns [] until the first reflection has ever run).
         self.semantic = SemanticStore(readonly=True)
@@ -1165,20 +1168,16 @@ class Companion:
     # ---------- Anthropic call ----------
 
     def _get_client(self):
-        if self._client is not None:
-            return self._client
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            if not self._warned_no_key:
-                print("Companion: ANTHROPIC_API_KEY not set - can't chat, will apologize instead.")
-                self._warned_no_key = True
-            return None
-        try:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=api_key)
-        except ImportError:
-            print("Companion: 'anthropic' package not installed - pip install anthropic to enable chat.")
-        return self._client
+        # `_client` remains a compatibility seam for off-robot tests and
+        # local overlays. Production calls use the shared gateway so provider
+        # selection, fallback, privacy, and telemetry stay centralized.
+        client = getattr(self, "_client", None)
+        if client is not None:
+            return client
+        gateway = getattr(self, "gateway", None)
+        if gateway is None:
+            gateway = self.gateway = LLMGateway(bus=getattr(self, "bus", None))
+        return gateway if gateway.available() else None
 
     def _context_blurb(self):
         with self.lock:
@@ -1342,15 +1341,27 @@ class Companion:
         if client is None:
             return None
         try:
-            response = client.messages.create(
-                model=INTENT_MODEL,
-                max_tokens=INTENT_MAX_TOKENS,
-                system=INTENT_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": content}],
-                timeout=INTENT_TIMEOUT,
-            )
-            raw = "".join(b.text for b in response.content
-                          if getattr(b, "type", None) == "text").strip()
+            if isinstance(client, LLMGateway):
+                result = client.complete(
+                    request_id=f"companion-intent-{uuid.uuid4().hex}",
+                    task="intent_repair", complexity="low",
+                    system=INTENT_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": content}],
+                    max_tokens=INTENT_MAX_TOKENS, timeout=INTENT_TIMEOUT,
+                    privacy="command_repair", idempotent=True)
+                if not result.ok:
+                    return None
+                raw = result.text
+            else:
+                response = client.messages.create(
+                    model=INTENT_MODEL,
+                    max_tokens=INTENT_MAX_TOKENS,
+                    system=INTENT_SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": content}],
+                    timeout=INTENT_TIMEOUT,
+                )
+                raw = "".join(b.text for b in response.content
+                              if getattr(b, "type", None) == "text").strip()
             if raw.startswith("```"):
                 raw = raw.strip("`")
                 if raw.startswith("json"):
@@ -1444,19 +1455,31 @@ class Companion:
             print("Companion: identify - no camera frame, giving up (last resort)")
             return
         try:
-            response = client.messages.create(
-                model=INTENT_MODEL,
-                max_tokens=IDENTIFY_MAX_TOKENS,
-                system=IDENTIFY_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": [
-                    {"type": "image", "source": {
-                        "type": "base64", "media_type": "image/jpeg",
-                        "data": frame_b64}},
-                    {"type": "text", "text": "What object is this?"}]}],
-                timeout=INTENT_TIMEOUT,
-            )
-            raw = "".join(b.text for b in response.content
-                          if getattr(b, "type", None) == "text").strip()
+            messages = [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg",
+                    "data": frame_b64}},
+                {"type": "text", "text": "What object is this?"}]}]
+            if isinstance(client, LLMGateway):
+                result = client.complete(
+                    request_id=f"companion-identify-{uuid.uuid4().hex}",
+                    task="object_identification", complexity="low",
+                    system=IDENTIFY_SYSTEM_PROMPT, messages=messages,
+                    max_tokens=IDENTIFY_MAX_TOKENS, timeout=INTENT_TIMEOUT,
+                    privacy="user_visual_request", idempotent=True)
+                if not result.ok:
+                    return
+                raw = result.text
+            else:
+                response = client.messages.create(
+                    model=INTENT_MODEL,
+                    max_tokens=IDENTIFY_MAX_TOKENS,
+                    system=IDENTIFY_SYSTEM_PROMPT,
+                    messages=messages,
+                    timeout=INTENT_TIMEOUT,
+                )
+                raw = "".join(b.text for b in response.content
+                              if getattr(b, "type", None) == "text").strip()
         except Exception as e:
             print(f"Companion: identify call failed ({e})")
             return
@@ -1528,7 +1551,33 @@ class Companion:
         convo = list(messages)
         active_tools = TOOLS if tools is None else list(tools)
         final_text = ""
+        request_id = f"companion-chat-{uuid.uuid4().hex}"
         for _ in range(MAX_TOOL_ROUNDS):
+            if isinstance(client, LLMGateway):
+                result = client.complete(
+                    request_id=request_id, task="companion_chat",
+                    complexity="high", system=self._compose_system_prompt(),
+                    messages=convo, tools=active_tools,
+                    max_tokens=REPLY_MAX_TOKENS, timeout=REPLY_TIMEOUT,
+                    privacy="user_conversation", idempotent=True)
+                if not result.ok:
+                    raise RuntimeError(result.failure.get("message", "LLM unavailable"))
+                text = result.text
+                content = result.content
+                if text:
+                    final_text = text
+                tool_uses = [b for b in content if b.get("type") == "tool_use"]
+                if not tool_uses:
+                    break
+                convo.append({"role": "assistant", "content": content})
+                results = []
+                for tu in tool_uses:
+                    out = self._execute_tool(tu.get("name"), tu.get("input") or {})
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": tu.get("id"),
+                                    "content": out})
+                convo.append({"role": "user", "content": results})
+                continue
             request = {
                 "model": COMPANION_MODEL,
                 "max_tokens": REPLY_MAX_TOKENS,

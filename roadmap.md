@@ -71,6 +71,12 @@ The new work is underway in the current worktree:
   speak when due. Single notes, auditable deletion, consented continuous meeting
   logging, transcript export, and the bounded boot briefing are implemented in
   the current worktree. Full target-Pi speech/privacy validation remains.
+- **LLM access:** conversation, intent repair, camera-grounded identification,
+  coaching, and reflection now use the shared fail-soft gateway. Complexity
+  selects the configured Claude family; eligible idempotent failures can use
+  the optional OpenAI fallback, with redacted provider telemetry on
+  `picarx/llm/status`. No tool execution or motion authority moved into the
+  gateway.
 - **Hardware boundary:** the safety daemon globally clamps pan to
   `[-75°, +75°]` and tilt to `[-35°, +35°]`, while gesture tracking remains
   intentionally narrower at pan `[-35°, +35°]` and tilt `[-30°, +30°]`.
@@ -356,10 +362,14 @@ pass.
 
 ### P0 — Unified LLM gateway with Claude routing and OpenAI fallback
 
-The current LLM users (`companion.py`, `coach.py`, and `reflection.py`) each
-own an Anthropic client and call Claude directly. Replace those provider
-boundaries with one small, fail-soft helper while keeping prompts, safety
-policy, and tool authorization in the calling modules.
+Historically, the LLM users (`companion.py`, `coach.py`, and `reflection.py`)
+each owned an Anthropic client and called Claude directly. This track replaces
+those provider boundaries with one small, fail-soft helper while keeping
+prompts, safety policy, and tool authorization in the calling modules.
+
+The shared gateway and these three caller migrations are now implemented;
+provider credentials remain optional, fake-provider coverage is in place, and
+live quota/fallback validation is still a deployment concern.
 
 1. **Common request contract.** Create a shared LLM helper that accepts a
    request ID, task name, complexity (`low`, `standard`, or `high`), system

@@ -64,7 +64,8 @@ Every completed query is published on picarx/coach/episode, which
 event_logger.py persists. The cache is persisted to disk
 (COACH_POLICY_PATH) so learning survives restarts.
 
-Requires ANTHROPIC_API_KEY to call the model; without it (or on failure)
+Uses the shared optional-provider gateway; without a usable provider (or on
+failure)
 it answers only from the cache, and if it has nothing cached it simply
 stays silent - field_agent has its own bounded timeout + canned
 fallback, so an unreachable coach degrades to "the robot handles it
@@ -77,6 +78,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+from llm_gateway import LLMGateway
 import robot_config
 from semantic_store import SemanticStore
 from embedding_util import Embedder
@@ -232,6 +234,7 @@ class Coach:
         self.work_queue = queue.Queue()
         self._client = None
         self._warned_no_key = False
+        self.gateway = LLMGateway(bus=self.bus)
         # A/B experiment condition for this session (see experiment.py). Default
         # "adopt" (trained arms in play); run() may flip it to "control".
         self.experiment_condition = experiment.ADOPT
@@ -446,21 +449,15 @@ class Coach:
     # ---------- Anthropic call ----------
 
     def _get_client(self):
-        if self._client is not None:
-            return self._client
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            if not self._warned_no_key:
-                print("Coach: ANTHROPIC_API_KEY not set - will only ever answer from the local policy cache.")
-                self._warned_no_key = True
-            return None
-        try:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=api_key)
-        except ImportError:
-            print("Coach: 'anthropic' package not installed - pip install anthropic to enable live coaching.")
-            self._client = None
-        return self._client
+        # `_client` remains a compatibility seam for tests/local overlays;
+        # production provider selection lives in the shared gateway.
+        client = getattr(self, "_client", None)
+        if client is not None:
+            return client
+        gateway = getattr(self, "gateway", None)
+        if gateway is None:
+            gateway = self.gateway = LLMGateway(bus=getattr(self, "bus", None))
+        return gateway if gateway.available() else None
 
     def _tried_before(self, situation_key):
         """Compact summary of what's already been tried here, for the prompt."""
@@ -518,16 +515,27 @@ class Coach:
         user_message = json.dumps(message)
 
         try:
-            response = client.messages.create(
-                model=COACH_MODEL,
-                max_tokens=400,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-                timeout=10.0,
-            )
-            text = "".join(
-                block.text for block in response.content if getattr(block, "type", None) == "text"
-            ).strip()
+            messages = [{"role": "user", "content": user_message}]
+            if isinstance(client, LLMGateway):
+                result = client.complete(
+                    request_id=f"coach-{time.time_ns()}", task="coach",
+                    complexity="low", system=SYSTEM_PROMPT, messages=messages,
+                    max_tokens=400, timeout=10.0,
+                    privacy="learning_context", idempotent=True)
+                if not result.ok:
+                    return None
+                text = result.text
+            else:
+                response = client.messages.create(
+                    model=COACH_MODEL,
+                    max_tokens=400,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                    timeout=10.0,
+                )
+                text = "".join(
+                    block.text for block in response.content if getattr(block, "type", None) == "text"
+                ).strip()
             return self._parse_plan(text)
         except Exception as e:
             print(f"Coach: LLM query failed for {situation_key}: {e}")

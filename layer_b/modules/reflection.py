@@ -39,6 +39,7 @@ os.getlogin = getpass.getuser
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
+from llm_gateway import LLMGateway
 import robot_config
 from semantic_store import SemanticStore
 from spatial_store import SpatialStore
@@ -182,6 +183,7 @@ class Reflection:
         self.last_activity = time.time()
         self._client = None
         self._warned_no_key = False
+        self.gateway = LLMGateway(bus=self.bus)
         # Last-run summaries for the heartbeat beacon (in-memory so the status_fn
         # never has to touch semantic.db): (ts, count) or None until each first runs.
         self._last_reflection = None   # (ts, facts_stored) of the last LLM reflection
@@ -418,20 +420,15 @@ class Reflection:
     # ---------- LLM ----------
 
     def _get_client(self):
-        if self._client is not None:
-            return self._client
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            if not self._warned_no_key:
-                print("Reflection: ANTHROPIC_API_KEY not set - reflection disabled.")
-                self._warned_no_key = True
-            return None
-        try:
-            import anthropic
-            self._client = anthropic.Anthropic(api_key=api_key)
-        except ImportError:
-            print("Reflection: 'anthropic' package not installed - reflection disabled.")
-        return self._client
+        # `_client` remains a compatibility seam for tests/local overlays;
+        # production calls use the shared gateway and stay fail-soft.
+        client = getattr(self, "_client", None)
+        if client is not None:
+            return client
+        gateway = getattr(self, "gateway", None)
+        if gateway is None:
+            gateway = self.gateway = LLMGateway(bus=getattr(self, "bus", None))
+        return gateway if gateway.available() else None
 
     def _existing_memory_block(self):
         """Current active facts shown to the model for contradiction
@@ -472,15 +469,27 @@ class Reflection:
             content += (f"\n\n---\nSESSION BOUNDARY DETECTED. Also emit one "
                         f"episode entry with subject \"{episode_subject}\".")
         try:
-            response = client.messages.create(
-                model=REFLECTION_MODEL,
-                max_tokens=600,
-                system=SYSTEM_PROMPT.format(max_facts=MAX_FACTS_PER_REFLECTION),
-                messages=[{"role": "user", "content": content}],
-                timeout=15.0,
-            )
-            text = "".join(b.text for b in response.content
-                           if getattr(b, "type", None) == "text").strip()
+            messages = [{"role": "user", "content": content}]
+            if isinstance(client, LLMGateway):
+                result = client.complete(
+                    request_id=f"reflection-{time.time_ns()}", task="reflection",
+                    complexity="low",
+                    system=SYSTEM_PROMPT.format(max_facts=MAX_FACTS_PER_REFLECTION),
+                    messages=messages, max_tokens=600, timeout=15.0,
+                    privacy="learning_context", idempotent=True)
+                if not result.ok:
+                    return None
+                text = result.text
+            else:
+                response = client.messages.create(
+                    model=REFLECTION_MODEL,
+                    max_tokens=600,
+                    system=SYSTEM_PROMPT.format(max_facts=MAX_FACTS_PER_REFLECTION),
+                    messages=messages,
+                    timeout=15.0,
+                )
+                text = "".join(b.text for b in response.content
+                               if getattr(b, "type", None) == "text").strip()
             if text.startswith("```"):
                 text = text.strip("`")
                 if text.startswith("json"):

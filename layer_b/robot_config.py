@@ -17,7 +17,8 @@ orchestrator. Precedence per knob, highest first:
 
 Fail-soft like everything else in Layer B: a missing or corrupt
 config.json just means built-in defaults (one console line says so); it
-never crashes a module. Secrets (ANTHROPIC_API_KEY) deliberately stay
+never crashes a module. Secrets (ANTHROPIC_API_KEY and optional OPENAI_API_KEY)
+deliberately stay
 environment-only - a JSON file that lives in a git repo is where keys go
 to leak, so this loader will never serve them.
 
@@ -207,6 +208,25 @@ KNOBS = [
     {"section": "reflection", "key": "model", "type": "str",
      "default": "claude-haiku-4-5-20251001", "env": "REFLECTION_MODEL",
      "desc": "Claude model for idle-time reflection."},
+    # ---- LLM gateway fallback (llm_gateway.py) ----
+    {"section": "llm", "key": "openai_low_model", "type": "str",
+     "default": "gpt-4o-mini", "env": "LLM_OPENAI_LOW_MODEL",
+     "desc": "OpenAI fallback model for low-complexity requests."},
+    {"section": "llm", "key": "openai_standard_model", "type": "str",
+     "default": "gpt-4o-mini", "env": "LLM_OPENAI_STANDARD_MODEL",
+     "desc": "OpenAI fallback model for standard-complexity requests."},
+    {"section": "llm", "key": "openai_high_model", "type": "str",
+     "default": "gpt-4o", "env": "LLM_OPENAI_HIGH_MODEL",
+     "desc": "OpenAI fallback model for high-complexity requests."},
+    {"section": "llm", "key": "claude_low_model", "type": "str",
+     "default": "claude-haiku-4-5-20251001", "env": "LLM_CLAUDE_LOW_MODEL",
+     "desc": "Claude model for low-complexity requests."},
+    {"section": "llm", "key": "claude_standard_model", "type": "str",
+     "default": "claude-haiku-4-5-20251001", "env": "LLM_CLAUDE_STANDARD_MODEL",
+     "desc": "Claude model for standard-complexity requests."},
+    {"section": "llm", "key": "claude_high_model", "type": "str",
+     "default": "claude-sonnet-5", "env": "LLM_CLAUDE_HIGH_MODEL",
+     "desc": "Claude model for high-complexity requests."},
     # ---- self-trainer (self_trainer.py) - disabled in the tracked registry ----
     {"section": "self_trainer", "key": "idle_after_sec", "type": "float",
      "default": 600.0, "env": "SELF_TRAIN_IDLE_AFTER",

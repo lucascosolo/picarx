@@ -306,8 +306,14 @@ Every tunable lives in [`layer_b/config.json`](layer_b/config.json) at its
 default, read through [`robot_config`](layer_b/robot_config.py). Precedence per
 knob is **environment variable > `config.json` > built-in default**, and the
 file is fail-soft — delete or corrupt it and the robot runs on built-ins. The
-one secret, `ANTHROPIC_API_KEY`, is *only* ever an environment variable, never
-in the file. Without it, the LLM-backed modules quietly stand down.
+provider keys, `ANTHROPIC_API_KEY` and optional `OPENAI_API_KEY`, are *only*
+ever environment variables, never in the file. All production model calls go
+through [`llm_gateway.py`](layer_b/llm_gateway.py); Claude is preferred and
+eligible idempotent failures can use the configured OpenAI fallback. If no
+provider is usable, the LLM-backed modules quietly regress to their existing
+local/cache-only behavior. Provider, model, latency, fallback, and error
+metadata (never prompts or keys) is published on `picarx/llm/status` and is
+visible in the web-console snapshot.
 
 The repository updater is disabled until explicitly enabled through the
 `repository_updater.enabled` knob (or `PICARX_UPDATE_ENABLED=1`). When enabled,
@@ -346,6 +352,8 @@ built ARM wheel. The downloaded Tasks asset is stored in the ignored
 
 For follow-mode target freshness, reacquisition, arbitration, and safety
 debugging, see [FOLLOW_TROUBLESHOOTING.md](FOLLOW_TROUBLESHOOTING.md).
+For provider routing and fallback diagnostics, see
+[LLM_TROUBLESHOOTING.md](LLM_TROUBLESHOOTING.md).
 
 > The code resolves its own paths relative to the `layer_b/` directory it lives
 > in, so the tree can be checked out or deployed anywhere — no fixed install
