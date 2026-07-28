@@ -6,6 +6,15 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
 
+ARCH="$(uname -m)"
+if [[ "$PYTHON" == python3 && "$ARCH" == "aarch64" &&
+      -x "$(command -v python3.12 || true)" ]]; then
+    PYTHON=python3.12
+elif [[ "$PYTHON" == python3 && ("$ARCH" == armv7l || "$ARCH" == armv6l) &&
+      -x "$(command -v python3.7 || true)" ]]; then
+    PYTHON=python3.7
+fi
+
 if ! command -v "$PYTHON" >/dev/null 2>&1; then
     echo "Python interpreter not found: $PYTHON" >&2
     exit 1
@@ -16,11 +25,17 @@ if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
     exit 1
 fi
 
-# Entries are "import name|pip distribution".  Some distributions expose a
-# different import name (paho-mqtt -> paho, opencv -> cv2). Keep the generic
-# MediaPipe package as the default. A separately built ARM wheel may be
-# selected explicitly with PICARX_MEDIAPIPE_PACKAGE.
-MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe}"
+# Entries are "import name|pip distribution". Some distributions expose a
+# different import name (paho-mqtt -> paho, opencv -> cv2). Select the tested
+# Pi 4 runtime by architecture; a custom tested ARM wheel may override it.
+if [[ "$ARCH" == "aarch64" ]]; then
+    DEFAULT_MEDIAPIPE_PACKAGE="mediapipe==0.10.18"
+elif [[ "$ARCH" == armv7l || "$ARCH" == armv6l ]]; then
+    DEFAULT_MEDIAPIPE_PACKAGE="mediapipe-rpi4==0.8.8"
+else
+    DEFAULT_MEDIAPIPE_PACKAGE="mediapipe"
+fi
+MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-$DEFAULT_MEDIAPIPE_PACKAGE}"
 dependencies=(
     "anthropic|anthropic"
     "cv2|opencv-contrib-python-headless"
