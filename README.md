@@ -309,6 +309,23 @@ file is fail-soft — delete or corrupt it and the robot runs on built-ins. The
 one secret, `ANTHROPIC_API_KEY`, is *only* ever an environment variable, never
 in the file. Without it, the LLM-backed modules quietly stand down.
 
+The repository updater is disabled until explicitly enabled through the
+`repository_updater.enabled` knob (or `PICARX_UPDATE_ENABLED=1`). When enabled,
+it checks the configured `origin` and `master` branch while the robot is safely
+idle, fast-forwards only, quiesces Layer B, and re-execs the orchestrator. A
+one-time approved update can be requested without waiting for the poll interval:
+
+```bash
+mosquitto_pub -t picarx/system/update/control \
+  -m '{"operation":"update","confirmed":true,"request_id":"deploy-1"}'
+mosquitto_sub -v -t picarx/system/update/status
+```
+
+Tracked local changes, divergent branches, active motion, low power, and failed
+health checks stop the update rather than overwriting work. The updater keeps a
+rollback marker and automatically restores the prior commit if the new
+orchestrator fails its startup checks.
+
 ### Hardware
 
 Raspberry Pi + SunFounder PiCar-X: Robot HAT, 2× 18650 Li-ion (≈8.4 V full),
@@ -367,6 +384,7 @@ more. Off-robot steering behaviour can also be inspected with
 safety/                 Layer A — the hardcoded safety daemon (owns the wheels)
 layer_b/
   orchestrator.py       Need-driven supervisor: state/demand lifecycle + hot reload
+  repository_updater.py Safe fast-forward updates with startup rollback checks
   module_registry.json  Module catalog (entrypoint + activation policy)
   broker_client.py      The MQTT Bus wrapper every module uses (+ heartbeat)
   config.json           All tunables, at their defaults

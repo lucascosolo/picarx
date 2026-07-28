@@ -16,6 +16,8 @@ import robot_config
 from broker_client import Bus
 from module_lifecycle import NeedPlanner, STATE_TOPIC
 from module_registry import load_registry as read_registry
+from repository_updater import (HEALTH_TOPIC, CONTROL_TOPIC,
+                                 RepositoryUpdater)
 
 REGISTRY_PATH = robot_config.base_path("module_registry.json")
 LOCAL_REGISTRY_PATH = robot_config.base_path("module_registry.local.json")
@@ -29,6 +31,8 @@ lifecycle_bus = None
 lifecycle_subscriptions = set()
 pending_replays = []
 deferred_stops = {}
+maintenance_mode = False
+repository_updater = None
 last_lifecycle_status = None
 last_bus_error_at = 0.0
 LIFECYCLE_TICK_SEC = 0.5
@@ -59,6 +63,8 @@ def get_mtime(path):
 
 
 def start_module(entry, replay_payload=None):
+    if maintenance_mode:
+        return
     name = entry["name"]
     if name in running_processes:
         return
@@ -138,6 +144,8 @@ def _sync_lifecycle(now=None):
     now = time.time() if now is None else float(now)
     if planner is None:
         return
+    if maintenance_mode:
+        return
     desired = planner.desired_names(now)
     for name in desired:
         entry = _entry(name)
@@ -161,9 +169,16 @@ def _sync_lifecycle(now=None):
 
 
 def _on_state(payload):
+    if repository_updater is not None:
+        repository_updater.on_state(payload)
     if planner is not None:
         planner.set_state(payload)
         _sync_lifecycle()
+
+
+def _on_health(payload):
+    if repository_updater is not None:
+        repository_updater.on_health(payload)
 
 
 def _on_demand(topic, payload):
@@ -260,6 +275,91 @@ def sync_with_registry():
     _run_pending_replays()
 
 
+def _quiesce_for_update():
+    """Stop every Layer B child so camera/audio leases are released."""
+    global maintenance_mode
+    maintenance_mode = True
+    # Give the arbiter an explicit safe command before terminating it.  The
+    # safety daemon's 0.75s drive lease watchdog is an independent backstop,
+    # but an update should not depend on waiting for that timeout.
+    if lifecycle_bus is not None:
+        lifecycle_bus.publish("picarx/intent/move", {
+            "source": "repository_updater", "priority": 1000,
+            "action": {"direction": "stop"}, "ttl": 1.0,
+            "reason": "repository update quiescence", "ts": time.time()})
+    for name in list(running_processes):
+        stop_module(name)
+    return True
+
+
+def _resume_after_update_failure():
+    global maintenance_mode
+    maintenance_mode = False
+    sync_with_registry()
+
+
+def _restart_after_update():
+    """Replace the supervisor with the newly pulled checkout.
+
+    The production process is ``picarx-orchestrator.service``.  Re-execing in
+    place keeps that systemd unit supervising the new code without requiring
+    the Layer B user to have permission to invoke ``systemctl``.  The separate
+    ``picarx-safety.service`` process is never stopped or re-execed here.
+    """
+    for name in list(running_processes):
+        stop_module(name)
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+    raise RuntimeError("orchestrator re-exec returned unexpectedly")
+
+
+def _services_healthy():
+    required = ("robot_state", "camera_controller", "audio_nodes",
+                "arbiter", "field_agent")
+    missing = [name for name in required if name not in running_processes]
+    dead = [name for name in required
+            if name in running_processes and running_processes[name].poll() is not None]
+    if missing or dead:
+        return False, f"missing={missing}, dead={dead}"
+    return True, "core Layer B services are running"
+
+
+def _initialize_repository_updater():
+    global repository_updater
+    if lifecycle_bus is None:
+        return
+    repo_path = robot_config.get(
+        "repository_updater", "repo_path",
+        os.path.dirname(robot_config.BASE_DIR), env="PICARX_UPDATE_REPO")
+    repository_updater = RepositoryUpdater(
+        repo_path=repo_path,
+        remote=robot_config.get("repository_updater", "remote", "origin",
+                                env="PICARX_UPDATE_REMOTE"),
+        branch=robot_config.get("repository_updater", "branch", "master",
+                                env="PICARX_UPDATE_BRANCH"),
+        enabled=robot_config.get_bool("repository_updater", "enabled", False,
+                                      env="PICARX_UPDATE_ENABLED"),
+        poll_interval=float(robot_config.get(
+            "repository_updater", "poll_interval_sec", 3600.0,
+            env="PICARX_UPDATE_INTERVAL")),
+        health_timeout=float(robot_config.get(
+            "repository_updater", "health_timeout_sec", 30.0,
+            env="PICARX_UPDATE_HEALTH_TIMEOUT")),
+        publish=lifecycle_bus.publish,
+        quiesce=_quiesce_for_update,
+        resume=_resume_after_update_failure,
+        restart=_restart_after_update,
+        runtime_health_check=_services_healthy,
+    )
+    lifecycle_bus.subscribe(CONTROL_TOPIC, repository_updater.on_control)
+    lifecycle_bus.subscribe(HEALTH_TOPIC, _on_health)
+    # RobotState does not rely on retained MQTT messages. Ask for a fresh
+    # snapshot so an approved update is evaluated against current state.
+    lifecycle_bus.publish("picarx/state/query", {"source": "repository_updater"})
+    if not repository_updater.startup_recover():
+        return
+    repository_updater.start()
+
+
 def shutdown(signum, frame):
     for name in list(running_processes):
         stop_module(name)
@@ -278,6 +378,7 @@ def main():
               f"into config.json ({', '.join(f'{s}.{k}' for s, k in added)})")
     _ensure_lifecycle_bus()
     sync_with_registry()
+    _initialize_repository_updater()
     while True:
         time.sleep(LIFECYCLE_TICK_SEC)
         try:
