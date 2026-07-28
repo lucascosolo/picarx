@@ -52,15 +52,17 @@ flowchart LR
   INT -.->|only when needed| LLM
 ```
 
-- **Layer A — reflexes (`safety/safety_daemon.py`).** The sole owner of *all*
-  hardware — drive motors, steering, and every sensor on the HAT. It ramps
-  motion smoothly, clamps the camera servos to their physical range, watches the
-  battery, and **vetoes** any commanded action it deems unsafe (obstacle too
-  close, cliff detected, sustained blind reverse). It also *serves* raw sensor
-  reads (ultrasonic distance, the I2C IMU) back over its socket, so no Layer B
-  module ever touches `robot_hat` directly. It speaks a Unix socket, not the
-  bus, and its veto authority is never delegated upward. Everything above it is
-  advisory.
+- **Layer A — reflexes (`safety/safety_daemon.py`).** The sole owner of the HAT
+  actuators and safety-critical sensor reads — drive motors, steering, camera
+  servos, battery, ultrasonic, grayscale, and IMU. It ramps motion smoothly,
+  clamps the camera servos to their physical range, watches the battery, and
+  **vetoes** any commanded action it deems unsafe (obstacle too close, cliff
+  detected, sustained blind reverse). The camera sensor pipeline is the one
+  deliberate Layer B exception: `camera_controller.py` is the sole Picamera2
+  owner, and vision/gesture/web consumers can only request a shared stream.
+  Layer A serves raw safety-owned sensor reads over its socket, so no other
+  Layer B module touches those HAT devices directly. Its veto authority is
+  never delegated upward; everything above it is advisory.
 
 - **Layer B — behaviour (`layer_b/modules/`).** ~27 small Python processes,
   each an independent MQTT participant: perception, world modelling, autonomous
@@ -121,7 +123,7 @@ separate channel so a glance never competes with driving.
 | **Attention & dialogue** | `dialog`, `attention` | One central turn-taking broker answers "is this utterance addressed to me, and is it the answer to my open question?" so a command, a web-console button, or one module's answer can't be swallowed by another. `attention.py` is the shared, pure model (wake-word / conversation-window / command-shape classification). |
 | **Interaction & personality** | `companion`, `curiosity`, `expressions` | Spoken conversation via Claude, now grounded in the robot's *own* recent experience so it speaks in the first person ("someone just picked me up", "I got stuck in the corner earlier"); questions about genuinely ambiguous sightings ("is that a chair or a speaker?"); and ambient personality — idle musings, curious head-tilts, greetings, notes-to-self, and an **affect layer** (decaying curiosity / frustration / satisfaction moods made legible as head gestures). |
 | **Observability** | `debug_monitor`, `heartbeat`, `behavior_metrics` | A unified per-module liveness heartbeat on one bus topic; an always-on `/proc`-based per-process CPU/telemetry log; and real-world collision/veto-rate instrumentation that (with the A/B experiment scaffolding) proves whether the self-training loop actually helps. |
-| **Practical tools** | `tools_registry`, `radio`, `reminder_daemon`, `notes_daemon`, `follow_daemon`, `remote_assist`, `gesture_tracking`, `robot_state`, `bluetooth_daemon`, `health_daemon`, `web_console` | A voice→topic command router, internet radio, persistent reminders and local notes/meeting logs, person-following, robot-owned SSH project assistance, bounded MediaPipe hand/head tracking, exclusive resource states, Bluetooth, homeostatic low-power self-preservation, and a multi-page phone/laptop web console (dashboard, live camera + RC driving, object-training, people & places, audio/radio, tools, notes, and a browser-editable config page). |
+| **Practical tools** | `tools_registry`, `radio`, `reminder_daemon`, `notes_daemon`, `follow_daemon`, `remote_assist`, `gesture_tracking`, `camera_controller`, `robot_state`, `bluetooth_daemon`, `health_daemon`, `web_console` | A voice→topic command router, internet radio, persistent reminders and local notes/meeting logs, person-following, robot-owned SSH project assistance, bounded MediaPipe hand/head tracking, one-owner camera capture with FPS subscriptions, exclusive resource states, Bluetooth, homeostatic low-power self-preservation, and a multi-page phone/laptop web console (dashboard, live camera + RC driving, object-training, people & places, audio/radio, tools, notes, and a browser-editable config page). |
 
 Two of these deserve a note because they define the robot's character:
 
