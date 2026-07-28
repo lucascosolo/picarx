@@ -30,6 +30,7 @@ class PythonEnvironmentScriptTest(unittest.TestCase):
             script = self._read(name)
             self.assertIn('PICARX_MEDIAPIPE_PACKAGE', script)
             self.assertIn('mediapipe-rpi4', script)
+            self.assertIn("pip uninstall -y mediapipe mediapipe-rpi4", script)
 
 
 if __name__ == "__main__":

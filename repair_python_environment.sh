@@ -63,18 +63,12 @@ if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
 fi
 
 # Keep this list aligned with setup_python.sh. Import and distribution names
-# differ for paho-mqtt and OpenCV. The official MediaPipe PyPI build does not
-# cover Raspberry Pi's ARM wheel/runtime combinations reliably, so use the
-# Pi 4 build there. Override this when deploying a separately built official
-# wheel (for example: PICARX_MEDIAPIPE_PACKAGE=mediapipe).
-case "$(uname -m)" in
-    aarch64|armv7l|armv8l)
-        MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe-rpi4}"
-        ;;
-    *)
-        MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe}"
-        ;;
-esac
+# differ for paho-mqtt and OpenCV. Keep the generic MediaPipe package as the
+# default: the old community mediapipe-rpi4 source distribution can install
+# the Python package without its native _framework_bindings extension, which
+# leaves an importable-but-broken mediapipe namespace. A separately built ARM
+# wheel may still be selected explicitly with PICARX_MEDIAPIPE_PACKAGE.
+MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe}"
 dependencies=(
     "anthropic|anthropic"
     "cv2|opencv-contrib-python-headless"
@@ -139,10 +133,10 @@ for dependency in "${dependencies[@]}"; do
         "$VENV_PYTHON" -m pip install --force-reinstall "$package_name"
         continue
     fi
-    if [[ "$import_name" == "mediapipe" && "$package_name" == "mediapipe-rpi4" ]]; then
-        # Both distributions install the mediapipe import package. Remove a
-        # newer generic install first, otherwise mixed Python/native files can
-        # make model construction abort before the module can report an error.
+    if [[ "$import_name" == "mediapipe" ]]; then
+        # Both distributions install the mediapipe import package. Remove
+        # either one first, otherwise mixed Python/native files can leave an
+        # importable namespace with no _framework_bindings extension.
         "$VENV_PYTHON" -m pip uninstall -y mediapipe mediapipe-rpi4 \
             >/dev/null 2>&1 || true
         "$VENV_PYTHON" -m pip install --force-reinstall "$package_name"
