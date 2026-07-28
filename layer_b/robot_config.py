@@ -249,8 +249,8 @@ KNOBS = [
     # ---- health (tools/health_daemon.py) ----
     {"section": "health", "key": "battery_adc", "type": "bool",
      "default": False, "env": "HEALTH_BATTERY_ADC",
-     "desc": "Direct-ADC battery fallback for setups without world_state "
-             "(leave off normally - it contends on the I2C bus)."},
+     "desc": "Safety-daemon battery-query fallback for setups without world_state "
+             "(leave off normally)."},
     # ---- embeddings (embedding_util.py) ----
     {"section": "embeddings", "key": "model_path", "type": "str",
      "default": data_path("models", "minilm", "model.onnx"),

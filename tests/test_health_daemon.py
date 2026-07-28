@@ -2,6 +2,8 @@ import os
 import sys
 import tempfile
 import unittest
+import json
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
@@ -31,6 +33,35 @@ class VitalHelpersTest(unittest.TestCase):
         free_gb, used_pct = hd.read_disk("/")
         self.assertIsInstance(free_gb, float)
         self.assertTrue(0 <= used_pct <= 100)
+
+    def test_battery_fallback_queries_safety_daemon(self):
+        class FakeSocket:
+            def __init__(self, *args, **kwargs):
+                self.request = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def connect(self, path):
+                self.path = path
+
+            def sendall(self, data):
+                self.request = json.loads(data.decode())
+
+            def recv(self, size):
+                return b'{"voltage": 7.4}'
+
+        fake = FakeSocket()
+        with patch.object(hd.socket, "socket", return_value=fake):
+            self.assertEqual(hd.read_battery_adc(), 7.4)
+        self.assertEqual(fake.path, hd.SAFETY_SOCKET_PATH)
+        self.assertEqual(fake.request, {"query": "battery_status"})
 
     def test_summarize(self):
         s = hd.summarize({"battery_v": 7.4, "battery_pct": 58, "temp_c": 52.0,

@@ -21,9 +21,9 @@ free disk - and drives a self-preservation LOW-POWER state.
 Battery source: it CONSUMES the voltage already on picarx/state/world (the
 safety daemon reads the battery ADC and world_state.py republishes it).
 Re-reading the robot_hat ADC from a second process would contend with the
-safety daemon on the I2C bus, so we don't by default. A direct ADC read
-(the SunFounder A4 snippet) is available behind HEALTH_BATTERY_ADC=1 as a
-fallback for setups that don't run world_state.
+safety daemon on the I2C bus, so we don't by default. A safety-daemon battery
+query is available behind HEALTH_BATTERY_ADC=1 as a fallback for setups that
+don't run world_state; this path still never opens the HAT itself.
 
 Fail-soft throughout: an unreadable sensor just reports None. Issues no
 motion and writes no database.
@@ -38,6 +38,8 @@ from broker_client import Bus
 import robot_config
 
 import shutil
+import json
+import socket
 import threading
 import time
 
@@ -46,6 +48,7 @@ STATE_TOPIC = "picarx/health/state"
 LOW_POWER_TOPIC = "picarx/health/low_power"
 LOWPOWER_REQUEST_TOPIC = "picarx/tools/lowpower/request"
 SPEAK_TOPIC = "picarx/audio/speak"
+SAFETY_SOCKET_PATH = "/tmp/picarx_safety.sock"
 
 THERMAL_PATH = "/sys/class/thermal/thermal_zone0/temp"
 DISK_PATH = "/"
@@ -111,12 +114,18 @@ def read_disk(path=DISK_PATH):
 
 
 def read_battery_adc():
-    """Direct robot_hat ADC battery read (SunFounder A4 divider). OFF by
-    default (see module docstring - I2C contention with the safety daemon).
-    Enable with HEALTH_BATTERY_ADC=1 for setups without world_state."""
+    """Read battery state through the safety daemon, never robot_hat.
+
+    The function name is retained for configuration and caller compatibility;
+    HEALTH_BATTERY_ADC now means "use the safety query as a fallback".
+    """
     try:
-        from robot_hat import ADC
-        v = round(ADC("A4").read() * 3.3 / 4095 * 3, 2)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.3)
+            client.connect(SAFETY_SOCKET_PATH)
+            client.sendall(json.dumps({"query": "battery_status"}).encode())
+            result = json.loads(client.recv(1024).decode())
+        v = result.get("voltage")
     except Exception:
         return None
     # A momentary 0.0V (or otherwise impossible) ADC sample is a glitch, not a
