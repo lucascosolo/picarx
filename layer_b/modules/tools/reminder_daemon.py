@@ -276,7 +276,8 @@ class ReminderDaemon:
             text = f"You have {len(rows)} reminders pending: {messages}."
         self.bus.publish(SPEAK_TOPIC, {"text": text[:400], "ts": time.time()})
         self.bus.publish(STATE_TOPIC, {"event": "boot_briefing",
-                                       "count": len(rows), "ts": time.time()})
+                                       "count": len(rows), "reminders": rows,
+                                       "ts": time.time()})
         return True
 
     def _delayed_boot_announce(self):

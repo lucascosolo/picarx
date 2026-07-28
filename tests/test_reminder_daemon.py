@@ -134,6 +134,8 @@ class ReminderDaemonTest(unittest.TestCase):
         spoken = self.d.bus.of(rd.SPEAK_TOPIC)
         self.assertEqual(len(spoken), 1)
         self.assertIn("one", spoken[0]["text"])
+        state = self.d.bus.of(rd.STATE_TOPIC)[-1]
+        self.assertEqual(len(state["reminders"]), 2)
 
     def test_boot_briefing_waits_for_safety_owner(self):
         self.d.on_set({"message": "safe", "delay_minutes": 30, "source": "web"})

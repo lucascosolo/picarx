@@ -43,6 +43,8 @@ class CompanionToolTest(unittest.TestCase):
         self.c.bus = harness.FakeBus()
         self.c.semantic = SemanticStore(
             readonly=True, db_path=os.path.join(tempfile.mkdtemp(), "none.db"))
+        self.c.history = deque(maxlen=20)
+        self.c.last_turn_at = None
 
     # ---- direct tool dispatch ----
 
@@ -140,6 +142,35 @@ class CompanionToolTest(unittest.TestCase):
     def test_on_health_caches(self):
         self.c.on_health({"battery_v": 8.0, "battery_pct": 90})
         self.assertEqual(self.c.latest_health["battery_pct"], 90)
+
+    def test_reminder_followup_is_answered_from_daemon_state(self):
+        self.c.on_reminder_state({
+            "event": "set", "id": "r1", "message": "take out the trash",
+            "fire_at": companion.time.time() + 300,
+        })
+        handled = self.c._maybe_answer_reminder(
+            "what are you reminding me to do?")
+        self.assertTrue(handled)
+        spoken = self.c.bus.last("picarx/audio/speak")["text"]
+        self.assertIn("take out the trash", spoken)
+        self.assertIn("5 minutes", spoken)
+
+    def test_reminder_followup_without_reminder_word_is_answered(self):
+        self.c.on_reminder_state({
+            "event": "set", "id": "r1", "message": "take out the trash",
+            "fire_at": companion.time.time() + 300,
+        })
+        self.assertTrue(self.c._maybe_answer_reminder(
+            "what are you going to tell me in five minutes again?"))
+
+    def test_fired_reminder_is_removed_from_followup_cache(self):
+        self.c.on_reminder_state({
+            "event": "set", "id": "r1", "message": "take out trash",
+            "fire_at": companion.time.time() + 300,
+        })
+        self.c.on_reminder_state({"event": "fired", "id": "r1"})
+        self.assertFalse(self.c._maybe_answer_reminder(
+            "what are you reminding me to do?"))
 
     def test_unknown_tool(self):
         self.assertIn("Unknown", self.c._execute_tool("frobnicate", {}))

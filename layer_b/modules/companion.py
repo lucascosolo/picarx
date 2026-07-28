@@ -258,6 +258,8 @@ EPISODE_TRIGGERS = (
 MAX_TOOL_ROUNDS = 3          # bound the tool<->model round-trips per utterance
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
 REMINDER_CONTROL_TOPIC = "picarx/tools/reminder/control"
+REMINDER_RESULT_TOPIC = "picarx/tools/reminder/result"
+REMINDER_STATE_TOPIC = "picarx/tools/reminder/state"
 NOTES_TOPIC = "picarx/tools/notes"
 FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
 BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
@@ -545,6 +547,10 @@ class Companion:
         self.latest_frame_at = 0.0
         # Latest vital stats from health_daemon (for the check_vital_stats tool)
         self.latest_health = None
+        # The reminder daemon owns timers; this is only a small read-only cache
+        # of its published state so follow-up questions can be answered locally
+        # without asking Claude to reconstruct an asynchronous tool call.
+        self.pending_reminders = {}
         # Pending "what did you want me to do?" question, or None:
         # {"question_id": <id the dialog broker holds>, "utterance": <original
         # misread phrasing>}. The broker owns the answer window/expiry; this is
@@ -688,6 +694,91 @@ class Companion:
         # Vital stats from health_daemon, cached for the check_vital_stats tool.
         with self.lock:
             self.latest_health = payload
+
+    def on_reminder_state(self, payload):
+        """Cache reminder-daemon state for local, token-free follow-ups."""
+        payload = dict(payload or {})
+        event = str(payload.get("event") or "").lower()
+        rows = payload.get("reminders")
+        with self.lock:
+            if not isinstance(getattr(self, "pending_reminders", None), dict):
+                self.pending_reminders = {}
+            if isinstance(rows, list):
+                self.pending_reminders = {
+                    str(row.get("id")): dict(row)
+                    for row in rows if isinstance(row, dict) and row.get("id")
+                }
+            elif event == "set" and payload.get("id"):
+                self.pending_reminders[str(payload["id"])] = payload
+            elif event in {"deleted", "fired"} and payload.get("id"):
+                self.pending_reminders.pop(str(payload["id"]), None)
+
+    def on_reminder_result(self, payload):
+        """Ingest list/set/delete results, including requests made by tools."""
+        payload = dict(payload or {})
+        result = payload.get("result") or {}
+        rows = result.get("reminders") if isinstance(result, dict) else None
+        if isinstance(rows, list):
+            self.on_reminder_state({"reminders": rows})
+            return
+        command = str(payload.get("command") or "").lower()
+        if command == "set" and isinstance(result, dict) and result.get("id"):
+            self.on_reminder_state({"event": "set", **result})
+        elif command == "delete" and isinstance(result, dict) and result.get("id"):
+            self.on_reminder_state({"event": "deleted", **result})
+
+    @staticmethod
+    def _reminder_question(text):
+        """Recognize reminder follow-ups without stealing new set requests."""
+        lowered = (text or "").lower()
+        if "remind" in lowered or "reminder" in lowered:
+            return ("what" in lowered or "which" in lowered or "when" in lowered)
+        # The common immediate follow-up omits the word reminder:
+        # "what are you going to tell me in five minutes?"
+        return ("what" in lowered and "minute" in lowered and
+                any(word in lowered for word in ("tell", "do", "again")))
+
+    @staticmethod
+    def _spoken_duration(seconds):
+        minutes = max(1, round(max(0.0, seconds) / 60.0))
+        if minutes < 60:
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        hours = max(1, round(minutes / 60.0))
+        return f"about {hours} hour{'s' if hours != 1 else ''}"
+
+    def _maybe_answer_reminder(self, text):
+        """Answer reminder-status questions from the daemon's local state."""
+        if not self._reminder_question(text):
+            return False
+        with self.lock:
+            rows = [dict(row) for row in
+                    getattr(self, "pending_reminders", {}).values()]
+        if not rows:
+            return False
+        rows.sort(key=lambda r: float(r.get("fire_at", 0)))
+        now = time.time()
+        if len(rows) == 1:
+            row = rows[0]
+            message = str(row.get("message") or "something")
+            remaining = float(row.get("fire_at", now)) - now
+            if remaining > 0:
+                reply = (f"I'm reminding you to {message} in "
+                         f"{self._spoken_duration(remaining)}.")
+            else:
+                reply = f"I'm reminding you to {message}."
+        else:
+            items = "; ".join(str(row.get("message") or "something")
+                               for row in rows[:5])
+            suffix = " and more" if len(rows) > 5 else ""
+            reply = f"Your pending reminders are: {items}{suffix}."
+        with self.lock:
+            self.history.append({"role": "user", "content": text})
+            self.history.append({"role": "assistant", "content": reply})
+            self.last_turn_at = now
+        self._save_memory()
+        print(f"Companion (reminder state): {reply}")
+        self.bus.publish("picarx/audio/speak", {"text": reply, "ts": now})
+        return True
 
     @staticmethod
     def _format_health(health):
@@ -937,8 +1028,9 @@ class Companion:
     def _context_blurb(self):
         with self.lock:
             snap = dict(self.latest_world) if self.latest_world else None
+            reminders = list(getattr(self, "pending_reminders", {}).values())
         if not snap:
-            return "no sensor data yet"
+            return self._reminder_blurb(reminders) or "no sensor data yet"
 
         parts = []
         face = snap.get("face", {})
@@ -974,12 +1066,26 @@ class Companion:
             remembered = "; ".join(f"{f['subject']}: {f['fact']}" for f in facts)
             parts.append(f"long-term memory notes: {remembered}")
 
+        reminder_note = self._reminder_blurb(reminders)
+        if reminder_note:
+            parts.append(reminder_note)
+
         # Its own recent EXPERIENCE: how it's moving/being handled right now,
         # a bump/pickup it just felt, what it did earlier today, and anything it
         # learned from practising. All fail-soft (see _experience_notes).
         parts.extend(self._experience_notes(time.time(), snap))
 
         return "; ".join(parts)
+
+    @staticmethod
+    def _reminder_blurb(reminders):
+        """Compact reminder context; never include more than a few rows."""
+        if not reminders:
+            return ""
+        rows = sorted(reminders, key=lambda r: float(r.get("fire_at", 0)))[:5]
+        return "pending reminders: " + "; ".join(
+            str(row.get("message") or "(unnamed reminder)")[:80]
+            for row in rows)
 
     def _experience_notes(self, now, snap):
         """First-person notes about the robot's own recent experience, folded
@@ -1458,6 +1564,11 @@ class Companion:
         # the semantic store directly, never spending an LLM round-trip.
         if self._maybe_answer_episode(text):
             return
+        # Reminder status is owned by reminder_daemon, but its published cache
+        # makes the natural follow-up deterministic and avoids a needless or
+        # hallucinated Claude answer after an asynchronous tool call.
+        if self._maybe_answer_reminder(text):
+            return
         client = self._get_client()
         if client is None:
             self.bus.publish("picarx/audio/speak", {"text": "Sorry, I can't chat right now."})
@@ -1530,6 +1641,8 @@ class Companion:
         self.bus.subscribe(CAMERA_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
+        self.bus.subscribe(REMINDER_STATE_TOPIC, self.on_reminder_state)
+        self.bus.subscribe(REMINDER_RESULT_TOPIC, self.on_reminder_result)
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
         self.bus.subscribe(IMU_EVENT_TOPIC, self.on_imu_event)
         self.bus.subscribe(SELF_TRAINER_STATUS_TOPIC, self.on_self_trainer_status)
