@@ -148,6 +148,32 @@ execute remotely.
 
 **Estimated effort:** 18–30 hours, excluding host-specific packaging.
 
+### P0 — Automatic repository update and restart
+
+This is an intentionally small, high-value deployment loop: once enabled, the
+robot should pull the configured repository branch and restart its managed
+services without requiring a manual login to the Pi.
+
+- Pull only from the configured repository and branch with a fast-forward-only
+  update; record the previous/new commit, trigger, and result in the event
+  journal.
+- Run only while safely idle, with no RC session, active drive intent, camera
+  capture, meeting recording, or remote write. Use an update lock so requests
+  cannot overlap, and report progress on the bus.
+- Restart the managed services after the pull, run bounded import/health checks,
+  and automatically restore the previous commit if startup fails. The safety
+  daemon must remain independently available throughout the process.
+- Keep polling or update requests explicitly configured; never pull an
+  arbitrary ref from a voice phrase, and retain a local rollback record when
+  the network or repository is unavailable.
+
+**Acceptance:** with the policy enabled, the robot fetches the configured
+branch, restarts itself, reports the commit transition, and returns to the
+last known-good revision after a failed health check without moving.
+
+**Estimated effort:** 8–14 hours, plus field validation of rollback and power
+loss during an update.
+
 ### P0 — Follow-me reliability and perception learning
 
 The existing follow daemon already routes movement through the arbiter and
