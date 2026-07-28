@@ -895,13 +895,34 @@ if __name__ == "__main__":
         # command in timeout because a broken ARM native binding can hang
         # inside the constructor and cannot be interrupted from Python.
         tracker = GestureTracker()
-        result = tracker._load_hands()
+        result = None
+
+        def probe_progress(phase, **fields):
+            print(json.dumps({"phase": phase, **fields}, sort_keys=True),
+                  flush=True)
+            return True
+
         print(json.dumps({
-            "ok": bool(result),
-            "backend": tracker._hands_backend,
-            "error": tracker._model_error,
-            "diagnostics": tracker._model_diagnostics,
-        }, sort_keys=True))
-        tracker._close_hands(result)
+            "phase": "starting",
+            **tracker._model_runtime_diagnostics(),
+        }, sort_keys=True), flush=True)
+        try:
+            result = tracker._create_hands(progress=probe_progress)
+            tracker._hands = result[0]
+            tracker._hands_backend = result[2]
+            tracker._model_diagnostics = result[3]
+            print(json.dumps({
+                "ok": True,
+                "backend": tracker._hands_backend,
+                "diagnostics": tracker._model_diagnostics,
+            }, sort_keys=True), flush=True)
+        except BaseException as exc:
+            print(json.dumps({
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "diagnostics": tracker._model_diagnostics,
+            }, sort_keys=True), flush=True)
+        finally:
+            tracker._close_hands(result[0] if result else None)
     else:
         GestureTracker().run()

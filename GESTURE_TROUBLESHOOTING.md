@@ -94,3 +94,21 @@ ownership and hand-detection problems.
    use a tested ARM build or a locally built wheel rather than an arbitrary
    generic package. Do not mix it with mediapipe-rpi4; both distributions
    install the same mediapipe namespace.
+
+   The probe prints each phase as a flushed JSON line. If it reaches
+   `phase=constructing` and then emits the AES/SIGILL fatal error, the crash
+   is in the native MediaPipe constructor. If it dies before `phase=imported`,
+   isolate the import itself:
+
+   ```bash
+   /usr/bin/python3 -c 'import mediapipe; print("mediapipe import ok")'
+   /usr/bin/python3 -c 'from mediapipe.tasks.python import vision; print("tasks import ok")'
+   ```
+
+   Also identify the exact crashing object instead of assuming it is
+   MediaPipe:
+
+   ```bash
+   grep -R -a -l 'go/sigill-fail-fast' \
+     /opt/picarx/venv/lib/python3.13/site-packages 2>/dev/null
+   ```
