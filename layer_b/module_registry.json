@@ -9,6 +9,15 @@
     }
   },
   {
+    "name": "camera_controller",
+    "version": "0.1",
+    "entrypoint": "camera_controller.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
     "name": "gesture_tracking",
     "version": "0.1",
     "entrypoint": "gesture_tracking.py",

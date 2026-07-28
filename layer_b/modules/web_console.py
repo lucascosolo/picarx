@@ -93,14 +93,12 @@ ASSETS = {
     "/app.js": ("app.js", "application/javascript; charset=utf-8"),
 }
 
-# Live camera view. vision_basic.py owns the camera and only encodes
-# frames while we ask it to (picarx/vision/stream_control), so the view
-# costs nothing until someone opens it. We tell vision to start on the
-# first frame request and, via a watchdog, to stop once the browser has
-# gone quiet for CAMERA_IDLE_SEC (tab closed / live toggle off) - so a
-# forgotten tab can't pin vision's CPU encoding frames nobody sees.
-VISION_STREAM_CONTROL = "picarx/vision/stream_control"
-VISION_FRAME_TOPIC = "picarx/vision/frame"
+# Live camera view is an observer subscription to the single camera
+# controller. It never asks vision_basic to encode or own the sensor.
+CAMERA_SUBSCRIBE_TOPIC = "picarx/camera/subscribe"
+CAMERA_FRAME_TOPIC = "picarx/camera/frame"
+CAMERA_SUBSCRIBER = "web_console"
+CAMERA_FPS = 5.0
 CAMERA_IDLE_SEC = 5.0
 
 # ---- RC mode ----
@@ -155,7 +153,7 @@ class ConsoleState:
         self.camera_jpeg = None       # latest JPEG bytes, or None until first frame
         self.camera_ts = 0.0          # when that frame was captured (robot clock)
         self.last_view_request = 0.0  # last time a browser fetched /camera.jpg
-        self.stream_on = False        # whether we've told vision to encode frames
+        self.stream_on = False        # whether we've subscribed to camera frames
 
     def add_log(self, kind, text, obs=None):
         with self.lock:
@@ -534,10 +532,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, config_data())
         elif self.path == "/camera.jpg" or self.path.startswith("/camera.jpg?"):
             # Fetching a frame is itself the "someone is watching" signal:
-            # start vision's stream on the first request, keep the
-            # watchdog fed on every one.
-            if STATE.note_view_demand():
-                BUS.publish(VISION_STREAM_CONTROL, {"enabled": True})
+            # subscribe on the first request and refresh the short lease on
+            # every request while the browser is polling.
+            STATE.note_view_demand()
+            if STATE.stream_on:
+                BUS.publish(CAMERA_SUBSCRIBE_TOPIC, {
+                    "subscriber": CAMERA_SUBSCRIBER, "enabled": True,
+                    "fps": CAMERA_FPS, "ttl": 2.0, "ts": time.time()})
             with STATE.lock:
                 jpeg = STATE.camera_jpeg
             if jpeg is None:
@@ -633,7 +634,9 @@ class Handler(BaseHTTPRequestHandler):
             # the idle watchdog; turning it on pre-warms the stream.
             enabled = bool(body.get("enabled", False))
             if STATE.set_stream(enabled):
-                BUS.publish(VISION_STREAM_CONTROL, {"enabled": enabled})
+                BUS.publish(CAMERA_SUBSCRIBE_TOPIC, {
+                    "subscriber": CAMERA_SUBSCRIBER, "enabled": enabled,
+                    "fps": CAMERA_FPS, "ttl": 2.0, "ts": time.time()})
             self._send(200, {"ok": True})
         elif self.path == "/gesture":
             BUS.publish("picarx/gesture/control", {
@@ -811,7 +814,9 @@ def camera_watchdog():
     while True:
         time.sleep(1.0)
         if STATE.camera_idle_expired(time.time()):
-            BUS.publish(VISION_STREAM_CONTROL, {"enabled": False})
+            BUS.publish(CAMERA_SUBSCRIBE_TOPIC, {
+                "subscriber": CAMERA_SUBSCRIBER, "enabled": False,
+                "ts": time.time()})
             print("Web console: live view idle - stopping camera stream")
 
 
@@ -836,7 +841,7 @@ def main():
     BUS.subscribe("picarx/tools/notes/result", on_notes_result)
     BUS.subscribe("picarx/tools/reminder/state", on_reminder_state)
     BUS.subscribe("picarx/tools/reminder/result", on_reminder_result)
-    BUS.subscribe(VISION_FRAME_TOPIC, on_vision_frame)
+    BUS.subscribe(CAMERA_FRAME_TOPIC, on_vision_frame)
 
     try:
         server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

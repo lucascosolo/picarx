@@ -203,10 +203,12 @@ remembered/recognized, or to share a connection are also {"chat": true}."""
 # When someone asks the robot what it's looking at (or teaches it a new
 # object: "remember this is a watering can"), attach a live camera
 # frame to the LLM call so the reply is grounded in ACTUAL sight, not
-# the 20 labels the on-board detector knows. Frames come from
-# vision_basic.py's on-demand stream (same one the web console uses).
-VISION_STREAM_CONTROL = "picarx/vision/stream_control"
-VISION_FRAME_TOPIC = "picarx/vision/frame"
+# the 20 labels the on-board detector knows. Frames come from the single
+# camera controller's temporary subscription.
+CAMERA_SUBSCRIBE_TOPIC = "picarx/camera/subscribe"
+CAMERA_FRAME_TOPIC = "picarx/camera/frame"
+CAMERA_SUBSCRIBER = "companion"
+CAMERA_FPS = 2.0
 FRAME_FRESH_SEC = 2.0            # a frame this recent is "now" - reuse it
 FRAME_WAIT_SEC = 4.0             # how long to wait for a requested frame
 
@@ -1100,7 +1102,9 @@ class Companion:
         with self.lock:
             if self.latest_frame_b64 and now - self.latest_frame_at < FRAME_FRESH_SEC:
                 return self.latest_frame_b64
-        self.bus.publish(VISION_STREAM_CONTROL, {"enabled": True})
+        self.bus.publish(CAMERA_SUBSCRIBE_TOPIC, {
+            "subscriber": CAMERA_SUBSCRIBER, "enabled": True,
+            "fps": CAMERA_FPS, "ttl": 2.0, "ts": time.time()})
         try:
             deadline = now + FRAME_WAIT_SEC
             while time.time() < deadline:
@@ -1111,7 +1115,9 @@ class Companion:
             print("Companion: no camera frame arrived in time")
             return None
         finally:
-            self.bus.publish(VISION_STREAM_CONTROL, {"enabled": False})
+            self.bus.publish(CAMERA_SUBSCRIBE_TOPIC, {
+                "subscriber": CAMERA_SUBSCRIBER, "enabled": False,
+                "ts": time.time()})
 
     @staticmethod
     def _wants_camera(text):
@@ -1485,7 +1491,7 @@ class Companion:
         self.bus.subscribe(DIALOG_ANSWER_TOPIC, self.on_dialog_answer)
         self.bus.subscribe(DIALOG_CLEARED_TOPIC, self.on_dialog_cleared)
         self.bus.subscribe(FEEDBACK_TOPIC, self.on_feedback)
-        self.bus.subscribe(VISION_FRAME_TOPIC, self.on_frame)
+        self.bus.subscribe(CAMERA_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)

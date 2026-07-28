@@ -126,11 +126,11 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", str(THREAD_LIMIT))
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
-from camera_lock import CameraBusy, CameraLease
+from camera_client import (CameraSubscription, LatestCameraFrame,
+                           decode_camera_frame)
 import robot_config
 import label_memory
 from perception_feedback import PerceptionFeedbackStore
-from picamera2 import Picamera2
 import base64
 import cv2
 import numpy as np
@@ -310,23 +310,9 @@ MOTION_CHECK_SIZE = (80, 60)
 MOTION_DIFF_THRESHOLD = 6.0     # mean abs pixel difference (0-255 scale) to count as "changed"
 FORCE_DETECT_INTERVAL = 6.0     # always refresh at least this often, motion or not
 
-# ---- on-demand MJPEG-style stream for the web console ----
-# The Pi camera is a single-owner device and this module holds it, so
-# the web console cannot open it directly. Instead, WHEN A VIEWER IS
-# ACTUALLY WATCHING, we JPEG-encode the frame we already captured and
-# publish it on picarx/vision/frame; web_console.py caches the latest
-# one and serves it over HTTP. This stays off by default and is gated by
-# picarx/vision/stream_control {"enabled": bool} (the console turns it on
-# only while its live view is open, and a watchdog there turns it back
-# off when nobody's looking), so the encode cost is paid only during
-# hands-on debugging - never during autonomous operation, preserving the
-# CPU budget this module guards everywhere else.
-STREAM_CONTROL_TOPIC = "picarx/vision/stream_control"
 TRAINING_TOPIC = "picarx/system/training"   # self_trainer: throttle to free CPU
 TRAINING_LOOP_INTERVAL = 1.0                # slow the capture loop while training
-STREAM_FRAME_TOPIC = "picarx/vision/frame"
-STREAM_MIN_INTERVAL = 0.2       # cap publish rate (~5 fps ceiling; loop tick bounds it lower)
-STREAM_JPEG_QUALITY = 60        # small over MQTT/base64; a debug view doesn't need more
+CAMERA_FPS = 1.0 / DETECT_INTERVAL
 ROBOT_STATE_TOPIC = "picarx/state/current"
 STATE_QUERY_TOPIC = "picarx/state/query"
 STATE_CLAIM_TOPIC = "picarx/state/claim"
@@ -671,10 +657,8 @@ class CentroidTracker:
 
 def run():
     bus = Bus()
-    picam2 = None
-    camera_lease = None
-    # Subscribe before opening Picamera2 so a retained/current state or a
-    # fast gesture claim can prevent a competing camera owner from starting.
+    # Subscribe before requesting frames. The controller owns Picamera2 and
+    # broadcasts one captured frame to every active consumer.
     robot_state = {"state": "IDLE"}
     state_seen = threading.Event()
     object_state_claimed = False
@@ -683,8 +667,7 @@ def run():
         state_seen.set()
     bus.subscribe(ROBOT_STATE_TOPIC, on_robot_state)
     # RobotState does not rely on MQTT retained messages. Ask for a fresh
-    # snapshot before opening the camera, otherwise vision can win the lock
-    # during startup just before an already-active gesture claim is delivered.
+    # snapshot before requesting frames so a gesture claim is observed first.
     bus.publish(STATE_QUERY_TOPIC, {"source": "vision_basic"})
     state_seen.wait(1.0)
 
@@ -703,58 +686,15 @@ def run():
                 "owner": VISION_STATE_OWNER, "ts": time.time()})
             object_state_claimed = False
 
-    def open_camera():
-        lease = CameraLease().acquire()
-        camera = None
-        try:
-            camera = Picamera2()
-            config = camera.create_preview_configuration(
-                main={"format": "RGB888", "size": CAPTURE_SIZE})
-            camera.configure(config)
-            camera.start()
-            time.sleep(1)
-            return camera, lease
-        except Exception:
-            close_camera(camera)
-            lease.release()
-            raise
-
-    def close_camera(camera):
-        if camera is None:
-            return
-        for method in ("stop", "close"):
-            try:
-                getattr(camera, method)()
-            except Exception:
-                pass
-
-    while robot_state["state"] != "GESTURE_TRACKING":
-        try:
-            picam2, camera_lease = open_camera()
-            break
-        except CameraBusy:
-            print("vision: camera owned by another process; waiting")
-            time.sleep(0.2)
-        except Exception as e:
-            print(f"vision: camera failed to start ({e}); retrying")
-            time.sleep(0.5)
-    if picam2 is None:
-        print("vision: gesture mode owns camera; waiting for handoff")
+    camera_frames = LatestCameraFrame()
+    camera = CameraSubscription(bus, VISION_STATE_OWNER, CAMERA_FPS,
+                                on_frame=camera_frames.put)
 
     face_cascade = cv2.CascadeClassifier(
         robot_config.base_path("modules", "cascades", "cascades.xml")
     )
     detector = _make_detector()
     tracker = CentroidTracker()
-
-    # On-demand console stream state. Toggled from the MQTT callback
-    # thread; the loop only reads it, so a plain dict is enough (a stale
-    # read just means one extra/fewer frame, which is harmless).
-    stream = {"enabled": False}
-    def on_stream_control(payload):
-        stream["enabled"] = bool(payload.get("enabled", False))
-        print(f"vision stream {'ENABLED' if stream['enabled'] else 'disabled'} (console live view)")
-    bus.subscribe(STREAM_CONTROL_TOPIC, on_stream_control)
 
     # Low-power curtailment (same mutable-dict-from-callback pattern as the
     # stream flag above): while active, the heavy SSD pass runs far less often.
@@ -779,11 +719,9 @@ def run():
         print(f"vision: self-training mode {'ON - throttling detection' if training['active'] else 'off'}")
     bus.subscribe(TRAINING_TOPIC, on_training)
 
-    # Camera ownership is exclusive with gesture_tracking.py.  When the
-    # state manager grants GESTURE_TRACKING, release Picamera2 completely so
-    # the gesture capture thread can open it; reacquire it after the state
-    # returns. During SPEAKING we keep the device open but deliberately drop
-    # frames so TTS gets the CPU and no stale camera queue can build.
+    # Request frames while vision is the active detector. During SPEAKING we
+    # still drain the shared stream but deliberately skip decoding, so TTS
+    # gets the CPU and no stale camera queue can build.
     # On-board label memory (recognition tier 2): visual signatures of tracked
     # objects, cached by track id on each detection pass, plus the persistent
     # signature->label store a human/LLM teaches. A label arriving on
@@ -842,7 +780,6 @@ def run():
     last_object_detect = 0.0
     last_forced_detect = 0.0
     last_motion_thumb = None
-    last_stream_pub = 0.0
     close_object = False   # persists between ticks where the SSD didn't run
     close_streak = 0       # consecutive SSD passes with a frame-filling detection
     overhead_object = None # persists between ticks; last confirmed head-height mass geometry
@@ -854,25 +791,21 @@ def run():
     while True:
         if robot_state["state"] == "GESTURE_TRACKING":
             release_object_state()
-            if picam2 is not None:
-                close_camera(picam2)
-                picam2 = None
-                if camera_lease is not None:
-                    camera_lease.release()
-                    camera_lease = None
-                print("vision: released camera to gesture tracker")
+            camera.release()
+            camera_frames.clear()
             time.sleep(0.05)
             continue
         claim_object_state()
-        if picam2 is None:
-            try:
-                picam2, camera_lease = open_camera()
-                print("vision: reacquired camera after gesture mode")
-            except Exception as e:
-                print(f"vision: camera reacquire failed ({e})")
-                time.sleep(0.5)
-                continue
-        frame = picam2.capture_array()
+        camera.ensure()
+        item = camera_frames.take()
+        if item is None:
+            time.sleep(0.02)
+            continue
+        _, payload, _ = item
+        frame = decode_camera_frame(payload)
+        if frame is None:
+            time.sleep(0.02)
+            continue
         if robot_state["state"] == "SPEAKING":
             # TTS owns the CPU/audio path. Capture is drained to avoid a
             # hardware buffer backlog, but this frame is intentionally not
@@ -1048,20 +981,6 @@ def run():
             "objects_updated_at": last_forced_detect if last_forced_detect else None,
             "frame_ts": now,
         })
-
-        # ---------- on-demand console stream (only while a viewer watches) ----------
-        if stream["enabled"] and now - last_stream_pub >= STREAM_MIN_INTERVAL:
-            last_stream_pub = now
-            # picamera2 gives RGB888; cv2.imencode assumes BGR, so convert
-            # first or the preview shows swapped red/blue channels.
-            ok, buf = cv2.imencode(
-                ".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
-                [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY])
-            if ok:
-                bus.publish(STREAM_FRAME_TOPIC, {
-                    "jpeg": base64.b64encode(buf.tobytes()).decode("ascii"),
-                    "w": frame_w, "h": frame_h, "ts": now,
-                })
 
         # While self-training, slow the whole capture loop too (not just the
         # detection passes) so the trainer gets the CPU. Released on session end.

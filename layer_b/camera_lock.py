@@ -1,9 +1,9 @@
-"""Process-wide lock for the Pi camera pipeline.
+"""Process-wide guard for the Pi camera pipeline.
 
 libcamera reports a rather unhelpful "pipeline handler in use" error when two
-Picamera2 instances race to open the same sensor.  RobotState coordinates the
-*intended* owner, but its MQTT transition is asynchronous, so camera users
-also need a kernel-enforced handoff while a Picamera2 instance is alive.
+Picamera2 instances race to open the same sensor.  The camera controller is
+the normal sole owner; this kernel-enforced guard also protects against an
+old deployment or an unrelated process opening Picamera2 directly.
 """
 import fcntl
 import os

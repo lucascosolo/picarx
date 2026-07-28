@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Low-cost MediaPipe Hands head tracking.
 
-The production loop is deliberately split into a capture thread and a
-processing loop.  The capture thread keeps only the newest 320x240 frame, so
+The production loop is deliberately split into a camera subscription and a
+processing loop.  The camera controller keeps only the newest frame for this
+consumer, so
 slow inference cannot create an ever-growing queue.  The pure controller and
 throttle classes are usable off-robot and are kept independent of MediaPipe,
 OpenCV, Picamera2, and psutil so the safety behavior can be tested on a CI
@@ -17,14 +18,13 @@ publishes drive intents and it relinquishes the head when its lease expires,
 when another RobotState wins, or when the camera/model fails.
 """
 import os
-import queue
 import sys
 import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
-from camera_lock import CameraBusy, CameraLease
+from camera_client import CameraSubscription, decode_camera_frame
 
 try:
     import robot_config
@@ -35,6 +35,7 @@ except Exception:  # pragma: no cover - production import should work
 PAN_MIN, PAN_MAX = -35.0, 35.0
 TILT_MIN, TILT_MAX = -30.0, 30.0
 FRAME_SIZE = (320, 240)
+CAMERA_FPS = 10.0
 CENTER_DEADZONE_PX = 10.0
 DEFAULT_SKIP_FACTOR = 3       # process one out of every three captured frames
 CPU_HIGH_PERCENT = 90.0
@@ -296,8 +297,8 @@ class GestureTracker:
         self.frames = LatestFrame()
         self.controller = GestureHeadController()
         self.scheduler = AdaptiveFrameScheduler()
-        self._capture_thread = None
-        self._camera = None
+        self.camera = CameraSubscription(self.bus, OWNER, CAMERA_FPS,
+                                         on_frame=self.frames.put)
         self._hands = None
         self._hands_backend = None
         self._mediapipe = None
@@ -305,7 +306,6 @@ class GestureTracker:
         self._last_claim_at = 0.0
         self._last_pose = None
         self._last_hand_at = 0.0
-        self._last_camera_wait_at = 0.0
 
     def _claim(self, force=False):
         now = time.monotonic()
@@ -329,12 +329,12 @@ class GestureTracker:
                 self.scheduler = AdaptiveFrameScheduler()
                 self._last_pose = None
                 self._last_hand_at = 0.0
-                self._last_camera_wait_at = 0.0
             self._claim(force=True)
             self.bus.publish(STATUS_TOPIC, {"enabled": True, "state": "starting",
                                              "ts": time.time()})
         else:
             self._release()
+            self.camera.release()
             self.frames.clear()
             self.controller = GestureHeadController()
             self._last_pose = None
@@ -352,62 +352,6 @@ class GestureTracker:
         # different process.
         if self.enabled and self.state != STATE_NAME:
             self._claim()
-
-    def _capture_loop(self):
-        lease = None
-        camera = None
-        try:
-            # RobotState closes the normal race, while this non-blocking
-            # kernel lock protects the short MQTT handoff window too.
-            while self.running and self.enabled and self.state == STATE_NAME:
-                try:
-                    lease = CameraLease().acquire()
-                    break
-                except CameraBusy:
-                    # Keep the capture worker alive while vision finishes its
-                    # handoff instead of exiting and spawning a new worker on
-                    # every 10 ms tick. The one-second log/status throttle
-                    # also prevents camera_wait from flooding systemd/MQTT.
-                    now = time.monotonic()
-                    if now - self._last_camera_wait_at >= 1.0:
-                        self._last_camera_wait_at = now
-                        self.bus.publish(STATUS_TOPIC, {
-                            "enabled": self.enabled, "state": "camera_wait",
-                            "error": "camera owned by another process",
-                            "lock": CameraLease().path, "ts": time.time()})
-                    time.sleep(0.2)
-            if lease is None:
-                return
-            from picamera2 import Picamera2
-            camera = Picamera2()
-            config = camera.create_preview_configuration(
-                main={"format": "RGB888", "size": FRAME_SIZE})
-            camera.configure(config)
-            camera.start()
-            self._camera = camera
-            time.sleep(0.3)
-            while self.running and self.enabled and self.state == STATE_NAME:
-                self.frames.put(camera.capture_array())
-        except Exception as e:
-            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "camera_error",
-                                             "error": str(e)[:200], "ts": time.time()})
-        finally:
-            camera = self._camera
-            self._camera = None
-            if camera is not None:
-                for method in ("stop", "close"):
-                    try:
-                        getattr(camera, method)()
-                    except Exception:
-                        pass
-            if lease is not None:
-                lease.release()
-
-    def _ensure_capture(self):
-        if self._capture_thread is None or not self._capture_thread.is_alive():
-            self._capture_thread = threading.Thread(target=self._capture_loop,
-                                                    name="gesture-capture", daemon=True)
-            self._capture_thread.start()
 
     def _load_hands(self):
         if self._hands is not None:
@@ -514,7 +458,11 @@ class GestureTracker:
             return None
         if not should_process:
             return None
-        _, frame, captured_at = item
+        _, payload, captured_at = item
+        frame = decode_camera_frame(payload) if isinstance(payload, dict) else payload
+        if frame is None:
+            self._handle_hand_loss(now)
+            return None
         if now - captured_at > 1.0:
             self._handle_hand_loss(now)
             return None
@@ -592,16 +540,19 @@ class GestureTracker:
                     # reclaim the camera when that owner releases it.
                     self._claim()
                     if self.state == STATE_NAME:
-                        self._ensure_capture()
+                        self.camera.ensure()
                         self.process_once()
                     else:
+                        self.camera.release()
                         self.frames.clear()
                 else:
+                    self.camera.release()
                     self.frames.clear()
                 time.sleep(0.01)
             except Exception as e:
                 print(f"Gesture tracker: loop failed ({e})")
                 time.sleep(0.2)
+        self.camera.release()
 
 
 if __name__ == "__main__":
