@@ -87,6 +87,7 @@ import queue
 import time
 import json
 import uuid
+import math
 from collections import deque
 
 HISTORY_TURNS = 20          # user+assistant messages kept for context
@@ -135,6 +136,11 @@ CHAT_MIN_QUALITY = float(robot_config.get(
 DIDNT_CATCH_COOLDOWN = 15.0   # min seconds between soft "didn't catch" replies
 LEARNED_INTENTS_PATH = f"{DATA_DIR}/learned_intents.json"
 LEARNED_INTENTS_MAX = 300        # oldest-used entries beyond this get evicted
+LEARNED_INTENTS_TTL_SEC = max(0.0, float(robot_config.get(
+    "companion", "learned_intent_ttl_sec", 30 * 86400,
+    env="LEARNED_INTENT_TTL_SEC")))
+LEARNED_INTENTS_CONTROL_TOPIC = "picarx/intent/learned/control"
+LEARNED_INTENTS_STATUS_TOPIC = "picarx/intent/learned/status"
 INTENT_REPAIR_COOLDOWN = 10.0    # min seconds between arbiter API calls
 INTENT_TIMEOUT = 6.0
 INTENT_MAX_TOKENS = 80
@@ -612,27 +618,159 @@ class Companion:
         try:
             with open(LEARNED_INTENTS_PATH) as f:
                 cache = json.load(f)
+            if not isinstance(cache, dict):
+                raise ValueError("learned intent cache is not an object")
             print(f"Companion: {len(cache)} learned phrases loaded")
             return cache
         except FileNotFoundError:
             return {}
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             print(f"Companion: failed to load learned intents, starting fresh: {e}")
             return {}
 
+    def _prune_learned_intents(self, now=None):
+        """Remove expired, malformed, unsafe, and over-capacity aliases.
+
+        Learned aliases are useful only while their evidence is reasonably
+        fresh.  Keep legacy entries with ``last=0`` readable, but normalize
+        every newly touched entry to a real timestamp.  The allowlist is
+        checked again here so a future code/config change cannot revive a
+        previously unsafe cache entry.
+        """
+        now = time.time() if now is None else float(now)
+        removed = []
+        with self.lock:
+            for key, entry in list(self.learned_intents.items()):
+                reason = None
+                if not isinstance(key, str) or not key.strip():
+                    reason = "invalid_phrase"
+                elif not isinstance(entry, dict):
+                    reason = "invalid_entry"
+                else:
+                    command = str(entry.get("command") or "").strip().lower()
+                    try:
+                        last = float(entry.get("last", 0) or 0)
+                    except (TypeError, ValueError):
+                        last = 0
+                        reason = "invalid_timestamp"
+                    if not reason and (not math.isfinite(last) or last < 0):
+                        reason = "invalid_timestamp"
+                    if not reason and not self._intent_allowed(command):
+                        reason = "command_not_allowed"
+                    elif (not reason and last > 0 and
+                          now - last > LEARNED_INTENTS_TTL_SEC):
+                        reason = "expired"
+                    elif not reason:
+                        entry["command"] = command
+                        entry["last"] = last
+                if reason:
+                    self.learned_intents.pop(key, None)
+                    removed.append({"phrase": str(key), "reason": reason})
+
+            if len(self.learned_intents) > LEARNED_INTENTS_MAX:
+                keep = sorted(
+                    self.learned_intents.items(),
+                    key=lambda kv: float(kv[1].get("last", 0) or 0),
+                    reverse=True)[:LEARNED_INTENTS_MAX]
+                kept = {key for key, _ in keep}
+                for key in list(self.learned_intents):
+                    if key not in kept:
+                        self.learned_intents.pop(key, None)
+                        removed.append({"phrase": str(key), "reason": "capacity"})
+        return removed
+
     def _save_learned_intents(self):
         os.makedirs(DATA_DIR, exist_ok=True)
+        # Re-validate on every write because feedback, correction, and repair
+        # arrive through different asynchronous paths.
+        self._prune_learned_intents()
         with self.lock:
-            if len(self.learned_intents) > LEARNED_INTENTS_MAX:
-                keep = sorted(self.learned_intents.items(),
-                              key=lambda kv: kv[1].get("last", 0),
-                              reverse=True)[:LEARNED_INTENTS_MAX]
-                self.learned_intents = dict(keep)
             snapshot = json.dumps(self.learned_intents, indent=1)
         tmp_path = f"{LEARNED_INTENTS_PATH}.tmp"
         with open(tmp_path, "w") as f:
             f.write(snapshot)
         os.replace(tmp_path, LEARNED_INTENTS_PATH)
+
+    def _learned_intent_status(self, operation="list", request_id=None,
+                               removed=None, deleted=None, error=None):
+        """Publish an operator-readable snapshot without executing aliases."""
+        rows = []
+        now = time.time()
+        with self.lock:
+            for phrase, entry in self.learned_intents.items():
+                last = float(entry.get("last", 0) or 0)
+                rows.append({
+                    "phrase": phrase,
+                    "command": entry.get("command"),
+                    "count": int(entry.get("count", 0) or 0),
+                    "confirmed": bool(entry.get("confirmed")),
+                    "taught": bool(entry.get("taught")),
+                    "last": last,
+                    "expires_at": (last + LEARNED_INTENTS_TTL_SEC
+                                   if last > 0 else None),
+                })
+        rows.sort(key=lambda row: (row["last"], row["phrase"]), reverse=True)
+        payload = {
+            "operation": operation,
+            "entries": rows,
+            "count": len(rows),
+            "ttl_sec": LEARNED_INTENTS_TTL_SEC,
+            "now": now,
+            "ts": now,
+        }
+        if request_id is not None:
+            payload["request_id"] = request_id
+        if removed:
+            payload["removed"] = removed
+        if deleted is not None:
+            payload["deleted"] = deleted
+        if error:
+            payload["error"] = error
+        self.bus.publish(LEARNED_INTENTS_STATUS_TOPIC, payload)
+
+    def on_learned_intent_control(self, payload):
+        """Review or delete learned aliases through an explicit local-admin path.
+
+        Supported operations are ``list``, ``delete`` (by original phrase or
+        canonical key), and confirmation-protected ``clear``.  This is kept
+        separate from the voice command path so an utterance can never erase
+        the robot's learned behavior by accident.
+        """
+        operation = str(payload.get("operation") or "list").strip().lower()
+        request_id = payload.get("request_id")
+        removed = self._prune_learned_intents()
+        if removed:
+            self._save_learned_intents()
+        if operation == "list":
+            self._learned_intent_status(operation, request_id, removed=removed)
+            return
+        if operation == "delete":
+            phrase = payload.get("phrase") or payload.get("key")
+            key = speech_match.canonicalize(str(phrase)) if phrase else ""
+            with self.lock:
+                entry = self.learned_intents.pop(key, None) if key else None
+            if entry is not None:
+                self._save_learned_intents()
+            self._learned_intent_status(operation, request_id, removed=removed,
+                                        deleted=bool(entry),
+                                        error=None if phrase else "phrase is required")
+            return
+        if operation == "clear":
+            if payload.get("confirmed") is not True:
+                self._learned_intent_status(
+                    operation, request_id, removed=removed, deleted=False,
+                    error="confirmed=true is required")
+                return
+            with self.lock:
+                count = len(self.learned_intents)
+                self.learned_intents.clear()
+            self._save_learned_intents()
+            self._learned_intent_status(operation, request_id, removed=removed,
+                                        deleted=count > 0)
+            return
+        self._learned_intent_status(
+            operation, request_id, removed=removed,
+            error="operation must be list, delete, or clear")
 
     def _dispatch_repaired(self, command, original_text, learned):
         """Re-inject a repaired command as if it had been heard cleanly.
@@ -907,6 +1045,9 @@ class Companion:
         verdict = payload.get("verdict")
         if verdict not in ("correct", "incorrect"):
             return
+        pruned = self._prune_learned_intents()
+        if pruned:
+            self._save_learned_intents()
         utterance = (payload.get("utterance") or "").strip()
         correction = (payload.get("correction") or "").strip()
         origin = payload.get("origin", "web")
@@ -1001,6 +1142,9 @@ class Companion:
         text = (payload.get("text") or "").strip()
         if not text:
             return
+        pruned = self._prune_learned_intents()
+        if pruned:
+            self._save_learned_intents()
         key = speech_match.canonicalize(text)
         with self.lock:
             entry = self.learned_intents.get(key)
@@ -1646,6 +1790,8 @@ class Companion:
     def run(self):
         self.bus.subscribe("picarx/audio/unhandled", self.on_unhandled)
         self.bus.subscribe("picarx/audio/uncertain", self.on_uncertain)
+        self.bus.subscribe(LEARNED_INTENTS_CONTROL_TOPIC,
+                           self.on_learned_intent_control)
         self.bus.subscribe(DIALOG_ANSWER_TOPIC, self.on_dialog_answer)
         self.bus.subscribe(DIALOG_CLEARED_TOPIC, self.on_dialog_cleared)
         self.bus.subscribe(FEEDBACK_TOPIC, self.on_feedback)

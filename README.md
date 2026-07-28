@@ -238,6 +238,27 @@ with that condition; and `ab_report.py` compares adopt vs control offline,
 refusing to over-claim below a minimum number of sessions per condition. Set
 `experiment.enabled=false` once the round-trip has earned its keep.
 
+### Reviewing learned voice aliases
+
+The companion's intent repairer promotes successful, non-motion corrections to
+local aliases. They are rechecked against the safety allowlist, expire after
+30 days by default (`LEARNED_INTENT_TTL_SEC`), and can be reviewed or removed
+without sending another voice command through the explicit operator topic:
+
+```bash
+mosquitto_sub -v -t picarx/intent/learned/status
+mosquitto_pub -t picarx/intent/learned/control \
+  -m '{"operation":"list","request_id":"review-1"}'
+mosquitto_pub -t picarx/intent/learned/control \
+  -m '{"operation":"delete","phrase":"how is my charge"}'
+mosquitto_pub -t picarx/intent/learned/control \
+  -m '{"operation":"clear","confirmed":true}'
+```
+
+`clear` requires explicit confirmation. The status response includes the
+canonical phrase, learned command, evidence count, confirmation/taught flags,
+last use, and expiry time; it never executes an alias.
+
 ---
 
 ## Running it

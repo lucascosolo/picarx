@@ -3,6 +3,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -178,6 +179,54 @@ class CompanionTeacherTest(unittest.TestCase):
         reloaded = companion.Companion._load_learned_intents(self.c)
         self.assertEqual(reloaded[self._key("hows your charge")]["command"],
                          "battery")
+
+    def test_stale_and_unsafe_aliases_are_pruned(self):
+        now = time.time()
+        self.c.learned_intents = {
+            self._key("old charge phrase"): {
+                "command": "battery", "count": 1,
+                "last": now - companion.LEARNED_INTENTS_TTL_SEC - 1},
+            self._key("unsafe phrase"): {
+                "command": "explore", "count": 1, "last": now},
+            self._key("fresh charge phrase"): {
+                "command": "battery", "count": 2, "last": now},
+        }
+        removed = self.c._prune_learned_intents(now)
+        self.assertEqual(self.c.learned_intents.keys(),
+                         {self._key("fresh charge phrase")})
+        self.assertEqual({item["reason"] for item in removed},
+                         {"expired", "command_not_allowed"})
+
+    def test_learned_intent_control_lists_and_deletes_by_phrase(self):
+        key = self._key("hows your charge")
+        self.c.learned_intents[key] = {
+            "command": "battery", "count": 3, "last": time.time(),
+            "taught": True}
+        self.c.on_learned_intent_control({"operation": "list",
+                                          "request_id": "r1"})
+        status = self.c.bus.last(companion.LEARNED_INTENTS_STATUS_TOPIC)
+        self.assertEqual(status["request_id"], "r1")
+        self.assertEqual(status["entries"][0]["command"], "battery")
+        self.assertTrue(status["entries"][0]["expires_at"] > status["entries"][0]["last"])
+
+        self.c.on_learned_intent_control({"operation": "delete",
+                                          "phrase": "hows your charge",
+                                          "request_id": "r2"})
+        status = self.c.bus.last(companion.LEARNED_INTENTS_STATUS_TOPIC)
+        self.assertEqual(status["request_id"], "r2")
+        self.assertTrue(status["deleted"])
+        self.assertNotIn(key, self.c.learned_intents)
+
+    def test_clearing_learned_intents_requires_confirmation(self):
+        self.c.learned_intents[self._key("hows your charge")] = {
+            "command": "battery", "count": 1, "last": time.time()}
+        self.c.on_learned_intent_control({"operation": "clear"})
+        status = self.c.bus.last(companion.LEARNED_INTENTS_STATUS_TOPIC)
+        self.assertEqual(status["error"], "confirmed=true is required")
+        self.assertEqual(len(self.c.learned_intents), 1)
+        self.c.on_learned_intent_control({"operation": "clear",
+                                          "confirmed": True})
+        self.assertEqual(self.c.learned_intents, {})
 
 
 class ConsoleLogPairingTest(unittest.TestCase):

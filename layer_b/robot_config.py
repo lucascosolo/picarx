@@ -173,6 +173,9 @@ KNOBS = [
     {"section": "companion", "key": "chat_min_quality", "type": "float",
      "default": 0.45, "env": "CHAT_MIN_QUALITY",
      "desc": "Between noise_quality and this, say 'I didn't catch that' with no LLM call."},
+    {"section": "companion", "key": "learned_intent_ttl_sec", "type": "float",
+     "default": 30 * 86400, "env": "LEARNED_INTENT_TTL_SEC",
+     "desc": "Seconds before a learned voice alias expires."},
     # ---- coach (coach.py) ----
     {"section": "coach", "key": "model", "type": "str",
      "default": "claude-haiku-4-5-20251001", "env": "COACH_MODEL",
