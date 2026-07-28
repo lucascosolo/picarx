@@ -292,9 +292,13 @@ stack runs without it (it degrades to vision + ultrasonic). Vision uses
 `picamera2` + OpenCV; speech uses Vosk (STT) and eSpeak/MBROLA (TTS). Internet
 radio needs `mpv` (optional).
 
-Gesture tracking uses MediaPipe's Tasks API. On its first enable, the hand
-landmarker asset is downloaded to the ignored `layer_b/data/models/mediapipe/`
-directory; it can also be placed there manually on an offline robot.
+Gesture tracking uses MediaPipe. On x86 it uses the current Tasks API and
+downloads the hand-landmarker asset on first enable. On Raspberry Pi ARM,
+the environment repair script selects the Pi 4 MediaPipe build, which retains
+the native legacy Hands API and does not need a model download. Set
+`PICARX_MEDIAPIPE_PACKAGE=mediapipe` only when a separately built compatible
+ARM wheel is installed. The downloaded Tasks asset, when used, is stored in
+the ignored `layer_b/data/models/mediapipe/` directory.
 
 > The code resolves its own paths relative to the `layer_b/` directory it lives
 > in, so the tree can be checked out or deployed anywhere — no fixed install

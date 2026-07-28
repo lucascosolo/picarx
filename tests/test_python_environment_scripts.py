@@ -25,6 +25,12 @@ class PythonEnvironmentScriptTest(unittest.TestCase):
             "git+https://github.com/sunfounder/robot-hat.git@2.5.x", script)
         self.assertNotIn('"robot_hat|robot-hat"', script)
 
+    def test_arm_setup_selects_pi_mediapipe_runtime(self):
+        for name in ("repair_python_environment.sh", "setup_python.sh"):
+            script = self._read(name)
+            self.assertIn('PICARX_MEDIAPIPE_PACKAGE', script)
+            self.assertIn('mediapipe-rpi4', script)
+
 
 if __name__ == "__main__":
     unittest.main()

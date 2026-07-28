@@ -63,11 +63,22 @@ if ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
 fi
 
 # Keep this list aligned with setup_python.sh. Import and distribution names
-# differ for paho-mqtt and OpenCV.
+# differ for paho-mqtt and OpenCV. The official MediaPipe PyPI build does not
+# cover Raspberry Pi's ARM wheel/runtime combinations reliably, so use the
+# Pi 4 build there. Override this when deploying a separately built official
+# wheel (for example: PICARX_MEDIAPIPE_PACKAGE=mediapipe).
+case "$(uname -m)" in
+    aarch64|armv7l|armv8l)
+        MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe-rpi4}"
+        ;;
+    *)
+        MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe}"
+        ;;
+esac
 dependencies=(
     "anthropic|anthropic"
     "cv2|opencv-contrib-python-headless"
-    "mediapipe|mediapipe"
+    "mediapipe|$MEDIAPIPE_PACKAGE"
     "numpy|numpy"
     "onnxruntime|onnxruntime"
     "paho.mqtt|paho-mqtt"
@@ -125,6 +136,15 @@ for dependency in "${dependencies[@]}"; do
         # before installing the official package. Otherwise pip can leave
         # module files from both projects in the shared robot_hat namespace.
         "$VENV_PYTHON" -m pip uninstall -y robot-hat robot_hat >/dev/null 2>&1 || true
+        "$VENV_PYTHON" -m pip install --force-reinstall "$package_name"
+        continue
+    fi
+    if [[ "$import_name" == "mediapipe" && "$package_name" == "mediapipe-rpi4" ]]; then
+        # Both distributions install the mediapipe import package. Remove a
+        # newer generic install first, otherwise mixed Python/native files can
+        # make model construction abort before the module can report an error.
+        "$VENV_PYTHON" -m pip uninstall -y mediapipe mediapipe-rpi4 \
+            >/dev/null 2>&1 || true
         "$VENV_PYTHON" -m pip install --force-reinstall "$package_name"
         continue
     fi

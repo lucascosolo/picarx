@@ -17,11 +17,21 @@ if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
 fi
 
 # Entries are "import name|pip distribution".  Some distributions expose a
-# different import name (paho-mqtt -> paho, opencv -> cv2).
+# different import name (paho-mqtt -> paho, opencv -> cv2). Use the Pi 4
+# MediaPipe build on ARM; the generic PyPI build is not a dependable ARM
+# runtime. Set PICARX_MEDIAPIPE_PACKAGE to override this selection.
+case "$(uname -m)" in
+    aarch64|armv7l|armv8l)
+        MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe-rpi4}"
+        ;;
+    *)
+        MEDIAPIPE_PACKAGE="${PICARX_MEDIAPIPE_PACKAGE:-mediapipe}"
+        ;;
+esac
 dependencies=(
     "anthropic|anthropic"
     "cv2|opencv-contrib-python-headless"
-    "mediapipe|mediapipe"
+    "mediapipe|$MEDIAPIPE_PACKAGE"
     "numpy|numpy"
     "onnxruntime|onnxruntime"
     "paho.mqtt|paho-mqtt"
@@ -43,6 +53,9 @@ for dependency in "${dependencies[@]}"; do
     fi
     if [[ "$import_name" == "robot_hat" ]]; then
         cv2_ok=no
+    elif [[ "$import_name" == "mediapipe" && "$package_name" == "mediapipe-rpi4" ]]; then
+        # Ensure the ARM-specific package replaces a generic mediapipe import.
+        cv2_ok=no
     elif [[ "$import_name" != "cv2" ]] && ! "$PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('$import_name') else 1)"; then
         cv2_ok=no
     fi
@@ -52,6 +65,8 @@ for dependency in "${dependencies[@]}"; do
         echo "install: $package_name"
         if [[ "$import_name" == "robot_hat" ]]; then
             "$PYTHON" -m pip uninstall -y robot-hat robot_hat >/dev/null 2>&1 || true
+        elif [[ "$import_name" == "mediapipe" && "$package_name" == "mediapipe-rpi4" ]]; then
+            "$PYTHON" -m pip uninstall -y mediapipe mediapipe-rpi4 >/dev/null 2>&1 || true
         fi
         "$PYTHON" -m pip install --upgrade --break-system-packages "$package_name"
     fi
