@@ -24,7 +24,9 @@ import time
 import faulthandler
 import json
 import importlib.metadata
+import multiprocessing
 import platform
+import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
@@ -73,6 +75,143 @@ HAND_MODEL_PATH = os.path.join(HAND_MODEL_DIR, "hand_landmarker.task")
 HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/1/hand_landmarker.task")
+
+
+def _worker_send(conn, payload):
+    try:
+        conn.send(payload)
+        return True
+    except (BrokenPipeError, EOFError, OSError):
+        return False
+
+
+def _worker_diagnostics(mp, backend, model_path):
+    versions = {}
+    for distribution in ("mediapipe", "mediapipe-rpi4"):
+        try:
+            versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+        except Exception as exc:
+            versions[distribution] = f"metadata error: {exc}"
+    exists = os.path.isfile(model_path)
+    return {
+        "interpreter": sys.executable,
+        "python_version": platform.python_version(),
+        "mediapipe_version": getattr(mp, "__version__", None),
+        "mediapipe_file": getattr(mp, "__file__", None),
+        "package_versions": versions,
+        "backend": backend,
+        "model_path": model_path,
+        "model_exists": exists,
+        "model_size_bytes": os.path.getsize(model_path) if exists else None,
+    }
+
+
+def _serialize_landmarks(results):
+    """Make either MediaPipe API's output safe to send over a pipe."""
+    hands = getattr(results, "multi_hand_landmarks", None)
+    if hands is None:
+        hands = getattr(results, "hand_landmarks", None)
+    serialized = []
+    for hand in hands or []:
+        points = getattr(hand, "landmark", None)
+        if points is None and isinstance(hand, (list, tuple)):
+            points = hand
+        serialized.append([
+            {
+                "x": float(getattr(point, "x", 0.0)),
+                "y": float(getattr(point, "y", 0.0)),
+                "z": float(getattr(point, "z", 0.0)),
+            }
+            for point in (points or [])
+        ])
+    return {"hand_landmarks": serialized}
+
+
+def _hand_model_worker(conn, model_path):
+    """Load and run MediaPipe outside the orchestrator process.
+
+    A native illegal instruction or fatal runtime error must kill only this
+    child. The parent treats EOF/death as a normal model_error and releases
+    its camera and RobotState leases.
+    """
+    hands = None
+    try:
+        _worker_send(conn, {"kind": "phase", "phase": "import"})
+        import mediapipe as mp
+        _worker_send(conn, {
+            "kind": "phase", "phase": "imported",
+            "diagnostics": _worker_diagnostics(mp, None, model_path)})
+        legacy = getattr(getattr(mp, "solutions", None), "hands", None)
+        if legacy is not None:
+            backend = "solutions"
+            _worker_send(conn, {
+                "kind": "phase", "phase": "constructing",
+                "diagnostics": _worker_diagnostics(mp, backend, model_path)})
+            hands = legacy.Hands(
+                static_image_mode=False, max_num_hands=1,
+                model_complexity=0, min_detection_confidence=0.55,
+                min_tracking_confidence=0.55)
+        else:
+            backend = "tasks"
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+            _worker_send(conn, {
+                "kind": "phase", "phase": "asset_ready",
+                "diagnostics": _worker_diagnostics(mp, backend, model_path)})
+            _worker_send(conn, {
+                "kind": "phase", "phase": "constructing",
+                "diagnostics": _worker_diagnostics(mp, backend, model_path)})
+            options = vision.HandLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=model_path),
+                running_mode=vision.RunningMode.IMAGE,
+                num_hands=1,
+                min_hand_detection_confidence=0.55,
+                min_hand_presence_confidence=0.55,
+                min_tracking_confidence=0.55)
+            hands = vision.HandLandmarker.create_from_options(options)
+        if not _worker_send(conn, {
+                "kind": "ready", "backend": backend,
+                "diagnostics": _worker_diagnostics(mp, backend, model_path)}):
+            return
+        while True:
+            request = conn.recv()
+            if not isinstance(request, dict):
+                continue
+            if request.get("op") == "close":
+                return
+            if request.get("op") != "frame":
+                continue
+            frame = request.get("frame")
+            if backend == "tasks":
+                image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB, data=frame)
+                results = hands.detect(image)
+            else:
+                results = hands.process(frame)
+            if not _worker_send(conn, {
+                    "kind": "result",
+                    "request_id": request.get("request_id"),
+                    "captured_at": request.get("captured_at"),
+                    "frame_width": request.get("frame_width"),
+                    "frame_height": request.get("frame_height"),
+                    "landmarks": _serialize_landmarks(results)}):
+                return
+    except BaseException as exc:
+        _worker_send(conn, {
+            "kind": "error", "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc()[-2000:]})
+    finally:
+        if hands is not None:
+            try:
+                hands.close()
+            except Exception:
+                pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _clamp(value, low, high):
@@ -268,17 +407,31 @@ class AdaptiveFrameScheduler:
 
 def _first_hand_landmarks(results):
     """Return the first hand's landmarks across both MediaPipe APIs."""
-    hands = getattr(results, "multi_hand_landmarks", None)
+    if isinstance(results, dict):
+        hands = results.get("multi_hand_landmarks")
+        if hands is None:
+            hands = results.get("hand_landmarks")
+    else:
+        hands = getattr(results, "multi_hand_landmarks", None)
     if hands is None:
         hands = getattr(results, "hand_landmarks", None)
     hands = hands or []
     if not hands:
         return []
     hand = hands[0]
-    landmarks = getattr(hand, "landmark", None)
+    if isinstance(hand, dict):
+        landmarks = hand.get("landmark")
+    else:
+        landmarks = getattr(hand, "landmark", None)
     if landmarks is None and isinstance(hand, (list, tuple)):
         landmarks = hand
     return landmarks or []
+
+
+def _point_value(point, name, default=None):
+    if isinstance(point, dict):
+        return point.get(name, default)
+    return getattr(point, name, default)
 
 
 def hand_bbox(results, frame_width, frame_height, margin=0.03):
@@ -287,8 +440,10 @@ def hand_bbox(results, frame_width, frame_height, margin=0.03):
     if len(landmarks) < 18:
         return None
     try:
-        xs = [float(point.x) * float(frame_width) for point in landmarks]
-        ys = [float(point.y) * float(frame_height) for point in landmarks]
+        xs = [float(_point_value(point, "x")) * float(frame_width)
+              for point in landmarks]
+        ys = [float(_point_value(point, "y")) * float(frame_height)
+              for point in landmarks]
         x1, x2 = min(xs), max(xs)
         y1, y2 = min(ys), max(ys)
         mx, my = (x2 - x1) * float(margin), (y2 - y1) * float(margin)
@@ -316,11 +471,13 @@ def hand_target(results, frame_width, frame_height):
     if len(landmarks) < 18:
         return None
     point = landmarks[8]  # index fingertip
-    if getattr(point, "visibility", 1.0) is not None and \
-            getattr(point, "visibility", 1.0) < 0.1:
+    visibility = _point_value(point, "visibility", 1.0)
+    if visibility is not None and visibility < 0.1:
         point = landmarks[9]
-    x = _clamp(float(point.x) * frame_width, 0, frame_width)
-    y = _clamp(float(point.y) * frame_height, 0, frame_height)
+    x = _clamp(float(_point_value(point, "x")) * frame_width, 0,
+               frame_width)
+    y = _clamp(float(_point_value(point, "y")) * frame_height, 0,
+               frame_height)
     return round(x, 2), round(y, 2)
 
 
@@ -343,6 +500,9 @@ class GestureTracker:
         self._model_loading = False
         self._model_load_thread = None
         self._model_constructor_dumped = False
+        self._hand_worker_process = None
+        self._hand_worker_conn = None
+        self._hand_worker_inflight = None
         self._model_load_started_at = 0.0
         self._model_load_last_status_at = 0.0
         self._model_load_phase = "idle"
@@ -401,6 +561,41 @@ class GestureTracker:
             self._model_load_cancel.set()
             self._model_loading = False
             self._model_load_thread = None
+        self._stop_hand_worker()
+
+    @staticmethod
+    def _terminate_hand_worker(process, conn):
+        if conn is not None:
+            try:
+                if process is not None and process.is_alive():
+                    conn.send({"op": "close"})
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            try:
+                conn.close()
+            except (OSError, AttributeError):
+                pass
+        if process is not None:
+            try:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=1.0)
+            except (OSError, AttributeError):
+                pass
+
+    def _stop_hand_worker(self):
+        process = self._hand_worker_process
+        conn = self._hand_worker_conn
+        self._hand_worker_process = None
+        self._hand_worker_conn = None
+        self._hand_worker_inflight = None
+        self._terminate_hand_worker(process, conn)
+
+    @staticmethod
+    def _is_hand_worker_result(result):
+        return (isinstance(result, tuple) and len(result) == 4 and
+                hasattr(result[0], "is_alive") and
+                hasattr(result[1], "poll"))
 
     def _model_runtime_diagnostics(self, mediapipe_module=None,
                                    backend=None):
@@ -522,6 +717,7 @@ class GestureTracker:
 
     def _set_model_error(self, error, exception=None, diagnostics=None,
                          timed_out=False):
+        self._stop_hand_worker()
         self._close_hands(None)
         with self._model_load_lock:
             if diagnostics:
@@ -544,11 +740,77 @@ class GestureTracker:
             timeout=bool(timed_out),
             cleanup={"camera_released": True, "state_released": True})
 
+    def _load_hands_isolated(self, generation, progress):
+        """Start a child process and wait only for its ready message."""
+        progress("import")
+        if not os.path.isfile(HAND_MODEL_PATH):
+            self._ensure_hand_model(progress=progress)
+        else:
+            progress("asset_ready", **self._model_runtime_diagnostics(
+                backend="tasks"))
+
+        context = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = context.Pipe()
+        process = context.Process(
+            target=_hand_model_worker,
+            args=(child_conn, HAND_MODEL_PATH),
+            name="gesture-mediapipe-worker",
+            daemon=True)
+        try:
+            process.start()
+        except Exception:
+            child_conn.close()
+            parent_conn.close()
+            raise
+        child_conn.close()
+        self._hand_worker_process = process
+        self._hand_worker_conn = parent_conn
+        while True:
+            with self._model_load_lock:
+                current = (generation == self._model_load_generation and
+                           not self._model_load_cancel.is_set())
+            if not current:
+                self._stop_hand_worker()
+                return None
+            if parent_conn.poll(0.1):
+                try:
+                    message = parent_conn.recv()
+                except (EOFError, OSError) as exc:
+                    raise RuntimeError(
+                        "MediaPipe worker exited before model initialization "
+                        f"(exitcode={process.exitcode})") from exc
+                kind = message.get("kind")
+                if kind == "phase":
+                    diagnostics = message.get("diagnostics") or {}
+                    progress(message.get("phase", "unknown"), **diagnostics)
+                elif kind == "ready":
+                    diagnostics = message.get("diagnostics") or {}
+                    return (process, parent_conn,
+                            message.get("backend") or "tasks", diagnostics)
+                elif kind == "error":
+                    detail = message.get("error") or "worker initialization failed"
+                    trace = message.get("traceback")
+                    raise RuntimeError(
+                        f"{detail}; worker_traceback={trace}" if trace else detail)
+            elif not process.is_alive():
+                raise RuntimeError(
+                    "MediaPipe worker exited before model initialization "
+                    f"(exitcode={process.exitcode})")
+
     def _model_load_worker(self, generation):
         def progress(phase, **fields):
             return self._model_load_progress(generation, phase, **fields)
         try:
-            result = self._create_hands(progress=progress)
+            # Keep the in-process path as an explicit test/local-overlay seam.
+            # Production uses the child process so a native SIGILL cannot take
+            # down the orchestrator's camera and state-control loops.
+            overridden = (getattr(self._create_hands, "__func__", None)
+                          is not GestureTracker._create_hands)
+            result = (self._create_hands(progress=progress)
+                      if overridden else
+                      self._load_hands_isolated(generation, progress))
+            if result is None:
+                return
         except ModuleNotFoundError as exc:
             missing = exc.name or "an import"
             self._finish_model_worker(generation, error=(
@@ -570,12 +832,22 @@ class GestureTracker:
                        not self._model_load_cancel.is_set())
         if not current:
             if result:
-                self._close_hands(result[0])
+                if self._is_hand_worker_result(result):
+                    self._terminate_hand_worker(result[0], result[1])
+                else:
+                    self._close_hands(result[0])
             return
         if error:
             self._set_model_error(error, exception=exception)
             return
-        hands, mediapipe_module, backend, diagnostics = result
+        if self._is_hand_worker_result(result):
+            process, conn, backend, diagnostics = result
+            hands = True
+            mediapipe_module = None
+            # _load_hands_isolated has already installed these references;
+            # retaining them is what routes frames through the child.
+        else:
+            hands, mediapipe_module, backend, diagnostics = result
         with self._model_load_lock:
             self._hands = hands
             self._mediapipe = mediapipe_module
@@ -585,6 +857,85 @@ class GestureTracker:
             self._model_failed = False
             self._model_load_phase = "ready"
         self._publish_model_status("model_ready", backend=backend, force=True)
+
+    def _worker_infer(self, frame, captured_at, frame_width, frame_height):
+        """Submit at most one frame and collect a child-process result.
+
+        The camera/control loop never waits for native inference. A crashed
+        MediaPipe process is converted into model_error here, so it cannot
+        take down the orchestrator or retain either shared-resource lease.
+        """
+        process = self._hand_worker_process
+        conn = self._hand_worker_conn
+        if process is None or conn is None:
+            self._set_model_error("MediaPipe worker is unavailable")
+            return None
+        if not process.is_alive() and not conn.poll():
+            self._set_model_error(
+                "MediaPipe worker exited during inference",
+                diagnostics={"worker_exitcode": process.exitcode})
+            return None
+
+        def receive_result():
+            while conn.poll():
+                try:
+                    message = conn.recv()
+                except (EOFError, OSError) as exc:
+                    self._set_model_error(
+                        "MediaPipe worker pipe closed during inference",
+                        exception=exc)
+                    return None
+                kind = message.get("kind")
+                if kind == "result":
+                    request = self._hand_worker_inflight
+                    if (request is None or
+                            message.get("request_id") != request["request_id"]):
+                        continue
+                    self._hand_worker_inflight = None
+                    return message
+                if kind == "error":
+                    detail = message.get("error") or "worker inference failed"
+                    trace = message.get("traceback")
+                    if trace:
+                        detail = f"{detail}; worker_traceback={trace}"
+                    self._set_model_error(detail)
+                    return None
+            return False
+
+        received = receive_result()
+        if received is not False:
+            return received
+        if self._hand_worker_inflight is None:
+            request = {
+                "op": "frame",
+                "request_id": time.monotonic_ns(),
+                "frame": frame,
+                "captured_at": captured_at,
+                "frame_width": frame_width,
+                "frame_height": frame_height,
+            }
+            try:
+                conn.send(request)
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                self._set_model_error(
+                    "MediaPipe worker pipe failed during inference",
+                    exception=exc)
+                return None
+            self._hand_worker_inflight = request
+
+        # Most frames will complete on the next loop. A short poll also keeps
+        # latency low on faster systems without making native work a blocking
+        # dependency of the orchestrator.
+        deadline = time.monotonic() + 0.01
+        while time.monotonic() < deadline and conn.poll(0.001):
+            received = receive_result()
+            if received is not False:
+                return received
+        if not process.is_alive() and self._hand_worker_inflight is not None:
+            self._set_model_error(
+                "MediaPipe worker exited during inference",
+                diagnostics={"worker_exitcode": process.exitcode})
+        return None
 
     def _start_model_load(self, frame_age=None):
         with self._model_load_lock:
@@ -789,29 +1140,39 @@ class GestureTracker:
         if now - captured_at > 1.0:
             self._handle_hand_loss(now)
             return None
+        shape = getattr(frame, "shape", (FRAME_SIZE[1], FRAME_SIZE[0]))
+        height, width = int(shape[0]), int(shape[1])
         if self._hands is None:
             self._start_model_load(frame_age=max(0.0, now - captured_at))
             self._publish_model_status(
                 "model_loading", frame_age=max(0.0, now - captured_at))
             return None
-        hands = self._hands
-        if not hands:
+        if not self._hands:
             return None
-        try:
-            # Picamera2 is configured as RGB888 and MediaPipe expects RGB;
-            # avoid an unnecessary conversion (and its extra Pi CPU cost).
-            if self._hands_backend == "tasks":
-                image = self._mediapipe.Image(
-                    image_format=self._mediapipe.ImageFormat.SRGB, data=frame)
-                results = hands.detect(image)
-            else:
-                results = hands.process(frame)
-        except Exception as e:
-            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "process_error",
-                                             "error": str(e)[:200], "ts": time.time()})
-            return None
-        shape = getattr(frame, "shape", (FRAME_SIZE[1], FRAME_SIZE[0]))
-        height, width = int(shape[0]), int(shape[1])
+        if self._hand_worker_conn is not None:
+            results = self._worker_infer(frame, captured_at, width, height)
+            if results is None:
+                return None
+            width = int(results.get("frame_width") or width)
+            height = int(results.get("frame_height") or height)
+            results = results.get("landmarks") or {}
+        else:
+            hands = self._hands
+            try:
+                # Picamera2 is configured as RGB888 and MediaPipe expects RGB;
+                # avoid an unnecessary conversion (and its extra Pi CPU cost).
+                if self._hands_backend == "tasks":
+                    image = self._mediapipe.Image(
+                        image_format=self._mediapipe.ImageFormat.SRGB, data=frame)
+                    results = hands.detect(image)
+                else:
+                    results = hands.process(frame)
+            except Exception as e:
+                self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled,
+                                                 "state": "process_error",
+                                                 "error": str(e)[:200],
+                                                 "ts": time.time()})
+                return None
         target = hand_target(results, width, height)
         if target is None:
             self._handle_hand_loss(now)
@@ -891,13 +1252,16 @@ class GestureTracker:
 
 if __name__ == "__main__":
     if "--probe-model" in sys.argv:
-        # A camera-free service-environment probe. The shell should wrap this
-        # command in timeout because a broken ARM native binding can hang
-        # inside the constructor and cannot be interrupted from Python.
+        # A camera-free service-environment probe. Run the native constructor
+        # in the same isolated worker used by production so a SIGILL is
+        # reported as JSON instead of killing the diagnostic process.
         tracker = GestureTracker()
         result = None
+        probe_diagnostics = {}
 
         def probe_progress(phase, **fields):
+            probe_diagnostics.update(fields)
+            probe_diagnostics["phase"] = phase
             print(json.dumps({"phase": phase, **fields}, sort_keys=True),
                   flush=True)
             return True
@@ -907,22 +1271,26 @@ if __name__ == "__main__":
             **tracker._model_runtime_diagnostics(),
         }, sort_keys=True), flush=True)
         try:
-            result = tracker._create_hands(progress=probe_progress)
-            tracker._hands = result[0]
-            tracker._hands_backend = result[2]
-            tracker._model_diagnostics = result[3]
+            tracker._model_load_generation = 1
+            tracker._model_load_started_at = time.monotonic()
+            result = tracker._load_hands_isolated(1, probe_progress)
+            backend = result[2]
+            diagnostics = result[3]
             print(json.dumps({
                 "ok": True,
-                "backend": tracker._hands_backend,
-                "diagnostics": tracker._model_diagnostics,
+                "backend": backend,
+                "diagnostics": diagnostics,
             }, sort_keys=True), flush=True)
         except BaseException as exc:
             print(json.dumps({
                 "ok": False,
                 "error": f"{type(exc).__name__}: {exc}",
-                "diagnostics": tracker._model_diagnostics,
+                "diagnostics": {
+                    **tracker._model_runtime_diagnostics(),
+                    **probe_diagnostics,
+                },
             }, sort_keys=True), flush=True)
         finally:
-            tracker._close_hands(result[0] if result else None)
+            tracker._stop_hand_worker()
     else:
         GestureTracker().run()

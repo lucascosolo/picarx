@@ -87,7 +87,13 @@ ownership and hand-detection problems.
    ```
 
    A JSON ok=true result proves the native constructor returns; a timeout
-   proves the installed ARM binding is hanging before inference. The current
+   proves the installed ARM binding is hanging before inference. In normal
+   service operation, model construction and inference now run in an isolated
+   worker process. A native crash is therefore reported as `model_error` with
+   worker exit diagnostics, and the orchestrator releases its camera/state
+   leases instead of dying. The feature still requires a MediaPipe build that
+   supports the Pi CPU; isolation prevents collateral failure but cannot make
+   an AES-incompatible binary perform inference. The current
    production mediapipe version 1.0.0 is not an official PyPI release
    matching the current upstream release line. Upstream documents that its
    Python package does not provide Linux aarch64 wheels, so the robot must

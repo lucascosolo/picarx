@@ -86,6 +86,15 @@ class GestureTrackingTests(unittest.TestCase):
         self.assertGreater(w, 192.0)
         self.assertGreater(h, 120.0)
 
+    def test_hand_helpers_accept_worker_landmark_payload(self):
+        points = [{"x": 0.5, "y": 0.5} for _ in range(21)]
+        points[0] = {"x": 0.2, "y": 0.25}
+        points[8] = {"x": 0.75, "y": 0.25}
+        points[20] = {"x": 0.8, "y": 0.75}
+        result = {"hand_landmarks": [points]}
+        self.assertEqual(hand_target(result, 320, 240), (240.0, 60.0))
+        self.assertIsNotNone(hand_bbox(result, 320, 240))
+
     def test_hand_loss_recenters_after_short_hold(self):
         tracker = GestureTracker()
         tracker.enabled = True
@@ -237,6 +246,33 @@ class GestureTrackingTests(unittest.TestCase):
             self.assertTrue(fake_hands.closed)
         finally:
             gt.MODEL_LOAD_TIMEOUT_SEC = original_timeout
+
+    def test_native_worker_crash_becomes_model_error_and_releases_resources(self):
+        tracker = GestureTracker()
+        tracker.enabled = True
+
+        class DeadProcess:
+            exitcode = -4
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        class EmptyConnection:
+            @staticmethod
+            def poll(*args):
+                return False
+
+        tracker._hands = True
+        tracker._hand_worker_process = DeadProcess()
+        tracker._hand_worker_conn = EmptyConnection()
+        self.assertIsNone(tracker._worker_infer(
+            types.SimpleNamespace(shape=(240, 320, 3)), 1.0, 320, 240))
+        status = tracker.bus.last("picarx/gesture/status")
+        self.assertEqual(status["state"], "model_error")
+        self.assertIn("exited during inference", status["error"])
+        self.assertEqual(status["cleanup"], {
+            "camera_released": True, "state_released": True})
 
 
 if __name__ == "__main__":
