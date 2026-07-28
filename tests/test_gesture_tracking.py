@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import types
 import unittest
 
@@ -101,6 +102,18 @@ class GestureTrackingTests(unittest.TestCase):
         claim = tracker.bus.last("picarx/state/claim")
         self.assertEqual(claim["owner"], "gesture_tracking")
         self.assertEqual(claim["state"], "GESTURE_TRACKING")
+
+    def test_lease_heartbeat_survives_slow_model_startup(self):
+        tracker = GestureTracker()
+        tracker.enabled = True
+        tracker._start_claim_loop()
+        try:
+            time.sleep(0.65)
+        finally:
+            tracker._stop_claim_loop()
+        claims = tracker.bus.of("picarx/state/claim")
+        self.assertGreaterEqual(len(claims), 2)
+        self.assertTrue(all(claim["ttl"] == 3.0 for claim in claims))
 
     def test_model_import_failure_reports_missing_dependency(self):
         tracker = GestureTracker()

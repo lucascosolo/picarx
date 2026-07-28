@@ -44,6 +44,7 @@ THERMAL_LIMIT_C = 80.0
 THERMAL_RECOVER_C = 72.0
 HAND_LOSS_HOLD_SEC = 1.0
 CLAIM_RENEW_INTERVAL_SEC = 0.5
+CLAIM_TTL_SEC = 3.0
 STATE_TOPIC = "picarx/state/current"
 CONTROL_TOPIC = "picarx/gesture/control"
 STATUS_TOPIC = "picarx/gesture/status"
@@ -330,17 +331,44 @@ class GestureTracker:
         self._mediapipe = None
         self._model_error = None
         self._last_claim_at = 0.0
+        self._claim_lock = threading.Lock()
+        self._claim_stop = threading.Event()
+        self._claim_thread = None
         self._last_pose = None
         self._last_hand_at = 0.0
 
     def _claim(self, force=False):
-        now = time.monotonic()
-        if not force and now - self._last_claim_at < CLAIM_RENEW_INTERVAL_SEC:
+        with self._claim_lock:
+            if not self.enabled:
+                return
+            now = time.monotonic()
+            if not force and now - self._last_claim_at < CLAIM_RENEW_INTERVAL_SEC:
+                return
+            self._last_claim_at = now
+            self.bus.publish(STATE_CLAIM_TOPIC, {
+                "owner": OWNER, "state": STATE_NAME, "ttl": CLAIM_TTL_SEC,
+                "reason": "gesture tracking enabled", "ts": time.time()})
+
+    def _claim_loop(self):
+        """Renew the lease independently of camera/model processing."""
+        while not self._claim_stop.wait(0.1):
+            if self.enabled:
+                self._claim()
+
+    def _start_claim_loop(self):
+        if self._claim_thread is not None and self._claim_thread.is_alive():
             return
-        self._last_claim_at = now
-        self.bus.publish(STATE_CLAIM_TOPIC, {
-            "owner": OWNER, "state": STATE_NAME, "ttl": 1.5,
-            "reason": "gesture tracking enabled", "ts": time.time()})
+        self._claim_stop.clear()
+        self._claim_thread = threading.Thread(
+            target=self._claim_loop, name="gesture-state-lease", daemon=True)
+        self._claim_thread.start()
+
+    def _stop_claim_loop(self):
+        self._claim_stop.set()
+        thread = self._claim_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._claim_thread = None
 
     def _release(self):
         self.bus.publish(STATE_RELEASE_TOPIC, {"owner": OWNER, "ts": time.time()})
@@ -373,7 +401,7 @@ class GestureTracker:
         # Speech/RC/safety can temporarily outrank gesture tracking.  Keep
         # our lease alive while preempted so RobotState hands the resource
         # back as soon as the higher-priority owner releases it.  Without
-        # this, the initial TTS confirmation can let the 1.5s gesture lease
+        # this, the initial TTS confirmation can let the short gesture lease
         # expire, leaving the module stuck in IDLE with the camera held by a
         # different process.
         if self.enabled and self.state != STATE_NAME:
@@ -492,6 +520,9 @@ class GestureTracker:
         if now - captured_at > 1.0:
             self._handle_hand_loss(now)
             return None
+        if self._hands is None:
+            self.bus.publish(STATUS_TOPIC, {
+                "enabled": True, "state": "model_loading", "ts": time.time()})
         hands = self._load_hands()
         if not hands:
             return None
@@ -556,33 +587,33 @@ class GestureTracker:
     def run(self):
         self.bus.subscribe(CONTROL_TOPIC, self.on_control)
         self.bus.subscribe(STATE_TOPIC, self.on_state)
+        self._start_claim_loop()
         print("Gesture tracker active (disabled until explicitly enabled)")
-        while self.running:
-            try:
-                # Do not open Picamera2 merely because the UI toggle arrived;
-                # wait for RobotState to acknowledge that this process owns
-                # the camera/head. This closes the startup race with
-                # vision_basic on brokers without retained state messages.
-                if self.enabled:
-                    # Renew independently of the currently winning state. A
-                    # higher-priority owner may temporarily preempt gesture;
-                    # keeping this lower-priority lease alive lets gesture
-                    # reclaim the camera when that owner releases it.
-                    self._claim()
-                    if self.state == STATE_NAME:
-                        self.camera.ensure()
-                        self.process_once()
+        try:
+            while self.running:
+                try:
+                    # Do not open Picamera2 merely because the UI toggle
+                    # arrived; wait for RobotState to acknowledge that this
+                    # process owns the camera/head. This closes the startup
+                    # race with vision_basic on brokers without retained
+                    # state messages.
+                    if self.enabled:
+                        if self.state == STATE_NAME:
+                            self.camera.ensure()
+                            self.process_once()
+                        else:
+                            self.camera.release()
+                            self.frames.clear()
                     else:
                         self.camera.release()
                         self.frames.clear()
-                else:
-                    self.camera.release()
-                    self.frames.clear()
-                time.sleep(0.01)
-            except Exception as e:
-                print(f"Gesture tracker: loop failed ({e})")
-                time.sleep(0.2)
-        self.camera.release()
+                    time.sleep(0.01)
+                except Exception as e:
+                    print(f"Gesture tracker: loop failed ({e})")
+                    time.sleep(0.2)
+        finally:
+            self._stop_claim_loop()
+            self.camera.release()
 
 
 if __name__ == "__main__":
