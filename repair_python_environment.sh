@@ -71,7 +71,11 @@ dependencies=(
     "numpy|numpy"
     "onnxruntime|onnxruntime"
     "paho.mqtt|paho-mqtt"
-    "robot_hat|robot-hat"
+    # Do not use the unqualified PyPI name here: it is a different, newer
+    # project that also claims the robot_hat import and lacks SunFounder's
+    # ADC/Pin/PWM API expected by picarx. PiCar-X's supported library is the
+    # SunFounder 2.5.x branch.
+    "robot_hat|git+https://github.com/sunfounder/robot-hat.git@2.5.x"
     "tokenizers|tokenizers"
     "vosk|vosk"
     "webrtcvad|webrtcvad"
@@ -114,7 +118,16 @@ venv_site="$("$VENV_PYTHON" -c 'import site; print(site.getsitepackages()[0])')"
 echo "Base interpreter: $BASE_PYTHON"
 echo "Installing allow-listed dependencies in: $VENV"
 for dependency in "${dependencies[@]}"; do
+    import_name="${dependency%%|*}"
     package_name="${dependency##*|}"
+    if [[ "$import_name" == "robot_hat" ]]; then
+        # Remove a previously installed, same-named incompatible distribution
+        # before installing the official package. Otherwise pip can leave
+        # module files from both projects in the shared robot_hat namespace.
+        "$VENV_PYTHON" -m pip uninstall -y robot-hat robot_hat >/dev/null 2>&1 || true
+        "$VENV_PYTHON" -m pip install --force-reinstall "$package_name"
+        continue
+    fi
     "$VENV_PYTHON" -m pip install --upgrade "$package_name"
 done
 
@@ -161,6 +174,14 @@ for user in "${users[@]}"; do
             PYTHONNOUSERSITE=1 \
             "$BASE_PYTHON" -c "import $import_name" >/dev/null
     done
+    as_user "$user" env \
+        VIRTUAL_ENV="$VENV" \
+        PATH="$VENV/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        PYTHONPATH="$venv_site" \
+        PYTHONNOUSERSITE=1 \
+        "$BASE_PYTHON" -c \
+        'from robot_hat import ADC, Pin, PWM, Servo, fileDB, Grayscale_Module, Ultrasonic' \
+        >/dev/null
     echo "validated: $user"
 done
 

@@ -25,7 +25,7 @@ dependencies=(
     "numpy|numpy"
     "onnxruntime|onnxruntime"
     "paho.mqtt|paho-mqtt"
-    "robot_hat|robot-hat"
+    "robot_hat|git+https://github.com/sunfounder/robot-hat.git@2.5.x"
     "tokenizers|tokenizers"
     "vosk|vosk"
     "webrtcvad|webrtcvad"
@@ -41,16 +41,23 @@ for dependency in "${dependencies[@]}"; do
     else
         cv2_ok=yes
     fi
-    if [[ "$import_name" != "cv2" ]] && ! "$PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('$import_name') else 1)"; then
+    if [[ "$import_name" == "robot_hat" ]]; then
+        cv2_ok=no
+    elif [[ "$import_name" != "cv2" ]] && ! "$PYTHON" -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('$import_name') else 1)"; then
         cv2_ok=no
     fi
     if [[ "$cv2_ok" == yes ]]; then
         echo "skip: $package_name (import $import_name already works)"
     else
         echo "install: $package_name"
+        if [[ "$import_name" == "robot_hat" ]]; then
+            "$PYTHON" -m pip uninstall -y robot-hat robot_hat >/dev/null 2>&1 || true
+        fi
         "$PYTHON" -m pip install --upgrade --break-system-packages "$package_name"
     fi
 done
+
+"$PYTHON" -c 'from robot_hat import ADC, Pin, PWM, Servo, fileDB, Grayscale_Module, Ultrasonic'
 
 # Picamera2 is distributed by Raspberry Pi OS rather than PyPI.  Install it
 # through apt when available, while still making the script useful on a host
