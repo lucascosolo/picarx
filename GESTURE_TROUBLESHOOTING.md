@@ -24,17 +24,20 @@ camera ownership and hand-detection problems.
    interpreter, then restart the module. If the import names another missing
    package, install or repair that dependency instead.
 
-3. If the import succeeds, check whether the camera is available:
+3. If the import succeeds, check the camera controller and then enable gesture
+   tracking:
 
    ```bash
+   mosquitto_sub -t picarx/camera/status -v
    mosquitto_sub -t picarx/gesture/status -v
    # then enable gesture tracking from the Tools page
    ```
 
-   `camera_wait` means another process owns the camera; `camera_error` is a
-   Picamera2/configuration failure; `process_error` means MediaPipe rejected a
-   captured frame. Only after the status reaches `tracking` should lighting,
-   framing, and hand-loss behavior be investigated.
+   The controller should report the active subscriber and requested FPS. It is
+   the only process allowed to open Picamera2; `camera_error` is a
+   Picamera2/configuration failure, while `process_error` means MediaPipe
+   rejected a decoded frame. Only after the gesture status reaches `tracking`
+   should lighting, framing, and hand-loss behavior be investigated.
 
 The tracker now includes the missing package and the exact `sys.executable` in
 the `model_error` payload. This avoids the common situation where MediaPipe is
