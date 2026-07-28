@@ -418,6 +418,38 @@ TOOLS = [
          "required": ["operation"]}},
 ]
 
+# Advertise only the small slice of tools relevant to the current utterance.
+# The intent arbiter and explicit feedback loop already provide the robot's
+# command-phrase learning; this index only prevents unrelated tool schemas
+# from consuming context on ordinary conversation.
+_TOOL_INDEX = {tool["name"]: tool for tool in TOOLS}
+
+
+def tools_for_utterance(text):
+    """Select relevant Claude tools using a cheap, fail-closed lexical gate."""
+    raw = (text or "").lower()
+    canon = speech_match.canonicalize(raw)
+    haystack = f"{raw} {canon}"
+    names = set()
+    if any(word in haystack for word in ("remind", "reminder")):
+        names.update(("schedule_reminder", "manage_reminders"))
+    if any(word in haystack for word in ("note", "meeting", "transcript")):
+        names.update(("create_note", "manage_notes", "control_meeting_notes"))
+    if any(word in haystack for word in ("follow", "following")):
+        names.update(("start_following", "stop_following"))
+    if any(word in haystack for word in ("bluetooth", "tether", "connection", "phone")):
+        names.add("share_connection")
+    if any(word in haystack for word in ("remember", "memory", "know", "learned")):
+        names.update(("recall_memory", "list_known_people"))
+    if any(word in haystack for word in ("battery", "charge", "power", "temperature", "disk")):
+        names.update(("check_vital_stats", "register_low_power_intent"))
+    if any(word in haystack for word in ("ssh", "remote", "host", "project", "patch")):
+        names.update(("connect_remote_host", "remote_project_operation"))
+    if (any(word in haystack for word in ("object", "thing", "saw", "seen"))
+            or "where is" in haystack or "where did" in haystack):
+        names.add("where_is_object")
+    return [_TOOL_INDEX[name] for name in _TOOL_INDEX if name in names]
+
 PEOPLE_DIR = f"{DATA_DIR}/people"
 
 
@@ -1226,23 +1258,26 @@ class Companion:
 
     # ---------- LLM tool loop ----------
 
-    def _chat_with_tools(self, client, messages):
+    def _chat_with_tools(self, client, messages, tools=None):
         """One utterance, with the model allowed to call tools. Runs a
         bounded tool<->model loop: each round, execute any tool_use blocks
         (which just publish mode toggles to the daemons) and feed the
         results back so the model can produce a natural spoken reply.
         Returns the final spoken text ("" if none)."""
         convo = list(messages)
+        active_tools = TOOLS if tools is None else list(tools)
         final_text = ""
         for _ in range(MAX_TOOL_ROUNDS):
-            response = client.messages.create(
-                model=COMPANION_MODEL,
-                max_tokens=REPLY_MAX_TOKENS,
-                system=self._compose_system_prompt(),
-                tools=TOOLS,
-                messages=convo,
-                timeout=REPLY_TIMEOUT,
-            )
+            request = {
+                "model": COMPANION_MODEL,
+                "max_tokens": REPLY_MAX_TOKENS,
+                "system": self._compose_system_prompt(),
+                "messages": convo,
+                "timeout": REPLY_TIMEOUT,
+            }
+            if active_tools:
+                request["tools"] = active_tools
+            response = client.messages.create(**request)
             text = "".join(b.text for b in response.content
                            if getattr(b, "type", None) == "text").strip()
             if text:
@@ -1449,7 +1484,8 @@ class Companion:
         messages = messages + [{"role": "user", "content": content}]
 
         try:
-            reply = self._chat_with_tools(client, messages)
+            reply = self._chat_with_tools(client, messages,
+                                          tools=tools_for_utterance(text))
         except Exception as e:
             print(f"Companion: chat failed: {e}")
             reply = "Sorry, I got a little confused there."

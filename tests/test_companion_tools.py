@@ -144,6 +144,14 @@ class CompanionToolTest(unittest.TestCase):
     def test_unknown_tool(self):
         self.assertIn("Unknown", self.c._execute_tool("frobnicate", {}))
 
+    def test_tool_catalog_is_narrow_for_ordinary_chat(self):
+        self.assertEqual(companion.tools_for_utterance("tell me a joke"), [])
+
+    def test_tool_catalog_keeps_only_relevant_capabilities(self):
+        names = [t["name"] for t in companion.tools_for_utterance(
+            "please remind me to call mom in ten minutes")]
+        self.assertEqual(names, ["schedule_reminder", "manage_reminders"])
+
     # ---- full tool loop ----
 
     def test_tool_loop_executes_then_speaks(self):
