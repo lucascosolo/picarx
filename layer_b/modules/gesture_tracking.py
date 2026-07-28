@@ -480,7 +480,8 @@ class GestureTracker:
         progress("imported", **self._model_runtime_diagnostics(mp))
         legacy = getattr(getattr(mp, "solutions", None), "hands", None)
         if legacy is not None:
-            progress("constructing", backend="solutions")
+            progress("constructing", **self._model_runtime_diagnostics(
+                mp, "solutions"))
             hands = legacy.Hands(
                 static_image_mode=False, max_num_hands=1,
                 model_complexity=0, min_detection_confidence=0.55,
@@ -495,8 +496,7 @@ class GestureTracker:
             raise RuntimeError(self._model_error or "hand model asset unavailable")
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
-        progress("constructing", backend="tasks",
-                 **self._model_runtime_diagnostics(mp, "tasks"))
+        progress("constructing", **self._model_runtime_diagnostics(mp, "tasks"))
         options = vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH),
             running_mode=vision.RunningMode.IMAGE,

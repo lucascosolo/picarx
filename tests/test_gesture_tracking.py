@@ -159,6 +159,53 @@ class GestureTrackingTests(unittest.TestCase):
         self.assertEqual(status["interpreter"], sys.executable)
         self.assertEqual(status["frame_age_sec"], 0.42)
 
+    def test_tasks_model_progress_merges_backend_diagnostics_once(self):
+        # Regression for the production failure where the explicit backend
+        # keyword collided with the same key returned by diagnostics.
+        tracker = GestureTracker()
+        tracker._ensure_hand_model = lambda progress=None: True
+        mp = types.ModuleType("mediapipe")
+        mp.__version__ = "test"
+        tasks = types.ModuleType("mediapipe.tasks")
+        tasks_python = types.ModuleType("mediapipe.tasks.python")
+        vision = types.ModuleType("mediapipe.tasks.python.vision")
+
+        class _Options:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class _Landmarker:
+            @classmethod
+            def create_from_options(cls, options):
+                return types.SimpleNamespace()
+
+        tasks_python.BaseOptions = lambda model_asset_path: model_asset_path
+        vision.HandLandmarkerOptions = _Options
+        vision.RunningMode = types.SimpleNamespace(IMAGE="image")
+        vision.HandLandmarker = _Landmarker
+        tasks.python = tasks_python
+        tasks_python.vision = vision
+        mp.tasks = tasks
+        names = ("mediapipe", "mediapipe.tasks", "mediapipe.tasks.python",
+                 "mediapipe.tasks.python.vision")
+        saved = {name: sys.modules.get(name) for name in names}
+        sys.modules.update({"mediapipe": mp, "mediapipe.tasks": tasks,
+                            "mediapipe.tasks.python": tasks_python,
+                            "mediapipe.tasks.python.vision": vision})
+        phases = []
+        try:
+            result = tracker._create_hands(
+                progress=lambda phase, **fields: phases.append((phase, fields)) or True)
+        finally:
+            for name, module in saved.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+        self.assertEqual(result[2], "tasks")
+        constructing = dict(phases)["constructing"]
+        self.assertEqual(constructing["backend"], "tasks")
+
     def test_model_load_timeout_reports_cleanup_and_ignores_late_result(self):
         original_timeout = gt.MODEL_LOAD_TIMEOUT_SEC
         gate = threading.Event()
