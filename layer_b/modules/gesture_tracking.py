@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import faulthandler
+import json
 import importlib.metadata
 import platform
 
@@ -889,4 +890,18 @@ class GestureTracker:
 
 
 if __name__ == "__main__":
-    GestureTracker().run()
+    if "--probe-model" in sys.argv:
+        # A camera-free service-environment probe. The shell should wrap this
+        # command in timeout because a broken ARM native binding can hang
+        # inside the constructor and cannot be interrupted from Python.
+        tracker = GestureTracker()
+        result = tracker._load_hands()
+        print(json.dumps({
+            "ok": bool(result),
+            "backend": tracker._hands_backend,
+            "error": tracker._model_error,
+            "diagnostics": tracker._model_diagnostics,
+        }, sort_keys=True))
+        tracker._close_hands(result)
+    else:
+        GestureTracker().run()

@@ -73,3 +73,24 @@ ownership and hand-detection problems.
    The tracker includes the exact `sys.executable` and native package path in
    the status payload, avoiding the common situation where MediaPipe is
    installed into one Python environment while the orchestrator runs another.
+
+5. Isolate native model construction from MQTT and camera ownership. Run this
+   with the same interpreter and environment shown in the status record:
+
+   ```bash
+   timeout --signal=KILL 60s \
+     sudo -u picarx env VIRTUAL_ENV=/opt/picarx/venv \
+     PATH=/opt/picarx/venv/bin:$PATH \
+     PYTHONPATH=/opt/picarx/venv/lib/python3.13/site-packages \
+     PYTHONNOUSERSITE=1 \
+     /usr/bin/python3 layer_b/modules/gesture_tracking.py --probe-model
+   ```
+
+   A JSON ok=true result proves the native constructor returns; a timeout
+   proves the installed ARM binding is hanging before inference. The current
+   production mediapipe version 1.0.0 is not an official PyPI release
+   matching the current upstream release line. Upstream documents that its
+   Python package does not provide Linux aarch64 wheels, so the robot must
+   use a tested ARM build or a locally built wheel rather than an arbitrary
+   generic package. Do not mix it with mediapipe-rpi4; both distributions
+   install the same mediapipe namespace.
