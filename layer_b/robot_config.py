@@ -195,6 +195,10 @@ KNOBS = [
     {"section": "repository_updater", "key": "health_timeout_sec", "type": "float",
      "default": 30.0, "env": "PICARX_UPDATE_HEALTH_TIMEOUT",
      "desc": "Maximum seconds for the updater's pre/post health checks."},
+    # ---- gesture tracking (gesture_tracking.py) ----
+    {"section": "gesture_tracking", "key": "model_load_timeout_sec", "type": "float",
+     "default": 45.0, "env": "GESTURE_MODEL_LOAD_TIMEOUT",
+     "desc": "Maximum seconds for MediaPipe import, asset download, and model construction."},
     # ---- coach (coach.py) ----
     {"section": "coach", "key": "model", "type": "str",
      "default": "claude-haiku-4-5-20251001", "env": "COACH_MODEL",

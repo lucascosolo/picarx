@@ -1,11 +1,13 @@
 import os
 import sys
 import time
+import threading
 import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
+import gesture_tracking as gt  # noqa: E402
 
 from gesture_tracking import (AdaptiveFrameScheduler, CpuThermalMonitor,
                               GestureHeadController, GestureTracker, HeadLimits,
@@ -134,6 +136,60 @@ class GestureTrackingTests(unittest.TestCase):
         self.assertEqual(status["state"], "model_error")
         self.assertIn("mediapipe", status["error"])
         self.assertIn(sys.executable, status["error"])
+
+    def test_async_model_loader_reports_backend_and_runtime_diagnostics(self):
+        tracker = GestureTracker()
+        tracker.enabled = True
+        fake_mp = types.SimpleNamespace(
+            __file__="/opt/picarx/venv/lib/python3.13/site-packages/mediapipe/__init__.py",
+            __version__="0.10.test")
+        fake_hands = types.SimpleNamespace()
+        diagnostics = tracker._model_runtime_diagnostics(fake_mp, "tasks")
+        tracker._create_hands = lambda progress=None: (
+            fake_hands, fake_mp, "tasks", diagnostics)
+        tracker._start_model_load(frame_age=0.42)
+        thread = tracker._model_load_thread
+        thread.join(1.0)
+        self.assertIs(tracker._hands, fake_hands)
+        self.assertEqual(tracker._hands_backend, "tasks")
+        status = tracker.bus.last("picarx/gesture/status")
+        self.assertEqual(status["state"], "model_ready")
+        self.assertEqual(status["backend"], "tasks")
+        self.assertEqual(status["mediapipe_version"], "0.10.test")
+        self.assertEqual(status["interpreter"], sys.executable)
+        self.assertEqual(status["frame_age_sec"], 0.42)
+
+    def test_model_load_timeout_reports_cleanup_and_ignores_late_result(self):
+        original_timeout = gt.MODEL_LOAD_TIMEOUT_SEC
+        gate = threading.Event()
+        try:
+            gt.MODEL_LOAD_TIMEOUT_SEC = 0.01
+            tracker = GestureTracker()
+            tracker.enabled = True
+            fake_hands = types.SimpleNamespace(closed=False,
+                                               close=lambda: setattr(
+                                                   fake_hands, "closed", True))
+            fake_mp = types.SimpleNamespace(__version__="late")
+            tracker._create_hands = lambda progress=None: (
+                gate.wait(1.0),
+                (fake_hands, fake_mp, "tasks",
+                 tracker._model_runtime_diagnostics(fake_mp, "tasks")))[1]
+            tracker._start_model_load(frame_age=0.2)
+            time.sleep(0.03)
+            tracker._check_model_load_timeout()
+            status = tracker.bus.last("picarx/gesture/status")
+            self.assertEqual(status["state"], "model_error")
+            self.assertTrue(status["timeout"])
+            self.assertEqual(status["cleanup"], {
+                "camera_released": True, "state_released": True})
+            self.assertTrue(any(p.get("owner") == "gesture_tracking"
+                                for p in tracker.bus.of("picarx/state/release")))
+            gate.set()
+            tracker._model_load_thread.join(1.0)
+            self.assertIs(tracker._hands, False)
+            self.assertTrue(fake_hands.closed)
+        finally:
+            gt.MODEL_LOAD_TIMEOUT_SEC = original_timeout
 
 
 if __name__ == "__main__":

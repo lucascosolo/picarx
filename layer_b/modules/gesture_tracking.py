@@ -21,6 +21,8 @@ import os
 import sys
 import threading
 import time
+import importlib.metadata
+import platform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
@@ -45,6 +47,10 @@ THERMAL_RECOVER_C = 72.0
 HAND_LOSS_HOLD_SEC = 1.0
 CLAIM_RENEW_INTERVAL_SEC = 0.5
 CLAIM_TTL_SEC = 3.0
+MODEL_LOAD_TIMEOUT_SEC = max(1.0, float(robot_config.get(
+    "gesture_tracking", "model_load_timeout_sec", 45.0,
+    env="GESTURE_MODEL_LOAD_TIMEOUT"))) if robot_config is not None else 45.0
+MODEL_STATUS_HEARTBEAT_SEC = 1.0
 STATE_TOPIC = "picarx/state/current"
 CONTROL_TOPIC = "picarx/gesture/control"
 STATUS_TOPIC = "picarx/gesture/status"
@@ -330,6 +336,17 @@ class GestureTracker:
         self._hands_backend = None
         self._mediapipe = None
         self._model_error = None
+        self._model_failed = False
+        self._model_loading = False
+        self._model_load_thread = None
+        self._model_load_started_at = 0.0
+        self._model_load_last_status_at = 0.0
+        self._model_load_phase = "idle"
+        self._model_load_frame_age = None
+        self._model_load_generation = 0
+        self._model_load_cancel = threading.Event()
+        self._model_load_lock = threading.Lock()
+        self._model_diagnostics = {}
         self._last_claim_at = 0.0
         self._claim_lock = threading.Lock()
         self._claim_stop = threading.Event()
@@ -339,7 +356,7 @@ class GestureTracker:
 
     def _claim(self, force=False):
         with self._claim_lock:
-            if not self.enabled:
+            if not self.enabled or self._model_failed:
                 return
             now = time.monotonic()
             if not force and now - self._last_claim_at < CLAIM_RENEW_INTERVAL_SEC:
@@ -373,20 +390,259 @@ class GestureTracker:
     def _release(self):
         self.bus.publish(STATE_RELEASE_TOPIC, {"owner": OWNER, "ts": time.time()})
 
+    def _cancel_model_load(self):
+        """Invalidate a model worker without blocking on native/network code."""
+        with self._model_load_lock:
+            self._model_load_generation += 1
+            self._model_load_cancel.set()
+            self._model_loading = False
+            self._model_load_thread = None
+
+    def _model_runtime_diagnostics(self, mediapipe_module=None,
+                                   backend=None):
+        model_size = None
+        model_exists = os.path.isfile(HAND_MODEL_PATH)
+        if model_exists:
+            try:
+                model_size = os.path.getsize(HAND_MODEL_PATH)
+            except OSError:
+                model_size = None
+        version = None
+        package_versions = {}
+        for distribution in ("mediapipe", "mediapipe-rpi4"):
+            try:
+                package_versions[distribution] = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                pass
+            except Exception as exc:
+                package_versions[distribution] = f"metadata error: {exc}"
+        if mediapipe_module is not None:
+            version = getattr(mediapipe_module, "__version__", None)
+        return {
+            "interpreter": sys.executable,
+            "python_version": platform.python_version(),
+            "mediapipe_version": version,
+            "mediapipe_file": (getattr(mediapipe_module, "__file__", None)
+                                if mediapipe_module is not None else None),
+            "package_versions": package_versions,
+            "backend": backend,
+            "model_path": HAND_MODEL_PATH,
+            "model_exists": model_exists,
+            "model_size_bytes": model_size,
+        }
+
+    def _publish_model_status(self, state, error=None, exception=None,
+                              frame_age=None, cleanup=None, force=False,
+                              **fields):
+        now = time.time()
+        with self._model_load_lock:
+            if not force and now - self._model_load_last_status_at < MODEL_STATUS_HEARTBEAT_SEC:
+                return
+            self._model_load_last_status_at = now
+            diagnostics = dict(self._model_diagnostics)
+            started = self._model_load_started_at
+            phase = self._model_load_phase
+        payload = {
+            "enabled": self.enabled,
+            "state": state,
+            "phase": phase,
+            "timeout_sec": MODEL_LOAD_TIMEOUT_SEC,
+            "elapsed_sec": round(max(0.0, time.monotonic() - started), 3)
+            if started else 0.0,
+            "frame_age_sec": (round(float(frame_age), 3)
+                               if frame_age is not None else self._model_load_frame_age),
+            "ts": now,
+        }
+        payload.update(diagnostics)
+        payload.update(fields)
+        if error:
+            payload["error"] = str(error)[:500]
+        if exception:
+            payload["exception"] = str(exception)[:500]
+        if cleanup is not None:
+            payload["cleanup"] = dict(cleanup)
+        self.bus.publish(STATUS_TOPIC, payload)
+
+    def _model_load_progress(self, generation, phase, **diagnostics):
+        with self._model_load_lock:
+            if generation != self._model_load_generation or self._model_load_cancel.is_set():
+                return False
+            self._model_load_phase = phase
+            self._model_diagnostics.update(diagnostics)
+        self._publish_model_status("model_loading", force=True)
+        return True
+
+    def _create_hands(self, progress=None):
+        """Construct a backend without mutating tracker state."""
+        progress = progress or (lambda phase, **fields: True)
+        progress("import", **self._model_runtime_diagnostics())
+        import mediapipe as mp
+        progress("imported", **self._model_runtime_diagnostics(mp))
+        legacy = getattr(getattr(mp, "solutions", None), "hands", None)
+        if legacy is not None:
+            progress("constructing", backend="solutions")
+            hands = legacy.Hands(
+                static_image_mode=False, max_num_hands=1,
+                model_complexity=0, min_detection_confidence=0.55,
+                min_tracking_confidence=0.55)
+            return hands, mp, "solutions", self._model_runtime_diagnostics(mp, "solutions")
+
+        # MediaPipe >= 0.10.30 no longer ships mp.solutions.  Use the
+        # supported Tasks API instead of requiring users to downgrade the
+        # package or install a distro-specific replacement.
+        progress("asset_check", **self._model_runtime_diagnostics(mp, "tasks"))
+        if not self._ensure_hand_model(progress=progress):
+            raise RuntimeError(self._model_error or "hand model asset unavailable")
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+        progress("constructing", backend="tasks",
+                 **self._model_runtime_diagnostics(mp, "tasks"))
+        options = vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH),
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=1,
+            min_hand_detection_confidence=0.55,
+            min_hand_presence_confidence=0.55,
+            min_tracking_confidence=0.55)
+        hands = vision.HandLandmarker.create_from_options(options)
+        return hands, mp, "tasks", self._model_runtime_diagnostics(mp, "tasks")
+
+    def _close_hands(self, hands):
+        if hands and hands is not False:
+            try:
+                close = getattr(hands, "close", None)
+                if close:
+                    close()
+            except Exception:
+                pass
+
+    def _set_model_error(self, error, exception=None, diagnostics=None,
+                         timed_out=False):
+        self._close_hands(None)
+        with self._model_load_lock:
+            if diagnostics:
+                self._model_diagnostics.update(diagnostics)
+            self._model_loading = False
+            self._model_failed = True
+            self._hands = False
+            self._hands_backend = None
+            self._model_error = str(error)
+            self._model_load_phase = "timeout" if timed_out else "error"
+            self._model_load_generation += 1
+            self._model_load_cancel.set()
+        # A model failure must not retain the camera or RobotState lease while
+        # the user investigates it.  Re-enabling (or retry=true) starts fresh.
+        self.camera.release()
+        self.frames.clear()
+        self._release()
+        self._publish_model_status(
+            "model_error", error=error, exception=exception, force=True,
+            timeout=bool(timed_out),
+            cleanup={"camera_released": True, "state_released": True})
+
+    def _model_load_worker(self, generation):
+        def progress(phase, **fields):
+            return self._model_load_progress(generation, phase, **fields)
+        try:
+            result = self._create_hands(progress=progress)
+        except ModuleNotFoundError as exc:
+            missing = exc.name or "an import"
+            self._finish_model_worker(generation, error=(
+                f"missing Python package '{missing}'; install the gesture "
+                "runtime dependencies with the same interpreter running "
+                f"the module ({sys.executable})"), exception=exc)
+            return
+        except Exception as exc:
+            self._finish_model_worker(generation,
+                                      error=f"{type(exc).__name__}: {exc}",
+                                      exception=exc)
+            return
+        self._finish_model_worker(generation, result=result)
+
+    def _finish_model_worker(self, generation, result=None, error=None,
+                             exception=None):
+        with self._model_load_lock:
+            current = (generation == self._model_load_generation and
+                       not self._model_load_cancel.is_set())
+        if not current:
+            if result:
+                self._close_hands(result[0])
+            return
+        if error:
+            self._set_model_error(error, exception=exception)
+            return
+        hands, mediapipe_module, backend, diagnostics = result
+        with self._model_load_lock:
+            self._hands = hands
+            self._mediapipe = mediapipe_module
+            self._hands_backend = backend
+            self._model_diagnostics = dict(diagnostics)
+            self._model_loading = False
+            self._model_failed = False
+            self._model_load_phase = "ready"
+        self._publish_model_status("model_ready", backend=backend, force=True)
+
+    def _start_model_load(self, frame_age=None):
+        with self._model_load_lock:
+            if self._model_loading or self._model_failed or self._hands is not None:
+                return
+            self._model_load_generation += 1
+            generation = self._model_load_generation
+            self._model_load_cancel = threading.Event()
+            self._model_loading = True
+            self._model_load_started_at = time.monotonic()
+            self._model_load_phase = "queued"
+            self._model_load_frame_age = frame_age
+            self._model_diagnostics = self._model_runtime_diagnostics()
+            self._model_load_last_status_at = 0.0
+            thread = threading.Thread(target=self._model_load_worker,
+                                      args=(generation,),
+                                      name="gesture-model-loader", daemon=True)
+            self._model_load_thread = thread
+        self._publish_model_status("model_loading", frame_age=frame_age, force=True)
+        thread.start()
+
+    def _check_model_load_timeout(self):
+        with self._model_load_lock:
+            if not self._model_loading:
+                return
+            elapsed = time.monotonic() - self._model_load_started_at
+            if elapsed < MODEL_LOAD_TIMEOUT_SEC:
+                timed_out = False
+            else:
+                timed_out = True
+                self._model_loading = False
+                self._model_load_generation += 1
+                self._model_load_cancel.set()
+        if not timed_out:
+            self._publish_model_status("model_loading")
+            return
+        self._set_model_error(
+            f"MediaPipe model initialization exceeded {MODEL_LOAD_TIMEOUT_SEC:.1f}s",
+            timed_out=True)
+
     def on_control(self, payload):
         enabled = bool(payload.get("enabled", False))
         was = self.enabled
         self.enabled = enabled
         if enabled:
-            if not was:
+            if not was or bool(payload.get("retry")):
+                self._cancel_model_load()
                 self.controller = GestureHeadController()
                 self.scheduler = AdaptiveFrameScheduler()
                 self._last_pose = None
                 self._last_hand_at = 0.0
+                self._hands = None
+                self._hands_backend = None
+                self._mediapipe = None
+                self._model_error = None
+                self._model_failed = False
             self._claim(force=True)
             self.bus.publish(STATUS_TOPIC, {"enabled": True, "state": "starting",
                                              "ts": time.time()})
         else:
+            self._cancel_model_load()
+            self._model_failed = False
             self._release()
             self.camera.release()
             self.frames.clear()
@@ -404,68 +660,58 @@ class GestureTracker:
         # this, the initial TTS confirmation can let the short gesture lease
         # expire, leaving the module stuck in IDLE with the camera held by a
         # different process.
-        if self.enabled and self.state != STATE_NAME:
+        if self.enabled and not self._model_failed and self.state != STATE_NAME:
             self._claim()
 
     def _load_hands(self):
+        """Synchronous compatibility helper used by diagnostics/tests.
+
+        Production processing uses ``_start_model_load`` so imports, asset
+        downloads, and native model construction cannot block the control loop.
+        """
         if self._hands is not None:
             return self._hands
         try:
-            import mediapipe as mp
-            legacy = getattr(getattr(mp, "solutions", None), "hands", None)
-            if legacy is not None:
-                self._hands = legacy.Hands(
-                    static_image_mode=False, max_num_hands=1,
-                    model_complexity=0, min_detection_confidence=0.55,
-                    min_tracking_confidence=0.55)
-                self._hands_backend = "solutions"
-            else:
-                # MediaPipe >= 0.10.30 no longer ships mp.solutions.  Use the
-                # supported Tasks API instead of requiring users to downgrade
-                # the package or install a distro-specific replacement.
-                if not self._ensure_hand_model():
-                    self._hands = False
-                    return self._hands
-                from mediapipe.tasks import python as mp_python
-                from mediapipe.tasks.python import vision
-                options = vision.HandLandmarkerOptions(
-                    base_options=mp_python.BaseOptions(
-                        model_asset_path=HAND_MODEL_PATH),
-                    running_mode=vision.RunningMode.IMAGE,
-                    num_hands=1,
-                    min_hand_detection_confidence=0.55,
-                    min_hand_presence_confidence=0.55,
-                    min_tracking_confidence=0.55)
-                self._hands = vision.HandLandmarker.create_from_options(options)
-                self._hands_backend = "tasks"
-            self._mediapipe = mp
+            self._model_load_started_at = time.monotonic()
+            hands, mediapipe_module, backend, diagnostics = self._create_hands()
+            self._hands = hands
+            self._mediapipe = mediapipe_module
+            self._hands_backend = backend
+            self._model_diagnostics = diagnostics
             self._model_error = None
+            self._model_failed = False
+            self._model_load_phase = "ready"
+            self._publish_model_status("model_ready", backend=backend, force=True)
         except ModuleNotFoundError as e:
             missing = e.name or "an import"
-            self._model_error = (
+            self._set_model_error(
+                error=(
                 f"missing Python package '{missing}'; install the gesture "
                 "runtime dependencies with the same interpreter running "
-                f"the module ({sys.executable})"
-            )
-            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "model_error",
-                                             "error": self._model_error, "exception": str(e),
-                                             "ts": time.time()})
-            self._hands = False
+                f"the module ({sys.executable})"), exception=e)
         except Exception as e:
-            self._model_error = f"{type(e).__name__}: {e}"
-            self.bus.publish(STATUS_TOPIC, {"enabled": self.enabled, "state": "model_error",
-                                             "error": self._model_error[:200], "ts": time.time()})
-            self._hands = False
+            self._set_model_error(f"{type(e).__name__}: {e}", exception=e)
         return self._hands
 
-    def _ensure_hand_model(self):
+    def _ensure_hand_model(self, progress=None):
         """Ensure the MediaPipe Tasks hand model exists, downloading it once."""
         if os.path.isfile(HAND_MODEL_PATH):
-            return True
+            try:
+                size = os.path.getsize(HAND_MODEL_PATH)
+            except OSError:
+                size = 0
+            if size >= 1024:
+                if progress:
+                    progress("asset_ready", **self._model_runtime_diagnostics(
+                        backend="tasks"))
+                return True
         try:
             from urllib.request import urlopen
             os.makedirs(HAND_MODEL_DIR, exist_ok=True)
             temporary = HAND_MODEL_PATH + ".tmp"
+            if progress:
+                progress("asset_downloading", **self._model_runtime_diagnostics(
+                    backend="tasks"))
             try:
                 with urlopen(HAND_MODEL_URL, timeout=30) as response, \
                         open(temporary, "wb") as output:
@@ -484,17 +730,17 @@ class GestureTracker:
                     pass
             return True
         except Exception as e:
-            self._model_error = (
+            raise RuntimeError(
                 f"MediaPipe hand model unavailable at {HAND_MODEL_PATH}: {e}. "
-                f"Download it from {HAND_MODEL_URL}")
-            self.bus.publish(STATUS_TOPIC, {
-                "enabled": self.enabled, "state": "model_error",
-                "error": self._model_error[:500], "ts": time.time()})
-            return False
+                f"Download it from {HAND_MODEL_URL}") from e
 
     def process_once(self, now=None):
         now = time.monotonic() if now is None else float(now)
+        self._check_model_load_timeout()
         if not self.enabled or self.state != STATE_NAME:
+            self.frames.clear()
+            return None
+        if self._model_failed:
             self.frames.clear()
             return None
         self._claim()
@@ -521,9 +767,11 @@ class GestureTracker:
             self._handle_hand_loss(now)
             return None
         if self._hands is None:
-            self.bus.publish(STATUS_TOPIC, {
-                "enabled": True, "state": "model_loading", "ts": time.time()})
-        hands = self._load_hands()
+            self._start_model_load(frame_age=max(0.0, now - captured_at))
+            self._publish_model_status(
+                "model_loading", frame_age=max(0.0, now - captured_at))
+            return None
+        hands = self._hands
         if not hands:
             return None
         try:
@@ -592,12 +840,13 @@ class GestureTracker:
         try:
             while self.running:
                 try:
+                    self._check_model_load_timeout()
                     # Do not open Picamera2 merely because the UI toggle
                     # arrived; wait for RobotState to acknowledge that this
                     # process owns the camera/head. This closes the startup
                     # race with vision_basic on brokers without retained
                     # state messages.
-                    if self.enabled:
+                    if self.enabled and not self._model_failed:
                         if self.state == STATE_NAME:
                             self.camera.ensure()
                             self.process_once()
@@ -613,6 +862,7 @@ class GestureTracker:
                     time.sleep(0.2)
         finally:
             self._stop_claim_loop()
+            self._cancel_model_load()
             self.camera.release()
 
 

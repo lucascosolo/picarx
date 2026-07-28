@@ -284,13 +284,12 @@ recovery hysteresis, queue bounds, and graceful absence of monitoring tools.
   and remote-session resources.
 - Gate the feature behind configuration and default it off until target-Pi
   thermal, servo-limit, and recovery tests pass.
-- **Outstanding model-loading diagnosis:** when gesture status reaches
-  `model_loading` and then disappears or the state lease returns to `IDLE`,
-  capture the exact service interpreter, MediaPipe package/version/backend,
-  hand-model asset path and size, camera-frame age, initialization duration,
-  exception, and cleanup transition. Add a bounded timeout and terminal
-  `model_error`/recovery status so a failed Tasks/legacy backend cannot look
-  like a silent camera or state-arbitration failure.
+- **Model-loading observability and recovery:** implemented asynchronously with
+  phase, exact service interpreter/package/backend, hand-model path and size,
+  frame age, initialization duration, exception, bounded timeout, and cleanup
+  telemetry. A failed Tasks/legacy backend now publishes terminal
+  `model_error`, releases camera/state ownership, and can be explicitly
+  retried. Target-Pi validation of native bindings and performance remains.
 
 **Acceptance:** no two heavy camera modes run concurrently, speech does not
 create an unbounded frame backlog, every head command stays inside the stated
