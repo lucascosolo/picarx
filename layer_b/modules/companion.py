@@ -173,17 +173,27 @@ ALLOWED_INTENTS = {
     "stop", "battery", "status", "history", "objects", "map", "why",
     "hello", "who am i", "where are you",
     "play radio", "stop radio", "next station",
-    "what's playing", "list stations",
+    "what's playing", "list stations", "list reminders",
+    "start meeting notes", "pause meeting notes", "resume meeting notes",
+    "stop meeting notes", "list notes", "disconnect remote assist",
 }
-ALLOWED_INTENT_PREFIXES = ("tune to ", "radio find ", "station ",
-                           "where is ", "what's in ", "call this place ")
+ALLOWED_INTENT_PREFIXES = (
+    "tune to ", "radio find ", "station ", "where is ", "what's in ",
+    "call this place ", "remind me in ", "remind me at ", "take a note ",
+    "delete reminders ", "cancel reminders ", "delete notes ",
+    "ssh into ", "connect to ",
+)
 
 INTENT_SYSTEM_PROMPT = """You repair garbled voice-command transcripts for a small robot car.
 The transcript comes from an offline speech recognizer and may contain misheard words.
 
 Known commands: stop, battery, status, history, objects, map, why, hello, who am i,
 where are you, play radio, stop radio, next station, what's playing, list stations,
-tune to <number>, radio find <keywords>, station <name>,
+list reminders, start meeting notes, pause meeting notes, resume meeting notes,
+stop meeting notes, list notes, disconnect remote assist, tune to <number>,
+radio find <keywords>, station <name>, remind me in <time> to <message>,
+remind me at <time> to <message>, take a note <text>, delete/cancel reminders <query>,
+delete notes <query>, ssh into <host>, connect to <host>,
 where is <object>  (asks the robot's memory where it last saw an object),
 what's in <place>  (asks what objects it has seen at a named place),
 call this place <name>  (names the robot's current location).
@@ -195,9 +205,10 @@ Reply with JSON only, one of:
 {"ignore": true} - background noise, TV, or speech not meant for the robot
 
 NEVER return a movement command: requests to explore, drive, turn, go somewhere, or
-follow someone must be answered with {"chat": true}, not a command - the chat layer
-has its own carefully-gated tools for those. Requests to set reminders, to be
-remembered/recognized, or to share a connection are also {"chat": true}."""
+follow someone must be answered with {"chat": true}, not a command. Never return a
+remote write/command/authorization operation, recording consent, or an arbitrary
+tool name. For a clearly attempted non-motion tool request, repair it only to one
+of the exact commands listed above; otherwise return {"chat": true}."""
 
 # ---------- camera-grounded chat ----------
 # When someone asks the robot what it's looking at (or teaches it a new

@@ -316,11 +316,17 @@ class ToolsRegistry:
         self.bus.publish("picarx/tools/available", {
             "tools": TOOL_DESCRIPTIONS, "ts": time.time()})
 
-    # Vocabulary that marks an utterance as radio-intent even when no
-    # rule managed to parse it - those go to the LLM intent arbiter
-    # (companion.py) instead of vanishing.
-    _RADIO_WORDS = ("radio", "station", "stations", "tune", "dial",
-                    "frequency", "music")
+    # Vocabulary that marks an utterance as a tool attempt even when no rule
+    # managed to parse it. These go to the LLM intent arbiter instead of
+    # vanishing. A successful repair becomes a cached alias, so new phrasing
+    # does not require another hardcoded regex rule.
+    _TOOL_WORDS = (
+        "radio", "station", "stations", "tune", "dial", "frequency", "music",
+        "song", "remind", "reminder", "note", "notes", "meeting",
+        "ssh", "remote", "host",
+    )
+    # Compatibility name for local overlays/tests that used the old marker.
+    _RADIO_WORDS = _TOOL_WORDS[:7]
 
     def on_heard(self, payload):
         text = (payload.get("text") or "").lower().strip()
@@ -350,17 +356,13 @@ class ToolsRegistry:
                 "choice": {"topic": topic, **command},
                 "reason": f"voice command matched: '{text}'", "ts": time.time()})
             return
-        # No rule fired, but the utterance clearly TRIED to be a radio
-        # command ("could you put the radio louder maybe"). Escalate to
-        # the intent arbiter - unless this text already IS the arbiter's
-        # repaired output, in which case dropping it here is the loop
-        # guard that keeps repair from recursing.
-        # Substring on purpose, mirroring field_agent's TOOL_KEYWORDS
-        # deferral: any text field_agent leaves to us ("...radial...")
-        # must either route or escalate here - never fall through both.
+        # No rule fired, but the utterance clearly tried to use a registered
+        # tool ("set a reminder", "save this as a note", "put the music on").
+        # Escalate it to the intent arbiter. Repaired output is the loop guard
+        # that prevents recursive escalation.
         if payload.get("source") != "intent_repair" and \
-                any(w in canon for w in self._RADIO_WORDS):
-            print(f"Tools registry: unparsed radio-ish utterance -> arbiter: '{text}'")
+                any(w in canon for w in self._TOOL_WORDS):
+            print(f"Tools registry: unparsed tool utterance -> arbiter: '{text}'")
             self.bus.publish("picarx/audio/uncertain", {
                 "text": text, "confidence": payload.get("confidence"),
                 "from": "tools_registry"})

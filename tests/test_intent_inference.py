@@ -140,6 +140,16 @@ class ArbiterAllowlistTest(unittest.TestCase):
                     "follow me"):
             self.assertFalse(companion.Companion._intent_allowed(cmd), cmd)
 
+    def test_non_motion_tool_aliases_are_learnable(self):
+        for cmd in ("remind me in 5 minutes to buy milk", "take a note buy milk",
+                    "start meeting notes", "ssh into robot.local"):
+            self.assertTrue(companion.Companion._intent_allowed(cmd), cmd)
+
+    def test_risky_tool_aliases_are_not_learnable(self):
+        for cmd in ("give remote host write access", "run command git status",
+                    "authorize_write"):
+            self.assertFalse(companion.Companion._intent_allowed(cmd), cmd)
+
     def test_parameterless_prefix_rejected(self):
         self.assertFalse(companion.Companion._intent_allowed("where is "))
         self.assertFalse(companion.Companion._intent_allowed("call this place "))

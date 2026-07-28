@@ -119,6 +119,19 @@ class NotesReminderRuleTest(unittest.TestCase):
         self.assertEqual(payload["query"], "trash")
         self.assertTrue(payload["confirmed"])
 
+    def test_unparsed_tool_phrase_enters_learning_path(self):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": "set a reminder for later"})
+        uncertain = registry.bus.last("picarx/audio/uncertain")
+        self.assertEqual(uncertain["text"], "set a reminder for later")
+        self.assertEqual(uncertain["from"], "tools_registry")
+
+    def test_repaired_tool_phrase_does_not_recurse(self):
+        registry = tr.ToolsRegistry()
+        registry.on_heard({"text": "set a reminder for later",
+                           "source": "intent_repair"})
+        self.assertIsNone(registry.bus.last("picarx/audio/uncertain"))
+
 
 if __name__ == "__main__":
     unittest.main()
