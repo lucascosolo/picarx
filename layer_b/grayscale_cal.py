@@ -3,13 +3,11 @@
 """
 Standalone grayscale sensor diagnostic.
 
-STOP safety_daemon.py before running this - both scripts try to own
-the same hardware (px.get_grayscale_data()), and running them
-simultaneously risks conflicting GPIO/ADC access, same class of
-problem as the earlier "device busy" mic issue.
+Keep safety_daemon.py running while using this diagnostic. It is the sole
+owner of the grayscale hardware; this script asks it for readings over the
+same Unix socket used by the runtime sensor consumer.
 
 Usage:
-    sudo systemctl stop picarx-orchestrator   # or however yours is stopped
     python3 grayscale_calibration.py
 
 Then physically carry/drive the robot slowly over:
@@ -32,17 +30,30 @@ import os
 import getpass
 os.getlogin = getpass.getuser
 
+import json
+import socket
 import time
-from picarx import Picarx
 
-px = Picarx()
+SOCKET_PATH = "/tmp/picarx_safety.sock"
+
+
+def read_grayscale():
+    """Read the safety daemon's HAT-owned grayscale sensor snapshot."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(1.0)
+        client.connect(SOCKET_PATH)
+        client.sendall(json.dumps({"query": "grayscale"}).encode())
+        result = json.loads(client.recv(1024).decode())
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    return result["grayscale"]
 
 print("Reading grayscale sensors. Ctrl+C to stop.")
 print("Drive/carry the robot over carpet, tile, the seam, and a real edge.\n")
 
 try:
     while True:
-        values = px.get_grayscale_data()
+        values = read_grayscale()
         print(f"grayscale: {values}")
         time.sleep(0.2)
 except KeyboardInterrupt:

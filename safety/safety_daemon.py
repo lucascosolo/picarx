@@ -332,6 +332,17 @@ def check_battery():
         print(f"Battery read error: {e}")
 
 
+def enable_speaker():
+    """Enable the Robot HAT speaker amp while retaining HAT ownership here."""
+    try:
+        from robot_hat.utils import enable_speaker as enable
+        with hardware_lock:
+            enable()
+        return {"status": "executed"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)[:300]}
+
+
 def _number(value, name):
     """Return a finite numeric command value, rejecting bools and strings."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -585,6 +596,18 @@ def main():
                         pass
                 continue
 
+            if action.get("query") == "grayscale":
+                try:
+                    with hardware_lock:
+                        values = px.get_grayscale_data()
+                    conn.sendall(json.dumps({"grayscale": values}).encode())
+                except Exception as sensor_err:
+                    try:
+                        conn.sendall(json.dumps({"error": str(sensor_err)}).encode())
+                    except Exception:
+                        pass
+                continue
+
             if action.get("query") == "imu":
                 # The MPU shares the I2C bus with the ADC/servos, so serialize
                 # the read under hardware_lock. Fail-soft: an error dict tells
@@ -616,6 +639,16 @@ def main():
                     conn.sendall(json.dumps({"training_mode": training_mode}).encode())
                 except Exception:
                     pass
+                continue
+            if action.get("command") == "speaker_enable":
+                try:
+                    conn.sendall(json.dumps(enable_speaker()).encode())
+                except Exception as speaker_err:
+                    try:
+                        conn.sendall(json.dumps({"status": "error",
+                                                 "detail": str(speaker_err)}).encode())
+                    except Exception:
+                        pass
                 continue
             # ---------------
 

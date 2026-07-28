@@ -163,33 +163,34 @@ class AmpReassertTest(unittest.TestCase):
     def setUp(self):
         self.node = _bare_node()
         self._orig_popen = audio_nodes.subprocess.Popen
-        self._orig_run = audio_nodes.subprocess.run
-        self.run_calls = []
+        self.enable_calls = 0
         audio_nodes.subprocess.Popen = lambda argv, **kw: _FakePopen(argv, **kw)
-        audio_nodes.subprocess.run = lambda argv, **kw: self.run_calls.append(argv)
+        self.node._enable_speakers_once = self._enable
 
     def tearDown(self):
         audio_nodes.subprocess.Popen = self._orig_popen
-        audio_nodes.subprocess.run = self._orig_run
+
+    def _enable(self):
+        self.enable_calls += 1
+        return True
 
     def _enable_calls(self):
-        enable_argv = audio_nodes.SPEAKER_ENABLE_CMD.split()
-        return [c for c in self.run_calls if c == enable_argv]
+        return self.enable_calls
 
     def test_amp_reasserted_before_utterance(self):
         self.node._render_and_play("hello")
-        self.assertEqual(len(self._enable_calls()), 1)
+        self.assertEqual(self._enable_calls(), 1)
 
     def test_reassert_throttled_within_interval(self):
         self.node._render_and_play("line one")
         self.node._render_and_play("line two")
-        self.assertEqual(len(self._enable_calls()), 1)
+        self.assertEqual(self._enable_calls(), 1)
 
     def test_reassert_fires_again_after_interval(self):
         self.node._render_and_play("early line")
         self.node._last_amp_assert_at -= (audio_nodes.SPEAKER_REASSERT_INTERVAL + 1)
         self.node._render_and_play("later line")
-        self.assertEqual(len(self._enable_calls()), 2)
+        self.assertEqual(self._enable_calls(), 2)
 
 
 class TtsQueueTest(unittest.TestCase):

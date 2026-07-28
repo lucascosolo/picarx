@@ -77,36 +77,31 @@ import time
 import json
 import queue
 import subprocess
+import socket
 import threading
 from collections import deque
 from vosk import Model, KaldiRecognizer
 
-# Speaker amp enable: the robot_hat amp GPIO comes up DISABLED on boot, and
-# can be pulled low AGAIN when safety_daemon's Picarx() initializes the HAT
-# after us (module start order isn't guaranteed). A single enable at our
-# startup loses that race, so we re-assert it a few times across the boot
-# window; re-asserting an already-on GPIO is a pop-free no-op, and we stop
-# once the window passes so it costs nothing ongoing.
-SPEAKER_ENABLE_CMD = str(robot_config.get(
-    "audio", "speaker_enable_cmd", "robot_hat enable_speaker", env="SPEAKER_ENABLE_CMD"))
+# The safety daemon is the sole owner of Robot HAT hardware. Audio requests
+# the amp-enable operation over its Unix socket instead of starting the
+# robot_hat CLI in this process; the retry policy remains here because the
+# daemon may initialize the HAT after audio starts.
+SAFETY_SOCKET_PATH = "/tmp/picarx_safety.sock"
 SPEAKER_ENABLE_RETRIES = 12
 SPEAKER_ENABLE_INTERVAL = 5.0
 
 # The boot-window burst above proved insufficient in the field: on slow
 # boots the HAT init that resets the amp GPIO can land AFTER the whole
 # 60s re-assert window has already been spent, leaving the robot mute
-# until someone manually ran `robot_hat restart_speaker` and restarted
-# the orchestrator. Rather than guessing an ever-later startup delay,
+# until someone manually enabled it and restarted the orchestrator. Rather
+# than guessing an ever-later startup delay,
 # the amp is now ALSO re-asserted directly before playback whenever the
 # last assert is older than this - effectively moving "enable speakers"
 # to the latest possible point in startup (right before the first words)
 # and making speech self-healing after any later reset, no matter when
 # it happens. Re-asserting an already-on GPIO is a pop-free no-op; the
-# throttle just keeps a chatty announcement stream from paying the
-# robot_hat CLI's process-spawn cost on every single line.
-# If your amp needs a full power-cycle rather than a plain enable, point
-# SPEAKER_ENABLE_CMD at "robot_hat restart_speaker" instead - both the
-# boot burst and this pre-utterance re-assert run whatever it says.
+# throttle just keeps a chatty announcement stream from sending a safety
+# request on every single line.
 SPEAKER_REASSERT_INTERVAL = 10.0
 
 try:
@@ -525,7 +520,7 @@ class AudioNode:
         # Remote speaker kill-switch (picarx/audio/speaker_control): while
         # off, every TTS request is dropped (at enqueue AND dequeue, so
         # nothing backs up to blurt out later). Toggling back ON runs the
-        # amp-enable command (robot_hat enable_speaker) before anything
+        # amp-enable request through the safety daemon before anything
         # plays - the HAT can reset the amp GPIO while we were muted, and
         # "unmuted but silent" is the worst failure mode. Only gates TTS;
         # the radio stream has its own stop/play controls.
@@ -719,15 +714,18 @@ class AudioNode:
         self._tts_queue.put((text, ts))
 
     def _enable_speakers_once(self):
-        """Assert the amp-enable GPIO once. Returns True if the command
-        ran (fail-soft: a missing robot_hat just prints and returns False).
-        Override the command via SPEAKER_ENABLE_CMD for other HAT builds."""
+        """Ask the safety daemon to assert the amp-enable GPIO once."""
         try:
-            subprocess.run(SPEAKER_ENABLE_CMD.split(), check=False, timeout=5,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(0.5)
+                client.connect(SAFETY_SOCKET_PATH)
+                client.sendall(json.dumps({"command": "speaker_enable"}).encode())
+                result = json.loads(client.recv(1024).decode())
+            if result.get("status") != "executed":
+                raise RuntimeError(result.get("detail") or "safety daemon rejected request")
             return True
-        except (FileNotFoundError, subprocess.SubprocessError) as e:
-            print(f"Audio node: could not enable speakers via '{SPEAKER_ENABLE_CMD}': {e}")
+        except Exception as e:
+            print(f"Audio node: could not enable speakers through safety daemon: {e}")
             return False
 
     def _enable_speakers(self):
@@ -741,7 +739,7 @@ class AudioNode:
                 ran = self._enable_speakers_once()
                 if i == 0:
                     print(f"Audio node: enabling speaker amp via "
-                          f"'{SPEAKER_ENABLE_CMD}'"
+                          "the safety daemon"
                           f"{'' if ran else ' (command unavailable)'}, re-asserting "
                           f"for ~{int(SPEAKER_ENABLE_RETRIES * SPEAKER_ENABLE_INTERVAL)}s.")
                 if not ran:

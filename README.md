@@ -54,14 +54,15 @@ flowchart LR
 
 - **Layer A — reflexes (`safety/safety_daemon.py`).** The sole owner of the HAT
   actuators and safety-critical sensor reads — drive motors, steering, camera
-  servos, battery, ultrasonic, grayscale, and IMU. It ramps motion smoothly,
+  servos, speaker amplifier enable, battery, ultrasonic, grayscale, and IMU. It ramps motion smoothly,
   clamps the camera servos to their physical range, watches the battery, and
   **vetoes** any commanded action it deems unsafe (obstacle too close, cliff
   detected, sustained blind reverse). The camera sensor pipeline is the one
   deliberate Layer B exception: `camera_controller.py` is the sole Picamera2
   owner, and vision/gesture/web consumers can only request a shared stream.
   Layer A serves raw safety-owned sensor reads over its socket, so no other
-  Layer B module touches those HAT devices directly. Its veto authority is
+  Layer B module touches those HAT devices directly; audio requests speaker
+  amplifier enable through the same controller. Its veto authority is
   never delegated upward; everything above it is advisory.
 
 - **Layer B — behaviour (`layer_b/modules/`).** ~27 small Python processes,

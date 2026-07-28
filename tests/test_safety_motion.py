@@ -254,6 +254,21 @@ class CommandSafetyTest(unittest.TestCase):
         self.assertFalse(safe)
         self.assertTrue(reason.startswith("sensor error:"))
 
+    def test_speaker_enable_is_owned_by_safety_daemon(self):
+        utils = types.ModuleType("robot_hat.utils")
+        calls = []
+        utils.enable_speaker = lambda: calls.append(True)
+        previous = sys.modules.get("robot_hat.utils")
+        sys.modules["robot_hat.utils"] = utils
+        try:
+            self.assertEqual(safety_daemon.enable_speaker(), {"status": "executed"})
+        finally:
+            if previous is None:
+                sys.modules.pop("robot_hat.utils", None)
+            else:
+                sys.modules["robot_hat.utils"] = previous
+        self.assertEqual(calls, [True])
+
 
 class _FakeI2C:
     """robot_hat.I2C stand-in: write([reg,...]) sets the register pointer from

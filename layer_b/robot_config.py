@@ -89,9 +89,6 @@ _cache = None
 # ---------------------------------------------------------------------------
 KNOBS = [
     # ---- audio (audio_nodes.py) ----
-    {"section": "audio", "key": "speaker_enable_cmd", "type": "str",
-     "default": "robot_hat enable_speaker", "env": "SPEAKER_ENABLE_CMD",
-     "desc": "Shell command run to power the speaker amp before speaking."},
     {"section": "audio", "key": "vosk_model_path", "type": "str",
      "default": base_path("modules", "models", "model-en-lgraph"),
      "env": "VOSK_MODEL_PATH", "desc": "Path to the Vosk speech-to-text model.",

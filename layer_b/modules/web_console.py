@@ -580,8 +580,8 @@ class Handler(BaseHTTPRequestHandler):
             BUS.publish("picarx/audio/mic_control", {"enabled": bool(body.get("enabled", True))})
             self._send(200, {"ok": True})
         elif self.path == "/speaker":
-            # audio_nodes gates TTS on this and re-runs the amp-enable
-            # command (robot_hat enable_speaker) on the off->on press.
+            # audio_nodes gates TTS on this and asks the safety daemon to
+            # re-assert the amp on the off->on press.
             BUS.publish("picarx/audio/speaker_control",
                         {"enabled": bool(body.get("enabled", True))})
             self._send(200, {"ok": True})
