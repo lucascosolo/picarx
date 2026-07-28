@@ -40,6 +40,13 @@ class ModuleRegistryOverlayTest(unittest.TestCase):
             stream.write("not json")
         self.assertEqual(load_registry(self.base, self.local), self.defaults)
 
+    def test_tracked_self_trainer_is_available_without_local_overlay(self):
+        registry = load_registry()
+        trainer = next(entry for entry in registry
+                       if entry["name"] == "self_trainer")
+        self.assertTrue(trainer["enabled"])
+        self.assertEqual(trainer["activation"]["mode"], "always")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -221,7 +221,7 @@ so the modules reload the combined files.
 
 ### Closing the loop — and proving it helps
 
-`self_trainer` (disabled by default) closes that round-trip on the robot itself:
+`self_trainer` closes that round-trip on the robot itself:
 while genuinely idle it snapshots its own learning stores, refines them in the
 sibling simulator as a `nice`-d subprocess, and folds the result back in *through
 the same online intakes the owning modules expose* — never becoming a second
@@ -270,8 +270,14 @@ The compact form only needs the setting you are changing, for example:
 {"self_trainer": {"enabled": true}}
 ```
 
-The local overlay is intentionally not committed. Keep the self-trainer
-disabled unless the sibling `picarx-training` checkout is present.
+The local overlay is intentionally not committed. The tracked registry keeps
+the self-trainer available by default, but it publishes a disabled status and
+does no work unless the sibling `picarx-training` checkout is present. Disable
+it in the local overlay on a constrained deployment:
+
+```json
+{"self_trainer": {"enabled": false}}
+```
 
 ### Configuration
 

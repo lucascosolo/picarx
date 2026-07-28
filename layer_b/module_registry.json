@@ -191,12 +191,9 @@
     "name": "self_trainer",
     "version": "0.1",
     "entrypoint": "self_trainer.py",
-    "enabled": false,
+    "enabled": true,
     "activation": {
-      "mode": "demand",
-      "topic": "picarx/system/training",
-      "enabled_field": "active",
-      "persistent": true
+      "mode": "always"
     }
   },
   {
