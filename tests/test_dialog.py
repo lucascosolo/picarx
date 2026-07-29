@@ -204,6 +204,40 @@ class DirectedRoutingTest(unittest.TestCase):
         self._directed(text="the weather is nice today")
         self.assertIsNone(self.d.bus.last(UNHANDLED))
 
+    def test_talk_about_a_capability_goes_to_chat_not_the_arbiter(self):
+        # Command-SHAPED only because it names a capability's vocabulary. No
+        # capability parses it and it's addressed to the robot in the second
+        # person, so it's conversation - and must not be spent from the
+        # command-repair budget.
+        for text in ("do you like music", "what do you think of the radio",
+                     "are you any good at dice"):
+            self.d.bus.clear()
+            self._directed(text=text)
+            self.assertEqual(self.d.bus.last(UNHANDLED)["text"], text, text)
+            self.assertIsNone(self.d.bus.last(UNCERTAIN), text)
+
+    def test_real_commands_still_reach_the_command_path(self):
+        # Instruction shape wins over second person ("can you play some music"),
+        # and so does a capability that genuinely parses the utterance.
+        for text in ("can you play some music", "turn off the radio",
+                     "do you know what time it is"):
+            self.d.bus.clear()
+            self._directed(text=text)
+            self.assertIsNotNone(self.d.bus.last(UNCERTAIN), text)
+            self.assertIsNone(self.d.bus.last(UNHANDLED), text)
+
+    def test_room_questions_still_escalate(self):
+        # A question opener alone is not second-person address: "is the radio
+        # on" is a status question the arbiter can repair into a real command.
+        self._directed(text="is the radio on")
+        self.assertIsNotNone(self.d.bus.last(UNCERTAIN))
+
+    def test_capability_talk_does_not_open_the_window(self):
+        self._directed(text="do you like music")
+        self.d.bus.clear()
+        self._directed(text="the weather is nice today")
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+
     def test_empty_or_missing_text_is_a_noop(self):
         self._directed(text="   ")
         self._directed(confidence=0.5)

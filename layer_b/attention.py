@@ -97,17 +97,31 @@ _QUESTION_OPENERS = {
 CHAT_MIN_TOKENS = 3
 
 
+def addresses_the_robot(text):
+    """True when an utterance speaks to the robot in the second person ("do
+    YOU like music", "what do YOU think").
+
+    This is the stronger half of looks_conversational, exposed on its own
+    because routers use it to distinguish "asking the robot something" from
+    "asking the room something": a question opener is ambiguous, but "you" is
+    a person addressing the thing in front of them."""
+    toks = speech_match.tokens(text)
+    if len(toks) < CHAT_MIN_TOKENS:
+        return False
+    return any(t in _SECOND_PERSON for t in toks)
+
+
 def looks_conversational(text):
     """True when an utterance is aimed at the robot as SPEECH rather than as a
     command - it addresses it in the second person, or opens like a question.
 
     Deliberately shallow: this only decides whether the utterance gets to be
     HEARD by the chat path, never whether anything is spent answering it."""
+    if addresses_the_robot(text):
+        return True
     toks = speech_match.tokens(text)
     if len(toks) < CHAT_MIN_TOKENS:
         return False
-    if any(t in _SECOND_PERSON for t in toks):
-        return True
     return toks[0] in _QUESTION_OPENERS
 
 

@@ -70,6 +70,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from broker_client import Bus
 import robot_config
 import attention
+import capabilities
+import speech_match
 
 import threading
 import time
@@ -202,6 +204,39 @@ class DialogBroker:
 
     # ---------- addressing: is this for me, and as what? ----------
 
+    def _is_talk_about_a_capability(self, text):
+        """True when an utterance only LOOKS like a command because it mentions
+        a capability's vocabulary, while actually being talk aimed at the robot
+        ("do you like music", "what do you think of the radio").
+
+        This is the capability-ownership question the roadmap's router
+        unification calls for, asked in the one place that decides where an
+        utterance goes. attention.classify() can only judge SHAPE, and shape
+        alone can't tell "play some music" from "do you like music" - both
+        carry radio vocabulary, so both were command-shaped and both went to
+        the LLM intent arbiter. The arbiter has a chat verdict for the second
+        case, but it is throttled by INTENT_REPAIR_COOLDOWN as a *command
+        repair* budget, so ordinary conversation was being dropped by a
+        cost control meant for misheard orders.
+
+        Three conditions, all required, so the reroute stays narrow:
+          - no capability actually PARSES it (a real MATCH is a real command,
+            and belongs on the command path regardless of how it's phrased);
+          - it isn't shaped like an instruction (looks_directed_command, so
+            "play me some music" and "turn off the radio" are untouched);
+          - it addresses the robot in the second person - the signal that this
+            is someone talking TO it rather than ordering it. A bare question
+            opener is deliberately not enough: "is the radio on" is a status
+            question the arbiter can still repair into a real command.
+        Nothing here can suppress a safety word: "stop"/"halt" utterances are
+        directed commands, and field_agent acts on them before this point."""
+        if speech_match.looks_directed_command(text):
+            return False
+        if not attention.addresses_the_robot(text):
+            return False
+        canon = speech_match.canonicalize(text)
+        return not capabilities.ROUTER.route(canon, text).matched
+
     def on_directed(self, payload):
         """Route ONE utterance field_agent could not handle as a local command.
         This is the addressing half of turn-taking, moved here so the broker is
@@ -219,7 +254,11 @@ class DialogBroker:
                                     re-extended (only wake / matched commands do,
                                     so a chatty TV can't hold it open forever);
               bare command shape -> the LLM intent arbiter (UNCERTAIN_TOPIC),
-                                    UNLESS it is already a repair (loop guard);
+                                    UNLESS it is already a repair (loop guard),
+                                    or no capability actually claims it as a
+                                    command and it is plainly talk aimed at the
+                                    robot (see _is_talk_about_a_capability),
+                                    in which case it is chat;
               chat shape         -> chat (UNHANDLED_TOPIC): talk aimed at the
                                     robot ("do you like music") with no wake
                                     word and no open window; window NOT opened;
@@ -260,6 +299,11 @@ class DialogBroker:
                              {"text": addressing.remainder, "confidence": confidence})
             print(f"Dialog: wake chat -> companion: '{addressing.remainder}'")
         elif addressing.reason == attention.COMMAND_SHAPE:
+            if self._is_talk_about_a_capability(text):
+                self.bus.publish(UNHANDLED_TOPIC,
+                                 {"text": text, "confidence": confidence})
+                print(f"Dialog: talk about a capability -> companion: '{text}'")
+                return
             # Loop guard: text the intent arbiter already repaired never
             # re-escalates - if its best repair still matched nothing, it dies.
             if from_repair:
