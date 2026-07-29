@@ -155,6 +155,12 @@ rollbacks, and commands, while human web controls remain available separately.
 The web tools page can begin/end the scoped session and shows its ID; disconnect
 always clears it.
 
+Progress (2026-07-28): transport exceptions during remote reads, edits, tests,
+or cancellation now fail closed: the SSH/helper session is closed, the remote
+state claim and coding/write authority are cleared, and the typed result says
+the session was disconnected. Typed helper errors still remain recoverable
+without throwing away a healthy session.
+
 ### Thinking-plane tool access (new priority)
 
 The conversational robot should receive the complete typed catalog of

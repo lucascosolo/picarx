@@ -305,6 +305,8 @@ class RemoteAssist:
         # and command output remain available on the result topic/web console.
         if not message.get("ok"):
             text = "Remote assist failed: " + str(message.get("error") or "unknown error")
+            if message.get("disconnected"):
+                text += " The remote session was closed after the connection failed."
         elif message.get("command") == "connect":
             text = "Connected. The remote project helper is ready."
         elif message.get("command") == "disconnect":
@@ -387,6 +389,28 @@ class RemoteAssist:
     def _release(self):
         self.bus.publish(STATE_RELEASE_TOPIC, {"owner": OWNER, "ts": time.time()})
 
+    def _drop_connection(self):
+        """Forget a session after the transport itself failed.
+
+        Helper errors are returned as typed ``ok=false`` responses and do not
+        imply a dead SSH channel. Exceptions while waiting for a response do:
+        retaining the REMOTE_ASSIST claim or write/coding authorization after
+        that point would make later tool calls operate on fiction.
+        """
+        with self.lock:
+            was_active = bool(self.connected or self.target or
+                              self.coding_session_id or self.write_authorized)
+            try:
+                self.session.close()
+            except Exception:
+                pass
+            self.connected = False
+            self.target = None
+            self.write_authorized = False
+            self.coding_session_id = None
+        if was_active:
+            self._release()
+
     def on_request(self, payload):
         threading.Thread(target=self._handle, args=(dict(payload),),
                          daemon=True, name="remote-assist-request").start()
@@ -394,8 +418,10 @@ class RemoteAssist:
     def _handle(self, payload):
         command = str(payload.get("command") or payload.get("op") or "").lower()
         request_id = str(payload.get("request_id") or uuid.uuid4().hex)[:80]
+        transport_request = False
         try:
             if command == "cancel":
+                transport_request = True
                 canceled = self.session.cancel(payload.get("target_request_id"))
                 self._publish({"ok": True, "command": command,
                                "request_id": request_id,
@@ -496,6 +522,7 @@ class RemoteAssist:
                         raise PermissionError(
                             "explicit confirmation is required for remote commands")
                     self._claim()
+                    transport_request = True
                     result = self.session.request(request)
                     response = {"ok": bool(result.get("ok")), "command": command,
                                 "request_id": request_id,
@@ -504,6 +531,7 @@ class RemoteAssist:
                     raise ValueError(f"unsupported remote command: {command}")
             self._publish(response)
         except Exception as e:
+            disconnected = False
             if command == "connect":
                 # A failed bootstrap or helper launch may have opened a
                 # partial SSH process; do not leave it attached or report a
@@ -516,8 +544,11 @@ class RemoteAssist:
                 self.target = None
                 self.write_authorized = False
                 self.coding_session_id = None
+            elif transport_request:
+                self._drop_connection()
+                disconnected = True
             self._publish({"ok": False, "command": command, "request_id": request_id,
-                           "error": str(e)[:500]})
+                           "error": str(e)[:500], "disconnected": disconnected})
 
     def run(self):
         self.bus.subscribe(REQUEST_TOPIC, self.on_request)

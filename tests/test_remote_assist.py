@@ -161,6 +161,8 @@ class FakeSession:
         self.requests = []
         self.cancel_calls = 0
         self.password = None
+        self.close_calls = 0
+        self.request_error = None
 
     def connect(self, host, user=None, port=None, project_root=".", password=None):
         self.connected = True
@@ -170,10 +172,13 @@ class FakeSession:
 
     def request(self, payload):
         self.requests.append(payload)
+        if self.request_error is not None:
+            raise self.request_error
         return {"ok": True, "result": {"path": payload.get("path", ".")}}
 
     def close(self):
         self.connected = False
+        self.close_calls += 1
 
     def cancel(self, target_request_id=None):
         self.cancel_calls += 1
@@ -212,6 +217,30 @@ class RemoteAssistTests(unittest.TestCase):
         remote._handle({"command": "cancel", "silent": True})
         self.assertEqual(session.cancel_calls, 1)
         self.assertTrue(remote.connected)
+
+    def test_transport_failure_clears_claim_and_session_authority(self):
+        session = FakeSession()
+        session.request_error = RuntimeError("SSH helper closed the session")
+        bus = harness.FakeBus()
+        remote = RemoteAssist(session=session, bus=bus)
+        remote._handle({"command": "connect", "host": "192.168.1.20"})
+        remote._handle({"command": "begin_coding", "confirmed": True})
+        coding_id = remote.coding_session_id
+        remote._handle({"command": "authorize_write", "confirmed": True})
+        self.assertTrue(remote.write_authorized)
+
+        remote._handle({"command": "read", "path": "main.py"})
+
+        self.assertFalse(remote.connected)
+        self.assertIsNone(remote.target)
+        self.assertIsNone(remote.coding_session_id)
+        self.assertFalse(remote.write_authorized)
+        self.assertGreaterEqual(session.close_calls, 1)
+        result = bus.last("picarx/tools/remote_assist/result")
+        self.assertTrue(result["disconnected"])
+        self.assertEqual(bus.last("picarx/state/release")["owner"],
+                         "remote_assist")
+        self.assertNotEqual(coding_id, remote.coding_session_id)
 
     def test_thinking_destructive_work_requires_active_coding_session(self):
         session = FakeSession()
