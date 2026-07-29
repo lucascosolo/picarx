@@ -61,6 +61,21 @@ class CompanionToolTest(unittest.TestCase):
         self.assertIn("delay", out.lower())
         self.assertEqual(self.c.bus.of(companion.REMINDER_SET_TOPIC), [])
 
+    def test_async_tool_result_is_correlated_for_next_model_step(self):
+        parent = self.c
+        class ReplyBus(harness.FakeBus):
+            def publish(self, topic, payload):
+                super().publish(topic, payload)
+                if topic == companion.REMINDER_SET_TOPIC:
+                    parent.on_reminder_result({
+                        "request_id": payload["request_id"], "ok": True,
+                        "result": {"id": "r1"}})
+        self.c.bus = ReplyBus()
+        out = self.c._execute_tool("schedule_reminder", {
+            "message": "call mom", "delay_minutes": 15})
+        self.assertIn("completed", out.lower())
+        self.assertIn("r1", out)
+
     def test_start_and_stop_following_publish_mode(self):
         self.c._execute_tool("start_following", {})
         self.c._execute_tool("stop_following", {})
@@ -90,7 +105,7 @@ class CompanionToolTest(unittest.TestCase):
     def test_thinking_tool_journal_keeps_outcome_but_not_sensitive_fields(self):
         out = self.c._run_thinking_tool(
             "create_note", {"text": "private note", "confirmed": True}, "u1")
-        self.assertIn("saved", out.lower())
+        self.assertIn("request sent", out.lower())
         events = self.c.bus.of("picarx/decision")
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["choice"]["fields"], ["text"])
@@ -145,7 +160,7 @@ class CompanionToolTest(unittest.TestCase):
 
     def test_note_and_meeting_tools_publish_typed_requests(self):
         out = self.c._execute_tool("create_note", {"text": "buy milk"})
-        self.assertIn("saved", out.lower())
+        self.assertIn("request sent", out.lower())
         self.assertEqual(self.c.bus.last(companion.NOTES_TOPIC)["command"], "create")
         self.c._execute_tool("control_meeting_notes",
                              {"action": "start", "confirmed": True})

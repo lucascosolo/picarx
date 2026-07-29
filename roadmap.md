@@ -128,10 +128,14 @@ including `describe_tools`, `get_robot_status`, and typed radio control;
 movement tools are filtered at both catalog construction and dispatch. The
 tool loop is expanded to eight rounds/16 calls with a hard exhaustion reply,
 and latest state mirrors are subscribed for honest “what am I doing?” answers.
-Next: add correlated asynchronous tool results and cancellation so a
-multi-tool plan can observe each daemon’s actual result before choosing its
-next step, and add explicit plan/approval state for long-running or
+Next: add cancellation and explicit plan/approval state for long-running or
 destructive work.
+
+Progress (2026-07-28): Companion now attaches correlation IDs to reminder,
+notes, and remote-assist requests, briefly waits for fast daemon results, and
+feeds bounded structured results back into the next model round. Slow work is
+reported as pending instead of being invented as complete; the status tool
+remains the read-only fallback.
 
 Growth architecture progress (2026-07-28): thinking-tool requests and
 bounded outcomes now enter the existing `picarx/decision` journal with only

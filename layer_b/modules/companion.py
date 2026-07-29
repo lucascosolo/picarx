@@ -287,11 +287,13 @@ EPISODE_TRIGGERS = (
 # motion at all.
 MAX_TOOL_ROUNDS = 8          # bounded, natural multi-step tool conversations
 MAX_TOOL_CALLS = 16          # cap parallel/repeated calls in one utterance
+TOOL_RESULT_WAIT_SEC = 0.8    # short wait; long jobs remain observable as pending
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
 REMINDER_CONTROL_TOPIC = "picarx/tools/reminder/control"
 REMINDER_RESULT_TOPIC = "picarx/tools/reminder/result"
 REMINDER_STATE_TOPIC = "picarx/tools/reminder/state"
 NOTES_TOPIC = "picarx/tools/notes"
+NOTES_RESULT_TOPIC = "picarx/tools/notes/result"
 FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
 BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 HEALTH_STATE_TOPIC = "picarx/health/state"
@@ -597,6 +599,8 @@ class Companion:
         self.latest_follow_status = None
         self.latest_remote_result = None
         self.latest_radio_state = None
+        self._tool_result_condition = threading.Condition()
+        self._tool_results = {}
         # The reminder daemon owns timers; this is only a small read-only cache
         # of its published state so follow-up questions can be answered locally
         # without asking Claude to reconstruct an asynchronous tool call.
@@ -864,10 +868,66 @@ class Companion:
     def on_remote_result(self, payload):
         with self.lock:
             self.latest_remote_result = dict(payload or {})
+        self._record_tool_result(payload)
 
     def on_radio_state(self, payload):
         with self.lock:
             self.latest_radio_state = dict(payload or {})
+
+    def on_notes_result(self, payload):
+        self._record_tool_result(payload)
+
+    def _record_tool_result(self, payload):
+        request_id = str((payload or {}).get("request_id") or "").strip()
+        if not request_id:
+            return
+        condition = getattr(self, "_tool_result_condition", None)
+        if condition is None:
+            self._tool_result_condition = condition = threading.Condition()
+        with condition:
+            results = getattr(self, "_tool_results", None)
+            if results is None:
+                self._tool_results = results = {}
+            results[request_id] = dict(payload or {})
+            # Keep the correlation cache bounded if a daemon repeats an old
+            # result or a caller never waits for a long-running operation.
+            if len(results) > 128:
+                for old in list(results)[:32]:
+                    results.pop(old, None)
+            condition.notify_all()
+
+    def _dispatch_thinking_request(self, topic, payload, result_topic=None):
+        """Publish a typed request and briefly correlate its daemon result."""
+        request_id = uuid.uuid4().hex
+        request = dict(payload or {}, request_id=request_id)
+        self.bus.publish(topic, request)
+        if not result_topic:
+            return f"request sent (id {request_id[:8]})."
+        condition = getattr(self, "_tool_result_condition", None)
+        if condition is None:
+            self._tool_result_condition = condition = threading.Condition()
+        deadline = time.monotonic() + TOOL_RESULT_WAIT_SEC
+        with condition:
+            while request_id not in getattr(self, "_tool_results", {}):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                condition.wait(remaining)
+            result = getattr(self, "_tool_results", {}).pop(request_id, None)
+        if result is None:
+            return f"request sent (id {request_id[:8]}); result is still pending."
+        if not result.get("ok"):
+            return "request failed: " + str(result.get("error") or "unknown error")[:400]
+        value = result.get("result")
+        if value is None:
+            return f"request completed (id {request_id[:8]})."
+        # Preserve bounded structured results so the model can use a read/list
+        # result in its next tool call, while never exposing the request body.
+        try:
+            rendered = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            rendered = str(value)
+        return f"request completed (id {request_id[:8]}): {rendered[:20000]}"
 
     def on_unhandled(self, payload):
         text = (payload.get("text") or "").strip()
@@ -937,6 +997,7 @@ class Companion:
     def on_reminder_result(self, payload):
         """Ingest list/set/delete results, including requests made by tools."""
         payload = dict(payload or {})
+        self._record_tool_result(payload)
         result = payload.get("result") or {}
         rows = result.get("reminders") if isinstance(result, dict) else None
         if isinstance(rows, list):
@@ -1774,13 +1835,20 @@ class Companion:
             "ts": time.time(),
         })
         outcome = self._execute_tool(name, tool_input)
+        outcome_text = str(outcome).lower()
+        if "request failed" in outcome_text or "didn't work" in outcome_text:
+            outcome_class = "failed"
+        elif "still pending" in outcome_text:
+            outcome_class = "pending"
+        else:
+            outcome_class = "completed"
         self.bus.publish("picarx/decision", {
             "source": "companion", "kind": "thinking_tool",
             "choice": {"tool": str(name), "phase": "completed",
-                        "ok": not str(outcome).lower().startswith(
-                            ("unknown tool", "that didn't work"))},
+                        "outcome": outcome_class,
+                        "ok": outcome_class != "failed"},
             "tool_use_id": str(tool_use_id or "")[:100] or None,
-            "reason": "tool result: " + " ".join(str(outcome).split())[:240],
+            "reason": "thinking tool returned a bounded result",
             "ts": time.time(),
         })
         return outcome
@@ -1856,8 +1924,9 @@ class Companion:
                     req["at"] = tool_input["at"]
                 if "delay_minutes" not in req and "at" not in req:
                     return "Need either a delay in minutes or an exact time."
-                self.bus.publish(REMINDER_SET_TOPIC, req)
-                return "Reminder scheduled."
+                result = self._dispatch_thinking_request(
+                    REMINDER_SET_TOPIC, req, REMINDER_RESULT_TOPIC)
+                return "Reminder scheduled; " + result
             if name == "manage_reminders":
                 operation = str(tool_input.get("operation") or "").lower()
                 if operation not in {"list", "delete"}:
@@ -1869,8 +1938,9 @@ class Companion:
                 for key in ("id", "query", "confirmed"):
                     if tool_input.get(key) not in (None, ""):
                         request[key] = tool_input[key]
-                self.bus.publish(REMINDER_CONTROL_TOPIC, request)
-                return f"Reminder {operation} request sent."
+                result = self._dispatch_thinking_request(
+                    REMINDER_CONTROL_TOPIC, request, REMINDER_RESULT_TOPIC)
+                return f"Reminder {operation}; {result}"
             if name == "create_note":
                 text = str(tool_input.get("text") or "").strip()
                 if not text:
@@ -1878,8 +1948,9 @@ class Companion:
                 request = {"command": "create", "text": text, "source": "voice"}
                 if tool_input.get("title"):
                     request["title"] = str(tool_input["title"])[:120]
-                self.bus.publish(NOTES_TOPIC, request)
-                return "Note saved."
+                result = self._dispatch_thinking_request(
+                    NOTES_TOPIC, request, NOTES_RESULT_TOPIC)
+                return "Note request sent; " + result
             if name == "manage_notes":
                 operation = str(tool_input.get("operation") or "").lower()
                 if operation not in {"list", "get", "search", "export", "delete"}:
@@ -1891,8 +1962,9 @@ class Companion:
                 for key in ("id", "query", "confirmed"):
                     if tool_input.get(key) not in (None, ""):
                         request[key] = tool_input[key]
-                self.bus.publish(NOTES_TOPIC, request)
-                return f"Notes {operation} request sent."
+                result = self._dispatch_thinking_request(
+                    NOTES_TOPIC, request, NOTES_RESULT_TOPIC)
+                return f"Notes {operation}; {result}"
             if name == "control_meeting_notes":
                 action = str(tool_input.get("action") or "").lower()
                 if action not in {"start", "pause", "resume", "stop"}:
@@ -1903,8 +1975,9 @@ class Companion:
                 for key in ("title", "id", "confirmed"):
                     if tool_input.get(key) not in (None, ""):
                         request[key] = tool_input[key]
-                self.bus.publish(NOTES_TOPIC, request)
-                return f"Meeting notes {action} request sent."
+                result = self._dispatch_thinking_request(
+                    NOTES_TOPIC, request, NOTES_RESULT_TOPIC)
+                return f"Meeting notes {action}; {result}"
             if name == "start_following":
                 self.bus.publish(FOLLOW_CONTROL_TOPIC, {"enabled": True})
                 return "Following started; movement is safety-checked."
@@ -1964,9 +2037,9 @@ class Companion:
                     value = tool_input.get(key)
                     if value not in (None, ""):
                         request[key] = value
-                self.bus.publish(REMOTE_ASSIST_TOPIC, request)
-                return ("Connecting to the host over verified SSH and starting my "
-                        "scoped helper there.")
+                result = self._dispatch_thinking_request(
+                    REMOTE_ASSIST_TOPIC, request, REMOTE_RESULT_TOPIC)
+                return ("Connecting to the host over verified SSH; " + result)
             if name == "remote_project_operation":
                 operation = str(tool_input.get("operation") or "").lower()
                 allowed = {"status", "list", "read", "search", "stat", "logs",
@@ -1991,8 +2064,9 @@ class Companion:
                         # the helper's run argument therefore travels as
                         # argv to avoid overwriting that operation name.
                         request["argv" if operation == "run" and key == "command" else key] = value
-                self.bus.publish(REMOTE_ASSIST_TOPIC, request)
-                return f"Remote {operation} request sent; I will report the result."
+                result = self._dispatch_thinking_request(
+                    REMOTE_ASSIST_TOPIC, request, REMOTE_RESULT_TOPIC)
+                return f"Remote {operation}; {result}"
         except Exception as e:
             print(f"Companion: tool '{name}' failed: {e}")
             return "That didn't work."
@@ -2091,6 +2165,7 @@ class Companion:
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
         self.bus.subscribe(REMINDER_STATE_TOPIC, self.on_reminder_state)
         self.bus.subscribe(REMINDER_RESULT_TOPIC, self.on_reminder_result)
+        self.bus.subscribe(NOTES_RESULT_TOPIC, self.on_notes_result)
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
         self.bus.subscribe(IMU_EVENT_TOPIC, self.on_imu_event)
         self.bus.subscribe(SELF_TRAINER_STATUS_TOPIC, self.on_self_trainer_status)
