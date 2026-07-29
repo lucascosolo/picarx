@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402,F401
 
 from repository_updater import (RepositoryUpdater, STATUS_TOPIC,
-                                safe_to_update)  # noqa: E402
+                                safe_to_update,
+                                service_environment_health)  # noqa: E402
 
 
 class GitFake:
@@ -61,6 +62,40 @@ class RepositoryUpdaterTests(unittest.TestCase):
         self.assertFalse(safe_to_update({"state": "IDLE", "claims": [
             {"state": "GESTURE_TRACKING"}]}, {}))
         self.assertFalse(safe_to_update({"state": "IDLE", "claims": ["bad"]}, {}))
+
+    def test_service_environment_health_accepts_managed_contract(self):
+        environment = {
+            "VIRTUAL_ENV": "/opt/picarx/venv",
+            "PATH": "/opt/picarx/venv/bin:/usr/bin",
+            "PYTHONNOUSERSITE": "1",
+        }
+        healthy, detail = service_environment_health(
+            environment=environment,
+            executable="/opt/picarx/venv/bin/python3.12",
+            prefix="/opt/picarx/venv")
+        self.assertTrue(healthy)
+        self.assertIn("managed Python environment", detail)
+
+    def test_service_environment_health_rejects_wrong_interpreter_contract(self):
+        base = {
+            "VIRTUAL_ENV": "/opt/picarx/venv",
+            "PATH": "/opt/picarx/venv/bin:/usr/bin",
+            "PYTHONNOUSERSITE": "1",
+        }
+        cases = [
+            ({**base, "PYTHONNOUSERSITE": "0"},
+             "/opt/picarx/venv/bin/python3.12", "/opt/picarx/venv"),
+            ({**base, "PATH": "/usr/bin:/opt/picarx/venv/bin"},
+             "/opt/picarx/venv/bin/python3.12", "/opt/picarx/venv"),
+            (base, "/usr/bin/python3", "/usr"),
+        ]
+        for environment, executable, prefix in cases:
+            with self.subTest(environment=environment, executable=executable):
+                healthy, detail = service_environment_health(
+                    environment=environment, executable=executable,
+                    prefix=prefix)
+                self.assertFalse(healthy)
+                self.assertTrue(detail)
 
     def test_failed_pre_restart_health_rolls_back_and_resumes(self):
         self.updater._run_update("approved", "req-1")

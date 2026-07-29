@@ -17,7 +17,8 @@ from broker_client import Bus
 from module_lifecycle import NeedPlanner, STATE_TOPIC
 from module_registry import load_registry as read_registry
 from repository_updater import (HEALTH_TOPIC, CONTROL_TOPIC,
-                                 RepositoryUpdater)
+                                 RepositoryUpdater,
+                                 service_environment_health)
 
 REGISTRY_PATH = robot_config.base_path("module_registry.json")
 LOCAL_REGISTRY_PATH = robot_config.base_path("module_registry.local.json")
@@ -313,6 +314,9 @@ def _restart_after_update():
 
 
 def _services_healthy():
+    environment_ok, environment_detail = service_environment_health()
+    if not environment_ok:
+        return False, f"service environment invalid: {environment_detail}"
     required = ("robot_state", "camera_controller", "audio_nodes",
                 "arbiter", "field_agent")
     missing = [name for name in required if name not in running_processes]

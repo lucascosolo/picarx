@@ -34,6 +34,47 @@ class UpdateError(RuntimeError):
     """A recoverable update/preflight failure."""
 
 
+def service_environment_health(environment=None, executable=None, prefix=None):
+    """Validate the interpreter contract expected by production services.
+
+    The updater runs inside the orchestrator, so a successful Python compile
+    is not enough evidence that a restarted service will use the repaired
+    virtual environment. Check only the contract that the repair script
+    deliberately installs: ``VIRTUAL_ENV``, the interpreter/prefix, the first
+    PATH entry, and disabled user-site packages. The arguments are injectable
+    so this remains a hardware-free, deterministic check.
+    """
+    environment = dict(os.environ if environment is None else environment)
+    executable = executable or sys.executable
+    prefix = prefix or sys.prefix
+    virtual_env = str(environment.get("VIRTUAL_ENV") or "").strip()
+    if not virtual_env:
+        return False, "VIRTUAL_ENV is not set"
+    if not os.path.isabs(virtual_env):
+        return False, "VIRTUAL_ENV must be an absolute path"
+    configured_env = os.path.abspath(virtual_env)
+    virtual_env = os.path.realpath(virtual_env)
+    if os.path.realpath(str(prefix)) != virtual_env:
+        return False, (f"Python prefix {prefix} is not the configured venv "
+                       f"{virtual_env}")
+
+    # A venv launcher is often a symlink to the base interpreter. Validate
+    # the launcher location rather than resolving the executable itself; the
+    # prefix check above is what proves Python initialized the venv correctly.
+    executable = os.path.abspath(os.path.expanduser(str(executable)))
+    expected_bins = {os.path.join(configured_env, "bin"),
+                     os.path.join(virtual_env, "bin")}
+    if os.path.dirname(executable) not in expected_bins:
+        return False, f"interpreter is outside the configured venv: {executable}"
+
+    path = str(environment.get("PATH") or "").split(os.pathsep)
+    if not path or os.path.realpath(path[0]) != virtual_env + os.sep + "bin":
+        return False, "PATH does not put the configured venv first"
+    if str(environment.get("PYTHONNOUSERSITE") or "") != "1":
+        return False, "PYTHONNOUSERSITE must be 1 for service isolation"
+    return True, f"managed Python environment validated: {virtual_env}"
+
+
 def safe_to_update(state_payload, health_payload=None):
     """Return whether the observed robot state permits maintenance.
 

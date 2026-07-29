@@ -89,6 +89,12 @@ power loss during merge therefore still leaves the previous commit and target
 recorded for startup recovery; marker write failure aborts before changing the
 checkout. Regression tests verify the marker exists at merge time.
 
+Progress (2026-07-28): post-update startup health now also fails closed when
+the orchestrator is not running from the configured venv, the venv launcher is
+not selected first on `PATH`, or user-site packages are enabled. This catches
+service-environment drift before a new revision is accepted; target-Pi
+systemd validation remains outstanding.
+
 Progress (2026-07-28): the legacy `setup_python.sh` entry point now delegates
 to `repair_python_environment.sh` instead of installing into the PEP-668
 system interpreter with `--break-system-packages`. Both deployment entry
