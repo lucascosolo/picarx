@@ -83,6 +83,7 @@ from semantic_store import SemanticStore
 from spatial_store import SpatialStore
 import speech_match
 import tool_catalog
+import capabilities
 
 import threading
 import queue
@@ -580,6 +581,21 @@ TOOLS = [
          "coding_session_id": {"type": "string"}},
          "required": ["operation"]}},
 ]
+
+# Capabilities that declared themselves to the thinking plane (layer_b/
+# capabilities.py) are appended to the hand-written list above rather than
+# copied into it. A capability used to be sayable but not thinkable: dice and
+# clock could be triggered by a phrase the router recognized, and were
+# invisible to the robot's own reasoning, so it could not decide to check the
+# time or leave something to a die roll. Declaring the tool next to the
+# capability's phrase rules means one declaration opens both doors.
+#
+# The registry holds no movement capability and must not - that exclusion is
+# enforced again below, after the merge, so a future capability cannot acquire
+# motor authority by declaring a tool.
+CAPABILITY_TOOLS = [tool.spec() for _, tool in capabilities.thinking_tools()]
+TOOLS = TOOLS + [spec for spec in CAPABILITY_TOOLS
+                 if spec["name"] not in {t["name"] for t in TOOLS}]
 
 # Movement stays on the instant local command path and is deliberately not
 # offered to the slower thinking model. Keep the exclusion centralized so a
@@ -2309,6 +2325,18 @@ class Companion:
         if name not in THINKING_TOOL_NAMES:
             return f"Unknown tool: {name}"
         try:
+            # Registry-declared capabilities dispatch generically: the
+            # capability builds its own payload from the model's arguments and
+            # publishes to the same topic a spoken phrase would have hit, so
+            # both doors into a skill end at one place. No per-tool branch here
+            # means adding a capability needs no edit to this module.
+            capability, tool = capabilities.tool_named(name)
+            if tool is not None:
+                built = tool.build(tool_input or {})
+                if isinstance(built, str):
+                    return built          # the capability declined; tell the model
+                return self._dispatch_thinking_request(
+                    capability.topic, built, result_topic=tool.result_topic)
             if name == "describe_tools":
                 rows = []
                 for tool in THINKING_TOOLS:
@@ -2794,6 +2822,12 @@ class Companion:
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
         self.bus.subscribe(IMU_EVENT_TOPIC, self.on_imu_event)
         self.bus.subscribe(SELF_TRAINER_STATUS_TOPIC, self.on_self_trainer_status)
+        # Result topics for registry-declared capabilities, so a tool the
+        # robot chose to use reports its OUTCOME back ("I rolled a 4"), not
+        # just an acknowledgement that a request was sent.
+        for _, tool in capabilities.thinking_tools():
+            if tool.result_topic:
+                self.bus.subscribe(tool.result_topic, self._record_tool_result)
 
         for _ in range(WORKER_THREADS):
             threading.Thread(target=self._worker_loop, daemon=True).start()

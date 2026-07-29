@@ -26,7 +26,7 @@ vocabulary, and must never become a registered capability.
 """
 import re
 
-from capability_registry import Capability, Router
+from capability_registry import Capability, CapabilityTool, Router
 
 REMOTE_TOPIC = "picarx/tools/remote_assist"
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
@@ -367,9 +367,52 @@ RADIO = Capability(
     ],
 )
 
+def _dice_tool(tool_input):
+    """The model's typed arguments, bounded the same way the spoken parser
+    bounds them. The capability keeps the last word on its own limits: a
+    request outside them comes back as a sentence, not a publish."""
+    command = str((tool_input or {}).get("command") or "roll").lower()
+    if command == "flip":
+        return {"command": "flip"}
+    if command != "roll":
+        return "I can roll dice or flip a coin, nothing else."
+    count = int((tool_input or {}).get("count") or 1)
+    sides = int((tool_input or {}).get("sides") or 6)
+    if not 1 <= count <= MAX_DICE:
+        return f"I can roll between 1 and {MAX_DICE} dice at once."
+    if not MIN_DICE_SIDES <= sides <= MAX_DICE_SIDES:
+        return (f"A die needs between {MIN_DICE_SIDES} and "
+                f"{MAX_DICE_SIDES} sides.")
+    return {"command": "roll", "count": count, "sides": sides}
+
+
+def _clock_tool(tool_input):
+    command = str((tool_input or {}).get("command") or "time").lower()
+    if command not in ("time", "date", "datetime"):
+        return "I can read the time, the date, or both."
+    return {"command": command}
+
+
 DICE = Capability(
     name="dice",
     topic=DICE_TOPIC,
+    tool=CapabilityTool(
+        name="roll_dice",
+        description="Roll dice or flip a coin, and hear the outcome. Use it "
+                    "whenever chance should decide something - the person asks "
+                    "you to, or you are choosing between options and would "
+                    "rather leave it to luck than pick. The result is real "
+                    "randomness from the robot, not a number you made up.",
+        input_schema={"type": "object", "properties": {
+            "command": {"type": "string", "enum": ["roll", "flip"]},
+            "count": {"type": "integer", "minimum": 1, "maximum": MAX_DICE,
+                      "description": "how many dice (roll only)"},
+            "sides": {"type": "integer", "minimum": MIN_DICE_SIDES,
+                      "maximum": MAX_DICE_SIDES,
+                      "description": "sides per die (roll only), 6 by default"}},
+            "required": ["command"]},
+        build=_dice_tool,
+        result_topic=DICE_TOPIC + "/result"),
     keywords=("dice", "coin flip", "flip a coin"),
     say="roll a dice / roll two dice / roll a d20 / flip a coin",
     description="rolls dice and flips coins locally - no network, no thinking, "
@@ -387,6 +430,18 @@ DICE = Capability(
 CLOCK = Capability(
     name="clock",
     topic=CLOCK_TOPIC,
+    tool=CapabilityTool(
+        name="read_clock",
+        description="Read the current local time and date off the robot's own "
+                    "clock. Use it whenever the actual time matters - working "
+                    "out how long ago something happened, whether it is late, "
+                    "or what to call today - rather than guessing from context.",
+        input_schema={"type": "object", "properties": {
+            "command": {"type": "string", "enum": ["time", "date", "datetime"],
+                        "description": "which to read; 'datetime' for both"}},
+            "required": ["command"]},
+        build=_clock_tool,
+        result_topic=CLOCK_TOPIC + "/result"),
     keywords=("what time", "the time", "what day", "what date", "the date"),
     say="what time is it / what's the date / what day is it",
     description="reads the current local time and date off my own clock - no "
@@ -424,3 +479,15 @@ def keywords():
 def describe():
     """Catalog entries for picarx/tools/available and the thinking plane."""
     return ROUTER.describe()
+
+
+def thinking_tools():
+    """(capability, CapabilityTool) for every capability that has declared
+    itself to the thinking plane. companion.py merges these into the typed
+    tool list it hands the model, so a capability declared here is reachable
+    BOTH by a spoken phrase and by the robot's own decision to use it."""
+    return ROUTER.tools()
+
+
+def tool_named(name):
+    return ROUTER.tool_named(name)

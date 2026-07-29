@@ -46,6 +46,45 @@ ESCALATE = "escalate"
 UNCLAIMED = "unclaimed"
 
 
+class CapabilityTool:
+    """How a capability offers itself to the THINKING plane.
+
+    A capability has two doors. `rules` is the fast one: a phrase the person
+    said, matched on-board, no network, no thinking. This is the other one -
+    the typed description the model sees, so the robot can decide *for itself*
+    that rolling a die is the right thing to do right now, instead of only
+    reacting when someone speaks a phrase the table happens to contain.
+
+    Both doors are declared side by side on purpose. They used to live in
+    different files (a regex table here, a hand-written JSON schema in
+    companion.py's TOOLS list), which meant a capability could be sayable but
+    not thinkable - dice and clock were exactly that. Declaring the tool here
+    means adding a capability makes it available to both, once.
+
+    `build(tool_input) -> payload dict` converts the model's typed arguments
+    into the same bus payload a spoken phrase would have produced, so both
+    doors end at one publish. Returning a STRING instead means "I won't do
+    that", and the string goes back to the model as the tool result - the
+    capability, not the model, gets the final word on its own arguments.
+    """
+
+    def __init__(self, name, description, input_schema=None, build=None,
+                 result_topic=None):
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema or {"type": "object", "properties": {},
+                                             "required": []}
+        self.build = build or (lambda tool_input: dict(tool_input or {}))
+        # Where the daemon answers, when the model should see the outcome
+        # ("what did I roll?") rather than just an acknowledgement.
+        self.result_topic = result_topic
+
+    def spec(self):
+        """The tool definition as the model API expects it."""
+        return {"name": self.name, "description": self.description,
+                "input_schema": self.input_schema}
+
+
 class Capability:
     """One declared skill: what it answers to, and how to build its request.
 
@@ -57,9 +96,12 @@ class Capability:
     """
 
     def __init__(self, name, topic=None, rules=(), keywords=(), say="",
-                 description="", escalate=True):
+                 description="", escalate=True, tool=None):
         self.name = name
         self.topic = topic
+        # Optional CapabilityTool: the same skill, offered to the thinking
+        # plane instead of only to the phrase matcher.
+        self.tool = tool
         self.rules = tuple(rules)
         self.keywords = tuple(dict.fromkeys(keywords))
         self.say = say
@@ -144,6 +186,20 @@ class Router:
 
     def describe(self):
         return [c.describe() for c in self.capabilities]
+
+    def tools(self):
+        """Every capability that has declared itself to the thinking plane,
+        as (capability, CapabilityTool) pairs."""
+        return [(c, c.tool) for c in self.capabilities if c.tool is not None]
+
+    def tool_named(self, name):
+        """(capability, tool) for a tool call the model made, or (None, None).
+        The registry - not the caller - owns the name→capability mapping, so
+        there is one place a tool name is resolved."""
+        for capability, tool in self.tools():
+            if tool.name == name:
+                return capability, tool
+        return None, None
 
     def owner_of(self, text):
         """The first capability whose vocabulary appears in `text`, else None.

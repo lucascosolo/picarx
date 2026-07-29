@@ -9,6 +9,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
 
+import capabilities  # noqa: E402
 import companion  # noqa: E402
 from semantic_store import SemanticStore  # noqa: E402
 
@@ -437,6 +438,51 @@ class CompanionToolTest(unittest.TestCase):
         reply = self.c._chat_with_tools(client, [{"role": "user", "content": "hi"}])
         self.assertEqual(reply, "Just chatting.")
         self.assertEqual(len(client.messages.calls), 1)  # no extra round
+
+    def test_registry_capabilities_are_offered_to_the_thinking_plane(self):
+        # A capability that declares a tool next to its phrase rules is
+        # reachable by the robot's own decision, not only by a spoken phrase.
+        names = {t["name"] for t in companion.THINKING_TOOLS}
+        for _, tool in capabilities.thinking_tools():
+            self.assertIn(tool.name, names, tool.name)
+        self.assertIn("roll_dice", names)
+        self.assertIn("read_clock", names)
+
+    def test_capability_tool_publishes_the_same_payload_as_speech(self):
+        parent = self.c
+
+        class ReplyBus(harness.FakeBus):
+            def publish(self, topic, payload):
+                super().publish(topic, payload)
+                if topic == capabilities.DICE_TOPIC:
+                    parent._record_tool_result({
+                        "request_id": payload["request_id"], "ok": True,
+                        "result": {"values": [4], "spoken": "4."}})
+
+        self.c.bus = ReplyBus()
+        out = self.c._execute_tool("roll_dice", {"command": "roll", "sides": 20})
+        request = self.c.bus.last(capabilities.DICE_TOPIC)
+        self.assertEqual(request["command"], "roll")
+        self.assertEqual(request["sides"], 20)
+        self.assertEqual(request["count"], 1)
+        self.assertIn("4", out)      # the model sees the outcome, not just an ack
+
+    def test_capability_keeps_the_last_word_on_its_own_bounds(self):
+        out = self.c._execute_tool("roll_dice",
+                                   {"command": "roll", "count": 10000})
+        self.assertIsNone(self.c.bus.last(capabilities.DICE_TOPIC))  # nothing sent
+        self.assertIn("1", out)      # explained back to the model instead
+
+    def test_clock_tool_reaches_the_clock_capability(self):
+        self.c._execute_tool("read_clock", {"command": "date"})
+        self.assertEqual(self.c.bus.last(capabilities.CLOCK_TOPIC)["command"],
+                         "date")
+
+    def test_registry_tools_cannot_be_movement(self):
+        # The registry declares no movement capability, and must not: motion
+        # stays on the local safety path.
+        for capability, tool in capabilities.thinking_tools():
+            self.assertNotIn(tool.name, companion.MOVEMENT_TOOL_NAMES)
 
     def test_tool_loop_bounded(self):
         # A model that keeps calling tools forever must stop at MAX_TOOL_ROUNDS.

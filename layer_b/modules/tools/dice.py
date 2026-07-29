@@ -51,6 +51,19 @@ def _clamp_int(value, default, low, high):
     return max(low, min(high, number))
 
 
+def _correlated(result, request):
+    """The result, plus the correlation keys a thinking-plane caller waits on.
+
+    A request that arrived from a spoken phrase carries no request_id and the
+    payload is unchanged - the extra keys only appear when someone is actually
+    waiting for the answer, which is what lets the robot use its own dice roll
+    in a sentence instead of only speaking it aloud."""
+    request_id = str((request or {}).get("request_id") or "").strip()
+    if not request_id:
+        return result
+    return dict(result, request_id=request_id, ok=True, result=result)
+
+
 class Dice:
     def __init__(self, rng=None):
         self.bus = Bus()
@@ -90,7 +103,7 @@ class Dice:
             result["ts"] = time.time()
             print(f"Dice: {result}")
             self._say(result["spoken"])
-            self.bus.publish(RESULT_TOPIC, result)
+            self.bus.publish(RESULT_TOPIC, _correlated(result, payload))
             self.bus.publish(DECISION_TOPIC, {
                 "source": "dice", "kind": "tool_result",
                 "choice": {k: result[k] for k in ("command", "count", "sides",

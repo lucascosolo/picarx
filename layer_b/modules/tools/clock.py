@@ -81,6 +81,17 @@ def spoken_date(now):
     return f"{now.strftime('%A')}, {now.strftime('%B')} {_ordinal(now.day)}"
 
 
+def _correlated(result, request):
+    """The result, plus the correlation keys a thinking-plane caller waits on.
+    Spoken requests carry no request_id and are published unchanged; the extra
+    keys appear only when the robot asked itself the question and is waiting
+    for the answer to use in a sentence."""
+    request_id = str((request or {}).get("request_id") or "").strip()
+    if not request_id:
+        return result
+    return dict(result, request_id=request_id, ok=True, result=result)
+
+
 class Clock:
     def __init__(self, clock=None):
         self.bus = Bus()
@@ -109,7 +120,7 @@ class Clock:
             print(f"Clock: {result['spoken']}")
             self.bus.publish(SPEAK_TOPIC, {"text": result["spoken"],
                                            "ts": result["ts"]})
-            self.bus.publish(RESULT_TOPIC, result)
+            self.bus.publish(RESULT_TOPIC, _correlated(result, payload))
         except Exception as e:                       # never kill the callback
             print(f"Clock: request failed: {e}")
 
