@@ -246,6 +246,10 @@ targets; and never imply that label memory changed detector weights.
 - **Short local clips:** bounded local audio/video capture/playback/delete with
   RobotState ownership, privacy confirmation, interruptibility, and storage
   limits.
+  Progress (2026-07-28): a shared `ClipStore` now provides generated-ID-only
+  paths, atomic media/metadata finalization, incomplete-capture cleanup, and
+  bounded per-clip/count/total-storage limits. Capture and playback control
+  integration remains next.
 - **Location graph:** completed telemetry/provenance and veto evidence remain
   authoritative. Later add validated fingerprint thresholds, directed edges and
   traversal timestamps, conservative IMU quality policy, audited merge/split,
