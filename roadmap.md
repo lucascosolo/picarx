@@ -134,8 +134,11 @@ its own plan. A typed local control path and the web tools page can approve, rej
 or cancel a plan; destructive meeting-note, reminder, note, and remote coding
 operations require the approved plan ID before they publish a request. Plan events
 and safe outcomes enter the decision journal for later reflection. Voice-native
-approval and resumable plan execution remain next, along with transport-level
-cancellation for long-running remote work.
+approval is now restricted to explicit spoken plan phrases while a live plan is
+pending; a bare “yes” cannot authorize it. Spoken rejection/cancellation also
+uses the typed control path and stops an active thinking loop. Resumable plan
+execution remains next, along with transport-level cancellation for long-running
+remote work.
 
 Progress (2026-07-28): Companion now attaches correlation IDs to reminder,
 notes, and remote-assist requests, briefly waits for fast daemon results, and

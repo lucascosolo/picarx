@@ -90,6 +90,7 @@ import time
 import json
 import uuid
 import math
+import re
 from collections import deque
 
 HISTORY_TURNS = 20          # user+assistant messages kept for context
@@ -306,6 +307,29 @@ REMOTE_RESULT_TOPIC = "picarx/tools/remote_assist/result"
 FOLLOW_STATUS_TOPIC = "picarx/tools/follow/status"
 THINKING_CONTROL_TOPIC = "picarx/companion/thinking/control"
 THINKING_STATUS_TOPIC = "picarx/companion/thinking/status"
+
+# These are deliberately narrow, local-only phrases.  A model never gets to
+# interpret "yes" as consent: the person must say an approval/rejection phrase
+# while a real pending plan exists, and the typed control path still enforces
+# the final state transition.
+PLAN_APPROVE_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"^(?:please\s+)?(?:i\s+)?(?:approve|accept|confirm)\s+"
+    r"(?:(?:the|this|current)\s+)?plan(?:\s+(?:now|please))?[.! ]*$",
+    r"^(?:please\s+)?(?:go ahead|proceed|continue)\s+with\s+"
+    r"(?:(?:the|this|current)\s+)?plan(?:\s+(?:now|please))?[.! ]*$",
+    r"^(?:yes|yeah|yep|okay|ok|please)[, ]+(?:go ahead|proceed|continue)"
+    r"(?:\s+with\s+(?:(?:the|this|current)\s+)?plan)?[.! ]*$",
+))
+PLAN_REJECT_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"^(?:please\s+)?(?:reject|decline|deny)\s+"
+    r"(?:(?:the|this|current)\s+)?plan[.! ]*$",
+    r"^(?:i\s+)?(?:do not|don't)\s+(?:approve|accept|continue|proceed)"
+    r"(?:\s+with\s+(?:(?:the|this|current)\s+)?plan)?[.! ]*$",
+))
+PLAN_CANCEL_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"^(?:please\s+)?(?:cancel|stop)\s+"
+    r"(?:(?:the|this|current)\s+)?plan[.! ]*$",
+))
 
 # ---------- talking about its own experience ----------
 # Beyond what it sees and who it's with, the companion grounds replies in the
@@ -1943,6 +1967,8 @@ class Companion:
                 return
             plan = self._plan_manager().reject(plan_id, "canceled" if command == "cancel_plan"
                                                else "rejected")
+            if command == "cancel_plan" and plan:
+                self._cancel_thinking_runs()
             self._publish_plan_event(
                 plan, "canceled" if command == "cancel_plan" else "rejected",
                 "explicit local plan rejection", plan_id=plan_id)
@@ -2373,6 +2399,51 @@ class Companion:
 
     # ---------- chat ----------
 
+    def _maybe_handle_plan_voice_control(self, text):
+        """Handle explicit spoken plan control without asking an LLM.
+
+        Approval is a human control-plane action, not a conversational tool
+        call.  Restricting this to a live plan and a phrase that names the
+        plan keeps an unrelated "yes" from authorizing remote work.  The
+        typed handler remains the single state-transition implementation.
+        """
+        plan = self._plan_manager().current()
+        if not plan or plan.get("status") not in {"pending", "approved"}:
+            return False
+        text = str(text or "").strip().lower()
+        if any(pattern.search(text) for pattern in PLAN_REJECT_PATTERNS):
+            command = "reject_plan"
+        elif any(pattern.search(text) for pattern in PLAN_CANCEL_PATTERNS):
+            command = "cancel_plan"
+        elif plan.get("status") == "pending" and any(
+                pattern.search(text) for pattern in PLAN_APPROVE_PATTERNS):
+            command = "approve_plan"
+        else:
+            return False
+
+        self.on_thinking_control({
+            "command": command, "plan_id": plan["plan_id"],
+            "confirmed": True, "source": "voice"})
+        current = self._plan_manager().current() or {}
+        status = current.get("status")
+        if command == "approve_plan" and status == "approved":
+            reply = (f"Plan {plan['plan_id'][:8]} is approved. Tell me to "
+                     "continue when you're ready.")
+        elif command == "reject_plan":
+            reply = "I rejected that thinking plan and will not run its steps."
+        elif command == "cancel_plan":
+            reply = "I canceled that thinking plan and stopped its active work."
+        else:
+            reply = "I couldn't change that thinking plan."
+        now = time.time()
+        with self.lock:
+            self.history.append({"role": "user", "content": text})
+            self.history.append({"role": "assistant", "content": reply})
+            self.last_turn_at = now
+        self._save_memory()
+        self._say(reply)
+        return True
+
     def _handle_utterance(self, text):
         # Autobiographical readback first: a diary question is answered from
         # the semantic store directly, never spending an LLM round-trip.
@@ -2382,6 +2453,8 @@ class Companion:
         # makes the natural follow-up deterministic and avoids a needless or
         # hallucinated Claude answer after an asynchronous tool call.
         if self._maybe_answer_reminder(text):
+            return
+        if self._maybe_handle_plan_voice_control(text):
             return
         client = self._get_client()
         if client is None:

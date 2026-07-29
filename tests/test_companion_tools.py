@@ -215,6 +215,31 @@ class CompanionToolTest(unittest.TestCase):
         self.c.on_thinking_control({"command": "approve_plan", "plan_id": plan_id})
         self.assertEqual(self.c._plan_manager().current()["status"], "pending")
 
+    def test_explicit_voice_phrase_approves_pending_plan_without_llm(self):
+        self.c._save_memory = lambda: None
+        self.c._execute_tool("propose_plan", {
+            "goal": "inspect the project", "steps": ["read status", "report"]})
+        self.assertFalse(self.c._maybe_handle_plan_voice_control("yes"))
+        self.assertFalse(self.c._maybe_handle_plan_voice_control(
+            "why should I approve the plan?"))
+        self.assertEqual(self.c._plan_manager().current()["status"], "pending")
+        self.assertTrue(self.c._maybe_handle_plan_voice_control("approve the plan"))
+        self.assertEqual(self.c._plan_manager().current()["status"], "approved")
+        self.assertIn("approved", self.c.bus.last("picarx/audio/speak")["text"])
+
+    def test_explicit_voice_cancel_rejects_plan_and_cancels_active_run(self):
+        self.c._save_memory = lambda: None
+        self.c._execute_tool("propose_plan", {
+            "goal": "run project tests", "steps": ["inspect", "test"]})
+        plan_id = self.c._plan_manager().current()["plan_id"]
+        event = threading.Event()
+        self.c._thinking_runs = {"run-1": {"cancel": event, "started_at": 1}}
+        self.assertTrue(self.c._maybe_handle_plan_voice_control("cancel the plan"))
+        self.assertEqual(self.c._plan_manager().current()["status"], "canceled")
+        self.assertTrue(event.is_set())
+        self.assertEqual(self.c.bus.last(companion.THINKING_STATUS_TOPIC)["plan_id"],
+                         plan_id)
+
     def test_note_and_meeting_tools_publish_typed_requests(self):
         out = self.c._execute_tool("create_note", {"text": "buy milk"})
         self.assertIn("request sent", out.lower())
