@@ -128,14 +128,19 @@ including `describe_tools`, `get_robot_status`, and typed radio control;
 movement tools are filtered at both catalog construction and dispatch. The
 tool loop is expanded to eight rounds/16 calls with a hard exhaustion reply,
 and latest state mirrors are subscribed for honest “what am I doing?” answers.
-Next: add cancellation and explicit plan/approval state for long-running or
-destructive work.
+Next: add explicit plan/approval state for long-running or destructive work.
 
 Progress (2026-07-28): Companion now attaches correlation IDs to reminder,
 notes, and remote-assist requests, briefly waits for fast daemon results, and
 feeds bounded structured results back into the next model round. Slow work is
 reported as pending instead of being invented as complete; the status tool
 remains the read-only fallback.
+
+Progress (2026-07-28): a typed thinking-control path can cancel active model
+loops, and `cancel_current_task` is available as a non-movement tool. Runs
+publish bounded lifecycle state, check cancellation between model/tool calls,
+and never translate cancellation into a motor command. Long-running remote
+operations still need explicit plan approval and transport-level cancellation.
 
 Growth architecture progress (2026-07-28): thinking-tool requests and
 bounded outcomes now enter the existing `picarx/decision` journal with only

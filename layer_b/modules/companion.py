@@ -304,6 +304,8 @@ ROBOT_STATE_TOPIC = "picarx/state/current"
 GESTURE_STATUS_TOPIC = "picarx/gesture/status"
 REMOTE_RESULT_TOPIC = "picarx/tools/remote_assist/result"
 FOLLOW_STATUS_TOPIC = "picarx/tools/follow/status"
+THINKING_CONTROL_TOPIC = "picarx/companion/thinking/control"
+THINKING_STATUS_TOPIC = "picarx/companion/thinking/status"
 
 # ---------- talking about its own experience ----------
 # Beyond what it sees and who it's with, the companion grounds replies in the
@@ -417,6 +419,11 @@ TOOLS = [
                     "mode/claims, health, perception, radio, follow, gesture, and "
                     "remote-session status. Use this before deciding what to do next "
                     "or when the person asks what is happening.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "cancel_current_task",
+     "description": "Cancel the current thinking/tool task without moving the robot. "
+                    "Use when the person says to stop the current research, coding, "
+                    "or multi-tool task. It is safe to call even if nothing is running.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "control_radio",
      "description": "Control internet radio without moving the robot. You can play, "
@@ -601,6 +608,8 @@ class Companion:
         self.latest_radio_state = None
         self._tool_result_condition = threading.Condition()
         self._tool_results = {}
+        self._thinking_runs_lock = threading.Lock()
+        self._thinking_runs = {}
         # The reminder daemon owns timers; this is only a small read-only cache
         # of its published state so follow-up questions can be answered locally
         # without asking Claude to reconstruct an asynchronous tool call.
@@ -1730,6 +1739,62 @@ class Companion:
 
     # ---------- LLM tool loop ----------
 
+    def _thinking_registry(self):
+        lock = getattr(self, "_thinking_runs_lock", None)
+        if lock is None:
+            self._thinking_runs_lock = lock = threading.Lock()
+        runs = getattr(self, "_thinking_runs", None)
+        if runs is None:
+            self._thinking_runs = runs = {}
+        return lock, runs
+
+    def _start_thinking_run(self, run_id):
+        lock, runs = self._thinking_registry()
+        cancel = threading.Event()
+        with lock:
+            runs[run_id] = {"cancel": cancel, "started_at": time.time()}
+        self.bus.publish(THINKING_STATUS_TOPIC, {
+            "state": "running", "run_id": run_id, "ts": time.time()})
+        return cancel
+
+    def _finish_thinking_run(self, run_id, state="complete"):
+        lock, runs = self._thinking_registry()
+        with lock:
+            runs.pop(run_id, None)
+        self.bus.publish(THINKING_STATUS_TOPIC, {
+            "state": state, "run_id": run_id, "ts": time.time()})
+
+    def _cancel_thinking_runs(self, run_id=None):
+        lock, runs = self._thinking_registry()
+        canceled = []
+        with lock:
+            selected = ([run_id] if run_id else list(runs))
+            for current in selected:
+                record = runs.get(current)
+                if record:
+                    record["cancel"].set()
+                    canceled.append(current)
+        self.bus.publish(THINKING_STATUS_TOPIC, {
+            "state": "cancel_requested", "run_id": run_id,
+            "canceled_count": len(canceled), "ts": time.time()})
+        return canceled
+
+    def on_thinking_control(self, payload):
+        """Cancel or inspect thinking runs through a typed local control path."""
+        payload = dict(payload or {})
+        command = str(payload.get("command") or payload.get("operation") or
+                      "status").lower()
+        if command == "cancel":
+            self._cancel_thinking_runs(payload.get("run_id"))
+            return
+        lock, runs = self._thinking_registry()
+        with lock:
+            active = [{"run_id": run_id,
+                       "started_at": record.get("started_at")}
+                      for run_id, record in runs.items()]
+        self.bus.publish(THINKING_STATUS_TOPIC, {
+            "state": "status", "active": active, "ts": time.time()})
+
     def _chat_with_tools(self, client, messages, tools=None):
         """One utterance, with the model allowed to call tools. Runs a
         bounded tool<->model loop: each round, execute any tool_use blocks
@@ -1742,17 +1807,28 @@ class Companion:
                         if tool.get("name") not in MOVEMENT_TOOL_NAMES]
         final_text = ""
         request_id = f"companion-chat-{uuid.uuid4().hex}"
+        cancel_event = self._start_thinking_run(request_id)
         tool_calls = 0
         exhausted = True
+        canceled = False
         for _ in range(MAX_TOOL_ROUNDS):
+            if cancel_event.is_set():
+                canceled = True
+                exhausted = False
+                break
             if isinstance(client, LLMGateway):
-                result = client.complete(
-                    request_id=request_id, task="companion_chat",
-                    complexity="high", system=self._compose_system_prompt(),
-                    messages=convo, tools=active_tools,
-                    max_tokens=REPLY_MAX_TOKENS, timeout=REPLY_TIMEOUT,
-                    privacy="user_conversation", idempotent=True)
+                try:
+                    result = client.complete(
+                        request_id=request_id, task="companion_chat",
+                        complexity="high", system=self._compose_system_prompt(),
+                        messages=convo, tools=active_tools,
+                        max_tokens=REPLY_MAX_TOKENS, timeout=REPLY_TIMEOUT,
+                        privacy="user_conversation", idempotent=True)
+                except Exception:
+                    self._finish_thinking_run(request_id, "error")
+                    raise
                 if not result.ok:
+                    self._finish_thinking_run(request_id, "error")
                     raise RuntimeError(result.failure.get("message", "LLM unavailable"))
                 text = result.text
                 content = result.content
@@ -1765,6 +1841,12 @@ class Companion:
                 convo.append({"role": "assistant", "content": content})
                 results = []
                 for tu in tool_uses:
+                    if cancel_event.is_set():
+                        canceled = True
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": tu.get("id"),
+                                        "content": "Thinking task canceled; tool not run."})
+                        continue
                     tool_calls += 1
                     if tool_calls > MAX_TOOL_CALLS:
                         results.append({"type": "tool_result",
@@ -1787,7 +1869,11 @@ class Companion:
             }
             if active_tools:
                 request["tools"] = active_tools
-            response = client.messages.create(**request)
+            try:
+                response = client.messages.create(**request)
+            except Exception:
+                self._finish_thinking_run(request_id, "error")
+                raise
             text = "".join(b.text for b in response.content
                            if getattr(b, "type", None) == "text").strip()
             if text:
@@ -1800,6 +1886,11 @@ class Companion:
             convo.append({"role": "assistant", "content": response.content})
             results = []
             for tu in tool_uses:
+                if cancel_event.is_set():
+                    canceled = True
+                    results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                    "content": "Thinking task canceled; tool not run."})
+                    continue
                 tool_calls += 1
                 if tool_calls > MAX_TOOL_CALLS:
                     results.append({"type": "tool_result", "tool_use_id": tu.id,
@@ -1810,9 +1901,14 @@ class Companion:
                 results.append({"type": "tool_result", "tool_use_id": tu.id,
                                 "content": out})
             convo.append({"role": "user", "content": results})
-        if exhausted and not final_text:
-            return "I reached the safe limit for this task before I could finish."
-        return final_text
+        try:
+            if canceled:
+                return "I stopped that thinking task."
+            if exhausted and not final_text:
+                return "I reached the safe limit for this task before I could finish."
+            return final_text
+        finally:
+            self._finish_thinking_run(request_id, "canceled" if canceled else "complete")
 
     def _run_thinking_tool(self, name, tool_input, tool_use_id=None):
         """Execute and journal a non-movement tool without logging its data.
@@ -1901,7 +1997,15 @@ class Companion:
                 if remote:
                     parts.append("remote session " + str(
                         remote.get("command") or remote.get("state") or "active"))
+                lock, runs = self._thinking_registry()
+                with lock:
+                    if runs:
+                        parts.append(f"thinking task active ({len(runs)})")
                 return "Current robot status: " + "; ".join(parts) + "."
+            if name == "cancel_current_task":
+                canceled = self._cancel_thinking_runs()
+                return (f"Cancellation requested for {len(canceled)} thinking task(s)."
+                        if canceled else "There is no active thinking task to cancel.")
             if name == "control_radio":
                 command = str(tool_input.get("command") or "").lower()
                 if command not in {"play", "stop", "next", "list", "find", "status"}:
@@ -2166,6 +2270,7 @@ class Companion:
         self.bus.subscribe(REMINDER_STATE_TOPIC, self.on_reminder_state)
         self.bus.subscribe(REMINDER_RESULT_TOPIC, self.on_reminder_result)
         self.bus.subscribe(NOTES_RESULT_TOPIC, self.on_notes_result)
+        self.bus.subscribe(THINKING_CONTROL_TOPIC, self.on_thinking_control)
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
         self.bus.subscribe(IMU_EVENT_TOPIC, self.on_imu_event)
         self.bus.subscribe(SELF_TRAINER_STATUS_TOPIC, self.on_self_trainer_status)

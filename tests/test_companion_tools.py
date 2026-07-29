@@ -95,6 +95,16 @@ class CompanionToolTest(unittest.TestCase):
         self.assertIn("mode IDLE", status)
         self.assertIn("battery 7.4 volts", status)
 
+    def test_thinking_task_can_be_canceled_without_motion(self):
+        event = threading.Event()
+        self.c._thinking_runs = {"run-1": {"cancel": event, "started_at": 1}}
+        out = self.c._execute_tool("cancel_current_task", {})
+        self.assertIn("requested", out.lower())
+        self.assertTrue(event.is_set())
+        self.c.on_thinking_control({"command": "status"})
+        self.assertEqual(self.c.bus.last(companion.THINKING_STATUS_TOPIC)["state"],
+                         "status")
+
     def test_thinking_robot_can_control_non_motion_radio(self):
         out = self.c._execute_tool("control_radio", {
             "command": "find", "query": "jazz"})
