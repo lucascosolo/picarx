@@ -380,6 +380,8 @@ the project's allow-listed PyPI dependencies there without modifying the
 PEP-668-managed system interpreter, and configures the two systemd services to
 see that environment. Set `PYTHON=/path/to/python` to choose the base
 interpreter or `PICARX_VENV=/path/to/venv` to choose another environment path.
+The older `setup_python.sh` filename remains as a compatibility wrapper around
+this same repair flow.
 
 The suite is ~500 fast, deterministic tests (`tests/`, sharing
 [`tests/harness.py`](tests/harness.py)) covering perception logic, the safety

@@ -89,6 +89,12 @@ power loss during merge therefore still leaves the previous commit and target
 recorded for startup recovery; marker write failure aborts before changing the
 checkout. Regression tests verify the marker exists at merge time.
 
+Progress (2026-07-28): the legacy `setup_python.sh` entry point now delegates
+to `repair_python_environment.sh` instead of installing into the PEP-668
+system interpreter with `--break-system-packages`. Both deployment entry
+points therefore use the same architecture-specific MediaPipe ABI, venv
+compatibility checks, and systemd environment configuration.
+
 ### 3. Remote project helper redesign
 
 `remote_assist.py`, companion tools, web controls, SSH host-key validation,
