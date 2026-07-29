@@ -95,6 +95,12 @@ not selected first on `PATH`, or user-site packages are enabled. This catches
 service-environment drift before a new revision is accepted; target-Pi
 systemd validation remains outstanding.
 
+Progress (2026-07-28): startup recovery now compares `HEAD` with both commits
+recorded in the durable marker. A power loss before the merge simply clears
+the marker, a failed health check can reset only the intended new revision,
+and an unrelated checkout is left untouched with a rollback error for
+operator recovery.
+
 Progress (2026-07-28): the legacy `setup_python.sh` entry point now delegates
 to `repair_python_environment.sh` instead of installing into the PEP-668
 system interpreter with `--break-system-packages`. Both deployment entry

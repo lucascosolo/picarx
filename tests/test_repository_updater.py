@@ -145,6 +145,9 @@ class RepositoryUpdaterTests(unittest.TestCase):
         self.assertIn("confirmed=true", self.events[-1][1]["error"])
 
     def test_startup_health_failure_restores_marked_revision(self):
+        # The marker was written before the merge, but this process restarted
+        # after HEAD moved to the proposed revision.
+        self.git.old = "new"
         with open(self.updater.marker_path, "w", encoding="utf-8") as stream:
             stream.write('{"previous_commit":"old","new_commit":"new"}')
         restarted = []
@@ -156,6 +159,7 @@ class RepositoryUpdaterTests(unittest.TestCase):
         self.assertEqual(self.events[-1][1]["state"], "rollback")
 
     def test_startup_health_success_commits_marked_revision(self):
+        self.git.old = "new"
         with open(self.updater.marker_path, "w", encoding="utf-8") as stream:
             stream.write('{"previous_commit":"old","new_commit":"new"}')
         self.updater.health_check = lambda: (True, "ok")
@@ -163,6 +167,28 @@ class RepositoryUpdaterTests(unittest.TestCase):
         self.assertTrue(self.updater.startup_recover())
         self.assertFalse(os.path.exists(self.updater.marker_path))
         self.assertEqual(self.events[-1][1]["state"], "success")
+
+    def test_startup_marker_before_merge_is_removed_without_rollback(self):
+        health_calls = []
+        self.updater.health_check = lambda: health_calls.append(True) or (
+            False, "must not run before merge")
+        with open(self.updater.marker_path, "w", encoding="utf-8") as stream:
+            stream.write('{"previous_commit":"old","new_commit":"new"}')
+        self.assertTrue(self.updater.startup_recover())
+        self.assertEqual(health_calls, [])
+        self.assertFalse(os.path.exists(self.updater.marker_path))
+        status = self.events[-1][1]
+        self.assertEqual(status["state"], "warning")
+        self.assertEqual(status["current_commit"], "old")
+
+    def test_startup_marker_never_resets_unrelated_revision(self):
+        self.git.old = "unrelated"
+        with open(self.updater.marker_path, "w", encoding="utf-8") as stream:
+            stream.write('{"previous_commit":"old","new_commit":"new"}')
+        self.assertFalse(self.updater.startup_recover())
+        self.assertNotIn(("reset", "--hard", "old"), self.git.commands)
+        self.assertTrue(os.path.exists(self.updater.marker_path))
+        self.assertEqual(self.events[-1][1]["state"], "rollback_error")
 
 
 if __name__ == "__main__":

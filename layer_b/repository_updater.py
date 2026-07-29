@@ -308,6 +308,29 @@ class RepositoryUpdater:
         self._emit("health_check", previous_commit=old, new_commit=new,
                    trigger=marker.get("trigger"))
         try:
+            current = self._git("rev-parse", "HEAD")
+        except UpdateError as exc:
+            self._emit("rollback_error", previous_commit=old,
+                       new_commit=new, error=f"could not inspect HEAD: {exc}")
+            return False
+        # A marker is written before the fast-forward merge. If power failed
+        # in that window, HEAD is still the known-good revision and there is
+        # nothing to roll back. Conversely, never reset an unrelated checkout
+        # merely because an old ignored marker was left behind.
+        if current == old:
+            self._remove_marker()
+            self._emit("warning", previous_commit=old, new_commit=new,
+                       current_commit=current,
+                       detail="update marker found before merge completed",
+                       trigger=marker.get("trigger"))
+            return True
+        if current != new:
+            self._emit(
+                "rollback_error", previous_commit=old, new_commit=new,
+                current_commit=current,
+                error="update marker does not match the current checkout")
+            return False
+        try:
             healthy, detail = self.health_check()
         except Exception as exc:  # health checks must fail closed
             healthy, detail = False, f"health check raised: {exc}"
