@@ -314,6 +314,79 @@ targets; and never imply that label memory changed detector weights.
   authoritative. Later add validated fingerprint thresholds, directed edges and
   traversal timestamps, conservative IMU quality policy, audited merge/split,
   then optional embeddings only after an evaluation corpus.
+- **Unify utterance routing behind one arbiter (architecture debt):** today,
+  "is this utterance for me, and who handles it" logic is split across several
+  independently-maintained phrase/keyword lists that have to be hand-kept in
+  sync: `field_agent.py`'s `TOOL_KEYWORDS`, `tools_registry.py`'s `_TOOL_WORDS`
+  and its `RULES` regex table, `attention.py`'s wake/command-shape model, and
+  companion's separate LLM tool-calling catalog. The `field_agent.py` /
+  `tools_registry.py` comments already admit this is fragile ("without them
+  here both modules would escalate the same text twice"), and every new tool
+  (see the dice/clock/weather/web-search entry below) currently means editing
+  2-3 of these files by hand with no single source of truth. This is the
+  wrong shape and needs a real redesign, not another parallel keyword list.
+  Target design: one router/arbiter owns a declarative capability registry
+  (each capability — movement, radio, reminders, notes, dice, clock, weather,
+  search, chat, ...— registers its own matchers once) and a single dispatch
+  order: hardcoded safety words first (never delegable, unchanged), then the
+  onboard/local "brain" (deterministic regex/phrase matches against every
+  registered capability, replacing today's scattered per-module keyword
+  lists), and only when nothing local matches an utterance that *is* addressed
+  to the robot, escalate once to the LLM intent arbiter. Critically, the LLM's
+  own tool calls should be dispatched back through this same router/arbiter
+  instead of companion.py's separate direct-publish tool-calling path, so
+  there is exactly one place that decides "who handles this utterance" and
+  one audit trail, whether the decision was made locally or by the model.
+  This must preserve every existing safety invariant unchanged: motion stays
+  off the LLM/thinking-plane path entirely, "stop"/"halt" are never filtered,
+  and the dialog broker's turn-taking/open-question semantics
+  (`attention.py`, `dialog.py`) keep working. Scope this as its own
+  audit-then-refactor pass across `field_agent.py`, `tools_registry.py`,
+  `attention.py`, `dialog.py`, `companion.py`'s tool loop, and `arbiter.py`
+  (note: `arbiter.py` today is the *motion* priority arbiter to the safety
+  daemon, a different concern — decide whether the new command router is a
+  new module or an extension of an existing one). Needs careful regression
+  coverage given the 1,000-test baseline and the safety-critical invariants
+  above; do this deliberately, not as a drive-by rename.
+  **Sequencing decision (2026-07-28): do this first.** The dice/clock/
+  weather/web-search tools below are the pilot for the new router — build
+  them as the first capabilities registered against it, not through another
+  round of mirrored `TOOL_KEYWORDS`/`_TOOL_WORDS` lists. If the full router
+  isn't ready when that work starts, land at minimum a single shared
+  capability-keyword source that both `field_agent.py` and
+  `tools_registry.py` import, rather than adding a fourth/fifth hand-copied
+  list.
+- **New tools scaffold — dice, clock, weather, web search:** add four small
+  tools following the existing `tools_registry.py` + `layer_b/modules/tools/`
+  pattern (one bus topic and `module_registry.json` entry per tool, always-on
+  since none owns exclusive hardware):
+  - `dice`: local `random`-only dice rolls and coin flips, no network/LLM —
+    instant and free, same category as "party tricks" in the tools_registry
+    docstring.
+  - `clock`: local "what time is it" / "what's the date" off the Pi's own
+    system clock, no network/LLM, same trust boundary reminder_daemon.py
+    already relies on for `at: "HH:MM"`.
+  - `weather`: fetch from `wttr.in`'s no-key plain-text endpoint (stdlib
+    `urllib` only, ~5s timeout, fail-soft to "couldn't reach the weather
+    service"); optional `weather.default_location`/units config knobs, empty
+    location falls back to wttr.in's IP geolocation.
+  - `web_search`: a new `layer_b/web_search_client.py` (stdlib-only, mirrors
+    `radio_browser.py`'s style) queries DuckDuckGo's free, keyless Instant
+    Answer API for a bounded set of snippets, then one low-complexity
+    `LLMGateway.complete()` call turns them into a short spoken summary,
+    grounded only in the fetched snippets (never asked to invent facts
+    beyond them). No snippets or no LLM available both fail soft — the
+    former says nothing useful was found, the latter reads back the best raw
+    snippet instead of a summary. This is the one tool here that costs a
+    token; log it like other `intent_repair`-class calls, not silently.
+  Also route `flip a dice/coin`, `what time/day is it`, `what's the weather`,
+  and `search the web for …` / `look up …` in `tools_registry.py`'s RULES,
+  add the matching entries to `TOOL_DESCRIPTIONS`, then register each with
+  the unified router from the "unify utterance routing" item above instead of
+  hand-adding another `_TOOL_WORDS`/`TOOL_KEYWORDS` mirror pair — that item is
+  a prerequisite for this one, not a follow-up. Cover each with off-robot
+  unit tests (parsing + fail-soft network/LLM paths, per the `harness.py`
+  `FakeBus` pattern already used for `reminder_daemon`/`tools_registry`).
 
 ## Completed architecture and capabilities
 
