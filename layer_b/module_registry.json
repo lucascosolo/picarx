@@ -326,6 +326,24 @@
     }
   },
   {
+    "name": "dice",
+    "version": "0.1",
+    "entrypoint": "tools/dice.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "clock",
+    "version": "0.1",
+    "entrypoint": "tools/clock.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
     "name": "web_console",
     "version": "0.1",
     "entrypoint": "web_console.py",

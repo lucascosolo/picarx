@@ -33,6 +33,8 @@ REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
 REMINDER_CONTROL_TOPIC = "picarx/tools/reminder/control"
 NOTES_TOPIC = "picarx/tools/notes"
 RADIO_TOPIC = "picarx/tools/radio"
+DICE_TOPIC = "picarx/tools/dice"
+CLOCK_TOPIC = "picarx/tools/clock"
 
 # ---------- spoken-number → dial string ----------
 # Vosk transcribes a frequency as WORDS ("ninety eight point seven",
@@ -183,6 +185,43 @@ def _note_payload(m, text):
     return {"command": "create", "text": body, "source": "voice"} if body else None
 
 
+_DICE_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4,
+                     "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+                     "ten": 10, "pair": 2, "couple": 2}
+MAX_DICE = 10
+MIN_DICE_SIDES = 2
+MAX_DICE_SIDES = 1000
+
+
+def _dice_payload(m, text):
+    """How many dice, and how many sides. Everything is optional: a bare
+    "roll the dice" is one ordinary six-sided die."""
+    sides = 6
+    shorthand = re.search(r"\bd\s?(\d{1,4})\b", text)      # "roll a d20"
+    spelled = re.search(r"\b(\d{1,4})[\s-]*sided\b", text)  # "twenty sided die"
+    if spelled:
+        sides = int(spelled.group(1))
+    elif shorthand:
+        sides = int(shorthand.group(1))
+    if not MIN_DICE_SIDES <= sides <= MAX_DICE_SIDES:
+        return None
+
+    # "two dice", "roll 3 dice", "a pair of dice" - the count word sits a
+    # word or two ahead of the noun, never after it.
+    count = 1
+    digits = None if spelled else re.search(
+        r"\b(\d{1,2})(?:\s+\w+){0,2}\s+(?:dice|die)\b", text)
+    if digits:
+        count = int(digits.group(1))
+    else:
+        for word, value in _DICE_COUNT_WORDS.items():
+            if re.search(rf"\b{word}\b(?:\s+\w+){{0,2}}\s+(?:dice|die)\b", text):
+                count = value
+                break
+    count = max(1, min(MAX_DICE, count))
+    return {"command": "roll", "count": count, "sides": sides}
+
+
 def _query_payload(m, text):
     query = (m.group("query") if m and m.groupdict().get("query") else "").strip(" .,!?")
     query = re.sub(r"^(?:about|for|named|called)\s+", "", query)
@@ -328,8 +367,47 @@ RADIO = Capability(
     ],
 )
 
-# Registration order is dispatch order.
-ROUTER = Router([REMINDERS, NOTES, REMOTE_ASSIST, RADIO])
+DICE = Capability(
+    name="dice",
+    topic=DICE_TOPIC,
+    keywords=("dice", "coin flip", "flip a coin"),
+    say="roll a dice / roll two dice / roll a d20 / flip a coin",
+    description="rolls dice and flips coins locally - no network, no thinking, "
+                "just an honest random number",
+    rules=[
+        (re.compile(r"\b(?:flip|toss)\b.*\bcoin\b|\bcoin\s+(?:flip|toss)\b|"
+                    r"\bheads\s+or\s+tails\b"),
+         lambda m, t: {"command": "flip"}),
+        (re.compile(r"\b(?:roll|throw|shake)\b.*\b(?:dice|die|d\d{1,4})\b|"
+                    r"\bdice\s+roll\b"),
+         _dice_payload),
+    ],
+)
+
+CLOCK = Capability(
+    name="clock",
+    topic=CLOCK_TOPIC,
+    keywords=("what time", "the time", "what day", "what date", "the date"),
+    say="what time is it / what's the date / what day is it",
+    description="reads the current local time and date off my own clock - no "
+                "network and no thinking needed",
+    rules=[
+        # Matched against canonicalized text, where trailing filler is already
+        # gone ("what time is it" arrives as "what time is").
+        (re.compile(r"\bwhat(?:'s)?(?:\s+\w+){0,2}\s+time\b|"
+                    r"\btime\s+is\s+it\b|\btell\s+(?:\w+\s+)?time\b|"
+                    r"\bcurrent\s+time\b"),
+         lambda m, t: {"command": "time"}),
+        (re.compile(r"\bwhat(?:'s)?(?:\s+\w+){0,2}\s+(?:date|day)\b|"
+                    r"\btoday'?s?\s+date\b|\bwhat\s+day\b"),
+         lambda m, t: {"command": "date"}),
+    ],
+)
+
+# Registration order is dispatch order. The four original tools keep their
+# existing precedence; the newer local answers are appended rather than
+# inserted, so no previously-routed phrase changes owner.
+ROUTER = Router([REMINDERS, NOTES, REMOTE_ASSIST, RADIO, DICE, CLOCK])
 
 # Asking the robot what it can do is answered by the registry itself rather
 # than by any one capability, but the word still belongs to the tool path so

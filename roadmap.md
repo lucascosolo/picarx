@@ -8,7 +8,7 @@ safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
 ## Current state (2026-07-28)
 
 - The repository is on `master`; the local implementation currently passes
-  1,016 tests. The full suite is the source-of-truth regression gate, while
+  1,047 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -370,7 +370,10 @@ targets; and never imply that label memory changed detector weights.
   fold `attention.py`/`dialog.py` addressing into the same decision, route
   companion's LLM tool calls back through the router, and give the escalation
   path a single audit trail.
-- **New tools scaffold — dice, clock, weather, web search:** add four small
+- **New tools scaffold — dice, clock, weather, web search:** (dice and clock
+  landed 2026-07-28 as the router's first pilot capabilities — see the
+  progress note at the end of this entry; weather and web search remain.)
+  Add four small
   tools following the existing `tools_registry.py` + `layer_b/modules/tools/`
   pattern (one bus topic and `module_registry.json` entry per tool, always-on
   since none owns exclusive hardware):
@@ -401,6 +404,18 @@ targets; and never imply that label memory changed detector weights.
   a prerequisite for this one, not a follow-up. Cover each with off-robot
   unit tests (parsing + fail-soft network/LLM paths, per the `harness.py`
   `FakeBus` pattern already used for `reminder_daemon`/`tools_registry`).
+  Progress (2026-07-28): `dice` and `clock` are implemented the new way —
+  declared once in `layer_b/capabilities.py`, served by
+  `layer_b/modules/tools/dice.py` and `tools/clock.py`, registered in
+  `module_registry.json`, with no keyword list edited anywhere else. Dice
+  bounds (`count`, `sides`) are clamped in the daemon as well as the parser
+  because a request can also arrive from a model; the clock speaks
+  conversationally ("twenty past four in the afternoon") since the answer goes
+  to a speaker. `speech_match.DOMAIN_VOCAB` gained the matching words so "what
+  time is it" reads as a command instead of needing a wake phrase. Still open
+  for these two: they are not yet in `tool_catalog.py`, so the thinking plane
+  cannot call them — that arrives with the stage that routes companion's tool
+  calls through the same router.
 
 ## Completed architecture and capabilities
 
@@ -441,7 +456,7 @@ safety daemon is the final authority.
 ## Delivery rules
 
 Use fake camera/MediaPipe/worker/process/servo/thermal/SSH tests off-robot,
-then field-test on the Pi. Current local full-suite baseline is 1,016 passing
+then field-test on the Pi. Current local full-suite baseline is 1,047 passing
 tests (`python3 -m unittest discover -s tests -p 'test_*.py'`); warnings from
 existing resource-cleanup tests are non-fatal.
 Keep commits scoped (for example, gesture worker; packaging; roadmap), push

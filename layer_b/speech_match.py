@@ -60,6 +60,10 @@ DOMAIN_VOCAB = {
     # reminder_daemon) - here both as escalation triggers and as snap
     # targets ("folow me" -> "follow me").
     "follow", "remember", "forget", "remind", "reminder", "place", "room",
+    # small local answers (capabilities.py: dice, clock) - listed so a
+    # near-miss snaps ("dyce" -> "dice") and so "what time is it" reads as a
+    # command rather than as chatter needing a wake word.
+    "dice", "coin", "flip", "roll", "time", "date", "clock",
 }
 
 # Only snap tokens of this length or more (short words collide too
