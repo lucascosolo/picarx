@@ -399,6 +399,21 @@ class Reflection:
                 wanted = f" (they wanted: {p['correction']})" if p.get("correction") else ""
                 return f"user flagged a MISUNDERSTOOD request: '{utterance}'{wanted}"
             return f"user confirmed a request was understood right: '{utterance}'"
+        if topic == "picarx/dialog/conversation":
+            # Brackets around a run of "heard:" lines. Without them the model
+            # sees a flat stream and cannot tell a six-turn conversation from
+            # six things said near the robot over an afternoon - which is
+            # exactly the distinction "who did I spend time with today" needs.
+            if p.get("open"):
+                return f"--- a conversation started ({p.get('reason')}) ---"
+            turns = p.get("turns")
+            duration = p.get("duration")
+            how = {"idle": "it went quiet", "max_duration": "it ran long",
+                   "asked": "they asked me to stop listening"}.get(
+                       str(p.get("reason")), str(p.get("reason") or "it ended"))
+            span = f" over {duration}s" if duration is not None else ""
+            count = f"{turns} turns" if turns is not None else "some turns"
+            return f"--- the conversation ended after {count}{span}: {how} ---"
         if topic == "picarx/action/result":
             result = p.get("result") or {}
             if result.get("status") == "vetoed":

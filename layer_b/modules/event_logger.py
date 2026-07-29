@@ -206,6 +206,14 @@ class EventLogger:
         # labeled an example - so it must be durable for reflection.
         self.log_event("picarx/intent/feedback", payload)
 
+    def on_conversation(self, payload):
+        # The edges of an open conversation. Two rows per conversation is
+        # cheap, and they are what turn a flat run of "heard:" lines into a
+        # session with a beginning, an end and a length - the difference
+        # between "somebody talked with me for six turns" and "six unrelated
+        # things were said near me". Reflection reads them as brackets.
+        self.log_event("picarx/dialog/conversation", payload)
+
     def on_decision(self, payload):
         # The decision journal: every non-trivial choice any module
         # makes, with its stated reason. This is what lets the robot
@@ -262,6 +270,7 @@ class EventLogger:
         self.bus.subscribe("picarx/exploration/goal_progress", self.on_goal_progress)
         self.bus.subscribe("picarx/rc/demonstration", self.on_rc_demonstration)
         self.bus.subscribe("picarx/intent/feedback", self.on_intent_feedback)
+        self.bus.subscribe("picarx/dialog/conversation", self.on_conversation)
         self.bus.subscribe("picarx/decision", self.on_decision)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
 

@@ -43,9 +43,14 @@ change from here should move in this direction:
   rather than a fresh assistant each turn. *Started 2026-07-29:* `identity.py`
   gives him a configurable name ("Marco"), grounded first-person in the
   personality prompt and folded into the wake phrases so his name addresses
-  him. Still missing: a persistent narrative history (who he's spent time
-  with, what he's done over days, not just the learned "self" facts) that
-  colours his voice, and reconciling the learned self-model with a stable core
+  him. *Also 2026-07-29:* conversations are now episodic events — the closing
+  edge of an open channel carries its turn count, length and why it ended,
+  event_logger records both edges, and reflection reads them as brackets
+  around the day's `heard:` lines. That is the first piece of narrative
+  history: the digest can now say "somebody talked with me for six turns"
+  instead of showing six unrelated utterances. Still missing: reflection does
+  not yet distil those sessions into durable "who I spent time with" facts,
+  and the learned self-model still has to be reconciled with a stable core
   identity so growth doesn't erase who he is.
 
 **The boundary that does not move.** Layer A stays hardcoded and Marco has no
@@ -59,7 +64,7 @@ hand-written matcher.
 ## Current state (2026-07-29)
 
 - The repository is on `master`; the local implementation currently passes
-  1,113 tests. The full suite is the source-of-truth regression gate, while
+  1,119 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -436,7 +441,9 @@ targets; and never imply that label memory changed detector weights.
   - *Landed 2026-07-29:* companion now consumes `picarx/dialog/conversation` —
     an open channel is the honest definition of "what is currently relevant",
     and closing it is what retires stale intent (see the stale-intent item
-    below). First consumer of the boundary; more should follow.
+    below). event_logger records both edges and reflection reads them as
+    brackets around the day's `heard:` lines, so a conversation is an episode
+    with a length and an ending rather than loose utterances.
 
 - **Stale intent lingers in context — Marco doesn't know when something stops
   mattering (owner-reported, 2026-07-29):** he deletes a note successfully, the

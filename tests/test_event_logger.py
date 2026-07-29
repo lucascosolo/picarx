@@ -56,6 +56,22 @@ class EventLoggerResolutionTest(unittest.TestCase):
             "SELECT COUNT(*) FROM events WHERE topic = ?",
             ("picarx/exploration/disambiguation_needed",)).fetchone()[0], 1)
 
+    def test_conversation_edges_are_recorded_as_events(self):
+        # Both edges: the pair is what lets reflection see a run of heard
+        # lines as one conversation rather than as unrelated utterances.
+        self.logger.bus.subscribe("picarx/dialog/conversation",
+                                  self.logger.on_conversation)
+        self.logger.bus.deliver("picarx/dialog/conversation",
+                                {"open": True, "reason": "wake"})
+        self.logger.bus.deliver("picarx/dialog/conversation",
+                                {"open": False, "reason": "idle", "turns": 4,
+                                 "duration": 62.5})
+        rows = self.logger.conn.execute(
+            "SELECT payload_json FROM events WHERE topic = ? ORDER BY id",
+            ("picarx/dialog/conversation",)).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(json.loads(rows[1][0])["turns"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

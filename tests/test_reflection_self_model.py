@@ -145,6 +145,40 @@ class SelfModelTest(unittest.TestCase):
         self.assertIn("failed", line)
 
 
+class ConversationDigestTest(unittest.TestCase):
+    """A digest of "heard:" lines alone cannot tell a six-turn conversation
+    from six things said near the robot. The conversation edges are what give
+    the day a shape worth reflecting on."""
+
+    def _line(self, payload):
+        return reflection.Reflection._summarize_event(
+            "picarx/dialog/conversation", json.dumps(payload))
+
+    def test_the_opening_edge_brackets_what_follows(self):
+        line = self._line({"open": True, "reason": "wake"})
+        self.assertIn("a conversation started", line)
+        self.assertIn("wake", line)
+
+    def test_the_closing_edge_reports_length_and_why_it_ended(self):
+        line = self._line({"open": False, "reason": "idle",
+                           "turns": 6, "duration": 214.0})
+        self.assertIn("6 turns", line)
+        self.assertIn("214.0s", line)
+        self.assertIn("went quiet", line)
+
+    def test_being_asked_to_stop_reads_as_a_person_ending_it(self):
+        # A meaningfully different ending from silence: somebody chose it.
+        line = self._line({"open": False, "reason": "asked", "turns": 2,
+                           "duration": 30.0})
+        self.assertIn("asked me to stop listening", line)
+
+    def test_a_close_without_the_shape_fields_still_summarizes(self):
+        # Old rows (and any future publisher) must not crash the digest.
+        line = self._line({"open": False, "reason": "idle"})
+        self.assertIn("some turns", line)
+        self.assertNotIn("None", line)
+
+
 class ReflectionEvidenceGateTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

@@ -387,6 +387,21 @@ class OpenConversationTest(unittest.TestCase):
         self.assertTrue(states[0]["open"])
         self.assertEqual(states[0]["reason"], "wake")
 
+    def test_the_closing_edge_carries_the_shape_of_the_conversation(self):
+        # The close is the only place that knows how long it lasted and how
+        # many turns it took; downstream (event_logger -> reflection) that is
+        # what makes it an episode instead of loose utterances.
+        self._directed(text="robot hello there")
+        self._directed(text="and what do you think about that")
+        self.d.conversation.opened_at -= 30.0
+        self.d.on_heard({"text": "goodbye"})
+        state = self.d.bus.last(dialog.CONVERSATION_TOPIC)
+        self.assertFalse(state["open"])
+        self.assertEqual(state["turns"], 2)
+        self.assertGreaterEqual(state["duration"], 30.0)
+        self.assertEqual(state["since"], self.d.bus.of(
+            dialog.CONVERSATION_TOPIC)[0]["since"] - 30.0)
+
 
 if __name__ == "__main__":
     unittest.main()

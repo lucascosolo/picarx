@@ -232,16 +232,26 @@ class DialogBroker:
 
     def _close_conversation(self, now, reason, ack=None):
         """End an open conversation. Returns False if none was open (so being
-        told to stop listening when nobody was talking stays silent)."""
+        told to stop listening when nobody was talking stays silent).
+
+        The closing edge carries the shape of what just happened - how many
+        turns, how long, why it ended - because that edge is the only place
+        that knows it. Downstream it becomes an episodic event, which is what
+        lets reflection see a run of heard lines as one conversation rather
+        than as unrelated utterances."""
         with self.lock:
+            since = self.conversation.opened_at or now
+            turns = self.conversation.turns
             was_open = self.conversation.close()
             if reason == attention.ASKED:
                 self._slept_at = now
         if not was_open:
             return False
-        print(f"Dialog: conversation closed ({reason})")
+        print(f"Dialog: conversation closed ({reason}, {turns} turns)")
         self.bus.publish(CONVERSATION_TOPIC,
-                         {"open": False, "reason": reason, "ts": now})
+                         {"open": False, "reason": reason, "turns": turns,
+                          "since": since, "duration": round(now - since, 1),
+                          "ts": now})
         if ack:
             self.bus.publish(SPEAK_TOPIC, {"text": ack})
         return True
@@ -366,9 +376,11 @@ class DialogBroker:
           otherwise          - classify the utterance and route it onward:
               wake phrase        -> chat (UNHANDLED_TOPIC), stripped remainder,
                                     and the window is (re)opened;
-              open conversation  -> chat (UNHANDLED_TOPIC), full text, window NOT
-                                    re-extended (only wake / matched commands do,
-                                    so a chatty TV can't hold it open forever);
+              open conversation  -> chat (UNHANDLED_TOPIC), full text, and the
+                                    turn extends the channel (a conversation is
+                                    made of turns); Conversation.max_sec is the
+                                    backstop against a chatty TV, not the
+                                    phrase tables;
               bare command shape -> the LLM intent arbiter (UNCERTAIN_TOPIC),
                                     UNLESS it is already a repair (loop guard),
                                     or no capability actually claims it as a
