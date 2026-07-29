@@ -114,6 +114,7 @@ INTERESTING_TOPICS = (
     "picarx/action/result",
     "picarx/intent/feedback",
     "picarx/rc/demonstration",
+    "picarx/decision",
 )
 
 SYSTEM_PROMPT = """You are the offline reflection process of a small autonomous robot car

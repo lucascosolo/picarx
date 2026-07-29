@@ -1710,7 +1710,8 @@ class Companion:
                                         "tool_use_id": tu.get("id"),
                                         "content": "Tool-call budget exhausted for this turn."})
                         continue
-                    out = self._execute_tool(tu.get("name"), tu.get("input") or {})
+                    out = self._run_thinking_tool(
+                        tu.get("name"), tu.get("input") or {}, tu.get("id"))
                     results.append({"type": "tool_result",
                                     "tool_use_id": tu.get("id"),
                                     "content": out})
@@ -1743,13 +1744,46 @@ class Companion:
                     results.append({"type": "tool_result", "tool_use_id": tu.id,
                                     "content": "Tool-call budget exhausted for this turn."})
                     continue
-                out = self._execute_tool(tu.name, getattr(tu, "input", None) or {})
+                out = self._run_thinking_tool(
+                    tu.name, getattr(tu, "input", None) or {}, tu.id)
                 results.append({"type": "tool_result", "tool_use_id": tu.id,
                                 "content": out})
             convo.append({"role": "user", "content": results})
         if exhausted and not final_text:
             return "I reached the safe limit for this task before I could finish."
         return final_text
+
+    def _run_thinking_tool(self, name, tool_input, tool_use_id=None):
+        """Execute and journal a non-movement tool without logging its data.
+
+        The event logger is the durable learning boundary. It receives the
+        tool name, field names, and bounded outcome only, never note text,
+        source content, passwords, or arbitrary command arguments. Reflection
+        can therefore learn what this individual robot actually tends to do
+        and which requests succeed without turning the event log into a secret
+        transcript.
+        """
+        fields = sorted(str(key) for key in (tool_input or {})
+                        if str(key) != "confirmed")[:20]
+        self.bus.publish("picarx/decision", {
+            "source": "companion", "kind": "thinking_tool",
+            "choice": {"tool": str(name), "phase": "requested",
+                        "fields": fields},
+            "tool_use_id": str(tool_use_id or "")[:100] or None,
+            "reason": "the thinking conversation selected a bounded non-movement tool",
+            "ts": time.time(),
+        })
+        outcome = self._execute_tool(name, tool_input)
+        self.bus.publish("picarx/decision", {
+            "source": "companion", "kind": "thinking_tool",
+            "choice": {"tool": str(name), "phase": "completed",
+                        "ok": not str(outcome).lower().startswith(
+                            ("unknown tool", "that didn't work"))},
+            "tool_use_id": str(tool_use_id or "")[:100] or None,
+            "reason": "tool result: " + " ".join(str(outcome).split())[:240],
+            "ts": time.time(),
+        })
+        return outcome
 
     def _execute_tool(self, name, tool_input):
         """Run one tool call by publishing the matching mode/request topic.

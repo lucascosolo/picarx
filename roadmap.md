@@ -133,6 +133,14 @@ multi-tool plan can observe each daemon’s actual result before choosing its
 next step, and add explicit plan/approval state for long-running or
 destructive work.
 
+Growth architecture progress (2026-07-28): thinking-tool requests and
+bounded outcomes now enter the existing `picarx/decision` journal with only
+tool names, field names, and safe summaries. Reflection consumes that topic,
+so the robot can learn durable patterns about how this individual uses its
+capabilities without storing note contents, remote source, passwords, or raw
+command arguments. This keeps learning evidence-based rather than adding a
+second hard-coded personality memory.
+
 ### 4. Follow/perception reliability
 
 Follow already has freshness telemetry, bounded reacquisition, arbitration and

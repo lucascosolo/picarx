@@ -87,6 +87,15 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(self.c.bus.last(companion.RADIO_TOPIC), {
             "command": "find", "keywords": "jazz"})
 
+    def test_thinking_tool_journal_keeps_outcome_but_not_sensitive_fields(self):
+        out = self.c._run_thinking_tool(
+            "create_note", {"text": "private note", "confirmed": True}, "u1")
+        self.assertIn("saved", out.lower())
+        events = self.c.bus.of("picarx/decision")
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["choice"]["fields"], ["text"])
+        self.assertNotIn("private note", repr(events))
+
     def test_share_connection_publishes_bluetooth(self):
         self.c._execute_tool("share_connection", {"name": "Pixel"})
         msg = self.c.bus.last(companion.BLUETOOTH_CONNECT_TOPIC)
