@@ -83,6 +83,12 @@ safety daemon. Finish target-Pi validation, failed-start rollback, power-loss
 behavior, and service-environment checks. Keep update requests explicitly
 configured; never accept an arbitrary ref from speech.
 
+Progress (2026-07-28): the updater now flushes and fsyncs its rollback marker
+file and containing directory before the fast-forward merge begins. A sudden
+power loss during merge therefore still leaves the previous commit and target
+recorded for startup recovery; marker write failure aborts before changing the
+checkout. Regression tests verify the marker exists at merge time.
+
 ### 3. Remote project helper redesign
 
 `remote_assist.py`, companion tools, web controls, SSH host-key validation,

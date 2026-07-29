@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import tempfile
 import types
@@ -70,6 +71,26 @@ class RepositoryUpdaterTests(unittest.TestCase):
         status = [payload for topic, payload in self.events if topic == STATUS_TOPIC]
         self.assertEqual(status[-1]["state"], "rollback")
         self.assertIn("simulated failed check", status[-1]["error"])
+
+    def test_rollback_marker_is_present_before_merge(self):
+        seen = []
+
+        def git(command, **kwargs):
+            if command[3:5] == ["merge", "--ff-only"]:
+                seen.append(os.path.exists(self.updater.marker_path))
+            return self.git(command, **kwargs)
+
+        self.updater.run_command = git
+        self.updater._run_update("approved", "req-marker")
+        self.assertEqual(seen, [True])
+        self.assertFalse(os.path.exists(self.updater.marker_path))
+
+    def test_marker_write_is_complete_and_json_readable(self):
+        self.updater._write_marker({"previous_commit": "old", "new_commit": "new"})
+        with open(self.updater.marker_path, encoding="utf-8") as stream:
+            value = json.load(stream)
+        self.assertEqual(value["previous_commit"], "old")
+        self.assertFalse(os.path.exists(self.updater.marker_path + ".tmp"))
 
     def test_non_fast_forward_never_quiesces_or_merges(self):
         self.updater = RepositoryUpdater(

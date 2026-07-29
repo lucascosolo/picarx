@@ -209,12 +209,31 @@ class RepositoryUpdater:
         return True, "python compile and module registry checks passed"
 
     def _write_marker(self, payload):
-        os.makedirs(os.path.dirname(self.marker_path), exist_ok=True)
+        directory = os.path.dirname(self.marker_path) or "."
+        os.makedirs(directory, exist_ok=True)
         temporary = self.marker_path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2)
-            stream.write("\n")
-        os.replace(temporary, self.marker_path)
+        try:
+            with open(temporary, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.marker_path)
+            # The rename is not durable across a sudden power loss until the
+            # containing directory is synced. Refuse to merge if that cannot
+            # be established; the old checkout is safer than an unmarked new
+            # checkout that cannot self-rollback on the next boot.
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise UpdateError(f"could not durably write update marker: {exc}") from exc
 
     def _read_marker(self):
         try:
@@ -305,10 +324,9 @@ class RepositoryUpdater:
             if not self.quiesce():
                 raise UpdateError("could not quiesce Layer B safely")
             quiesced = True
-            self._git("merge", "--ff-only", remote_ref)
-            healthy, detail = self.health_check()
-            if not healthy:
-                raise UpdateError(f"pre-restart health check failed: {detail}")
+            # Write and fsync the rollback marker *before* changing HEAD. If
+            # power is lost during the merge or before re-exec, startup still
+            # knows which known-good commit to restore.
             self._write_marker({
                 "previous_commit": previous,
                 "new_commit": target,
@@ -316,6 +334,10 @@ class RepositoryUpdater:
                 "request_id": request_id,
                 "started_at": self.clock(),
             })
+            self._git("merge", "--ff-only", remote_ref)
+            healthy, detail = self.health_check()
+            if not healthy:
+                raise UpdateError(f"pre-restart health check failed: {detail}")
             self._emit("restarting", trigger=trigger, request_id=request_id,
                        previous_commit=previous, new_commit=target)
             self.restart()
