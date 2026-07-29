@@ -107,6 +107,7 @@ import robot_config
 from spatial_store import SpatialStore
 import person_memory
 import speech_match
+import capabilities
 
 # Smooth Ackermann steering controller (fail-soft: if it can't import,
 # the discrete _steer_away_angle law below keeps working unchanged).
@@ -142,16 +143,16 @@ EXPLORE_PRIORITY = 5
 EXPLORE_TICK_HZ = 5
 INTENT_TTL = 0.6       # must be > 1/EXPLORE_TICK_HZ so intents don't gap out
 
-# Utterances containing these are TOOL commands (tools_registry.py
-# routes them to their own modules). They must be ignored here so that
-# e.g. "stop radio" reaches the radio instead of tripping the
-# robot-wide "stop". Movement/safety words never appear in this list.
-# "music"/"song" are here because tools_registry now treats them as
-# radio synonyms AND escalates its own unparsed radio-ish utterances -
-# without them here both modules would escalate the same text twice.
-TOOL_KEYWORDS = ("radio", "station", "tools", "tune", "frequency", "dial", "fm",
-                 "music", "song", "ssh", "remote assist", "remote", "host",
-                 "remind", "reminder", "note", "notes", "meeting")
+# Utterances containing these are TOOL commands (tools_registry.py routes
+# them to their own modules). They must be ignored here so that e.g. "stop
+# radio" reaches the radio instead of tripping the robot-wide "stop", and so
+# both modules don't escalate the same unparsed text twice.
+#
+# This list is DERIVED from layer_b/capabilities.py, not maintained here: a
+# capability declares its own vocabulary once, and every module that needs to
+# know "is this utterance already spoken for?" reads the same source. Movement
+# and safety words are never capability vocabulary, so they can never appear.
+TOOL_KEYWORDS = capabilities.keywords()
 
 # Person identity (person_memory.py, optional): greet a recognized person
 # by name, but not every time their face is re-confirmed - once per

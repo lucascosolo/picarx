@@ -8,7 +8,7 @@ safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
 ## Current state (2026-07-28)
 
 - The repository is on `master`; the local implementation currently passes
-  1,000 tests. The full suite is the source-of-truth regression gate, while
+  1,016 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -356,6 +356,20 @@ targets; and never imply that label memory changed detector weights.
   capability-keyword source that both `field_agent.py` and
   `tools_registry.py` import, rather than adding a fourth/fifth hand-copied
   list.
+  Progress (2026-07-28), stage 1 of the refactor: `layer_b/capability_
+  registry.py` now provides the pure, stdlib-only mechanism (a `Capability`
+  declares its phrases, vocabulary, topic, and self-description; a `Router`
+  resolves one utterance to match / escalate / unclaimed in registration
+  order), and `layer_b/capabilities.py` holds the declarations for reminders,
+  notes, remote assist, and radio. `tools_registry.py` is now a thin bus
+  adapter over the router, and `field_agent.py`'s `TOOL_KEYWORDS` is derived
+  from `capabilities.keywords()` instead of hand-copied, so the two lists can
+  no longer drift. Dispatch order and every existing rule are unchanged (the
+  old flat table was already grouped in this order); a regression test asserts
+  no movement word can become capability vocabulary. Remaining stages:
+  fold `attention.py`/`dialog.py` addressing into the same decision, route
+  companion's LLM tool calls back through the router, and give the escalation
+  path a single audit trail.
 - **New tools scaffold — dice, clock, weather, web search:** add four small
   tools following the existing `tools_registry.py` + `layer_b/modules/tools/`
   pattern (one bus topic and `module_registry.json` entry per tool, always-on
@@ -427,7 +441,7 @@ safety daemon is the final authority.
 ## Delivery rules
 
 Use fake camera/MediaPipe/worker/process/servo/thermal/SSH tests off-robot,
-then field-test on the Pi. Current local full-suite baseline is 1,000 passing
+then field-test on the Pi. Current local full-suite baseline is 1,016 passing
 tests (`python3 -m unittest discover -s tests -p 'test_*.py'`); warnings from
 existing resource-cleanup tests are non-fatal.
 Keep commits scoped (for example, gesture worker; packaging; roadmap), push
