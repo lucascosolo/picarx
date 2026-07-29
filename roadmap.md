@@ -249,8 +249,12 @@ targets; and never imply that label memory changed detector weights.
   limits.
   Progress (2026-07-28): a shared `ClipStore` now provides generated-ID-only
   paths, atomic media/metadata finalization, incomplete-capture cleanup, and
-  bounded per-clip/count/total-storage limits. Capture and playback control
-  integration remains next.
+  bounded per-clip/count/total-storage limits. Capture/playback control now
+  uses the central camera subscription, delegates audio to the existing
+  microphone stream, owns the `LOCAL_CAPTURE` lease, and interrupts on higher
+  priority state. Companion exposes confirmed capture plus bounded clip
+  management as non-movement thinking tools. Real-device camera/ALSA codec
+  validation remains outstanding.
 - **Responsive web UI:** refresh the existing web console with a lightweight,
   attractive responsive design that remains usable on phones and desktops.
   Preserve the current typed safety/control boundaries, keep pages fast on the

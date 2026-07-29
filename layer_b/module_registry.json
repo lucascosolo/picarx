@@ -57,7 +57,6 @@
         "OBJECT_DETECTION",
         "SPEAKING",
         "REMOTE_ASSIST",
-        "LOCAL_CAPTURE",
         "RC"
       ]
     }
@@ -312,6 +311,15 @@
     "name": "health_daemon",
     "version": "0.1",
     "entrypoint": "tools/health_daemon.py",
+    "enabled": true,
+    "activation": {
+      "mode": "always"
+    }
+  },
+  {
+    "name": "clip_daemon",
+    "version": "0.1",
+    "entrypoint": "tools/clip_daemon.py",
     "enabled": true,
     "activation": {
       "mode": "always"

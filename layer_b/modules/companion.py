@@ -295,6 +295,8 @@ REMINDER_RESULT_TOPIC = "picarx/tools/reminder/result"
 REMINDER_STATE_TOPIC = "picarx/tools/reminder/state"
 NOTES_TOPIC = "picarx/tools/notes"
 NOTES_RESULT_TOPIC = "picarx/tools/notes/result"
+CLIP_TOPIC = "picarx/tools/clip"
+CLIP_RESULT_TOPIC = "picarx/tools/clip/result"
 FOLLOW_CONTROL_TOPIC = "picarx/tools/follow/set"
 BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 HEALTH_STATE_TOPIC = "picarx/health/state"
@@ -391,6 +393,28 @@ TOOLS = [
          "title": {"type": "string"}, "id": {"type": "string"},
          "confirmed": {"type": "boolean"}, "plan_id": {"type": "string"}},
          "required": ["action"]}},
+    {"name": "capture_clip",
+     "description": "Capture a short local audio or video clip for the person. "
+                    "Recording requires explicit confirmed=true; clips stay "
+                    "local, are bounded by duration/storage limits, and can "
+                    "be interrupted by safety or speech activity.",
+     "input_schema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["audio", "video"]},
+         "duration_sec": {"type": "number", "minimum": 0.1,
+                           "maximum": 15},
+         "confirmed": {"type": "boolean"}},
+         "required": ["kind", "duration_sec"]}},
+    {"name": "manage_clips",
+     "description": "List, inspect, play, stop, or delete local clips. "
+                    "Deleting a clip requires explicit confirmation and an "
+                    "approved plan; playback and status are read-only/control "
+                    "operations.",
+     "input_schema": {"type": "object", "properties": {
+         "operation": {"type": "string", "enum": ["list", "status",
+                       "play", "delete", "stop"]},
+         "id": {"type": "string"}, "confirmed": {"type": "boolean"},
+         "plan_id": {"type": "string"}},
+         "required": ["operation"]}},
     {"name": "share_connection",
      "description": "Get internet by tethering over BLUETOOTH to the person's "
                     "already-paired phone, so radio and chat keep working where "
@@ -833,6 +857,7 @@ class Companion:
         self.latest_follow_status = None
         self.latest_remote_result = None
         self.latest_radio_state = None
+        self.latest_clip_result = None
         self._tool_result_condition = threading.Condition()
         self._tool_results = {}
         self._thinking_runs_lock = threading.Lock()
@@ -1112,6 +1137,11 @@ class Companion:
             self.latest_radio_state = dict(payload or {})
 
     def on_notes_result(self, payload):
+        self._record_tool_result(payload)
+
+    def on_clip_result(self, payload):
+        with self.lock:
+            self.latest_clip_result = dict(payload or {})
         self._record_tool_result(payload)
 
     def _record_tool_result(self, payload):
@@ -2295,6 +2325,7 @@ class Companion:
                     follow = dict(getattr(self, "latest_follow_status", None) or {})
                     remote = dict(getattr(self, "latest_remote_result", None) or {})
                     radio = dict(getattr(self, "latest_radio_state", None) or {})
+                    clip = dict(getattr(self, "latest_clip_result", None) or {})
                 parts = [f"mode {state.get('state') or 'unknown'}"]
                 claims = state.get("claims")
                 if isinstance(claims, list) and claims:
@@ -2314,6 +2345,13 @@ class Companion:
                 if radio:
                     parts.append("radio " + (f"playing {radio.get('station')}"
                                               if radio.get("playing") else "off"))
+                if clip:
+                    clip_result = clip.get("result") or {}
+                    clip_kind = clip_result.get("kind") if isinstance(
+                        clip_result, dict) else None
+                    parts.append("clips " + (f"last {clip_kind} capture"
+                                              if clip_kind else str(
+                                                  clip.get("command") or "active")))
                 if remote:
                     parts.append("remote session " + str(
                         remote.get("command") or remote.get("state") or "active"))
@@ -2448,6 +2486,44 @@ class Companion:
                 result = self._dispatch_thinking_request(
                     NOTES_TOPIC, request, NOTES_RESULT_TOPIC)
                 return f"Meeting notes {action}; {result}"
+            if name == "capture_clip":
+                kind = str(tool_input.get("kind") or "").lower()
+                if kind not in {"audio", "video"}:
+                    return "A clip must be audio or video."
+                if not bool(tool_input.get("confirmed")):
+                    return ("I need explicit confirmation before recording. Ask the "
+                            "person to confirm that this local " + kind + " clip "
+                            "may be captured.")
+                try:
+                    duration = float(tool_input.get("duration_sec"))
+                except (TypeError, ValueError):
+                    return "I need a clip duration in seconds."
+                if not math.isfinite(duration) or not 0.1 <= duration <= 15.0:
+                    return "Clip duration must be between 0.1 and 15 seconds."
+                request = {"command": "capture", "kind": kind,
+                           "duration_sec": duration, "confirmed": True,
+                           "source": "thinking"}
+                result = self._dispatch_thinking_request(
+                    CLIP_TOPIC, request, CLIP_RESULT_TOPIC)
+                return f"Local {kind} clip capture requested; {result}"
+            if name == "manage_clips":
+                operation = str(tool_input.get("operation") or "").lower()
+                if operation not in {"list", "status", "play", "delete", "stop"}:
+                    return "I can list, inspect, play, stop, or delete local clips."
+                if operation == "delete" and not bool(tool_input.get("confirmed")):
+                    return "I need explicit confirmation before deleting a local clip."
+                if operation == "delete":
+                    blocked = self._approved_plan_required(
+                        tool_input, "manage_clips.delete")
+                    if blocked:
+                        return blocked
+                request = {"command": operation, "source": "thinking"}
+                for key in ("id", "confirmed"):
+                    if tool_input.get(key) not in (None, ""):
+                        request[key] = tool_input[key]
+                result = self._dispatch_thinking_request(
+                    CLIP_TOPIC, request, CLIP_RESULT_TOPIC)
+                return f"Clips {operation}; {result}"
             if name == "start_following":
                 self.bus.publish(FOLLOW_CONTROL_TOPIC, {"enabled": True})
                 return "Following started; movement is safety-checked."
@@ -2713,6 +2789,7 @@ class Companion:
         self.bus.subscribe(REMINDER_STATE_TOPIC, self.on_reminder_state)
         self.bus.subscribe(REMINDER_RESULT_TOPIC, self.on_reminder_result)
         self.bus.subscribe(NOTES_RESULT_TOPIC, self.on_notes_result)
+        self.bus.subscribe(CLIP_RESULT_TOPIC, self.on_clip_result)
         self.bus.subscribe(THINKING_CONTROL_TOPIC, self.on_thinking_control)
         self.bus.subscribe(PERCEPTION_IDENTIFY_TOPIC, self.on_identify)
         self.bus.subscribe(IMU_EVENT_TOPIC, self.on_imu_event)

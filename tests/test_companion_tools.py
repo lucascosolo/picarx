@@ -138,12 +138,46 @@ class CompanionToolTest(unittest.TestCase):
         tools = self.c._execute_tool("describe_tools", {})
         self.assertIn("schedule_reminder", tools)
         self.assertIn("control_radio", tools)
+        self.assertIn("capture_clip", tools)
+        self.assertIn("manage_clips", tools)
         self.assertNotIn("start_following", tools)
         self.c.latest_robot_state = {"state": "IDLE", "claims": []}
         self.c.latest_health = {"battery_v": 7.4, "battery_pct": 58}
         status = self.c._execute_tool("get_robot_status", {})
         self.assertIn("mode IDLE", status)
         self.assertIn("battery 7.4 volts", status)
+
+    def test_capture_clip_requires_explicit_confirmation(self):
+        out = self.c._execute_tool("capture_clip", {
+            "kind": "audio", "duration_sec": 2})
+        self.assertIn("confirmation", out.lower())
+        self.assertEqual(self.c.bus.of(companion.CLIP_TOPIC), [])
+
+    def test_confirmed_clip_capture_publishes_typed_request(self):
+        parent = self.c
+
+        class ReplyBus(harness.FakeBus):
+            def publish(self, topic, payload):
+                super().publish(topic, payload)
+                if topic == companion.CLIP_TOPIC:
+                    parent.on_clip_result({
+                        "request_id": payload["request_id"], "ok": True,
+                        "result": {"kind": payload["kind"], "pending": True}})
+
+        self.c.bus = ReplyBus()
+        out = self.c._execute_tool("capture_clip", {
+            "kind": "video", "duration_sec": 3, "confirmed": True})
+        self.assertIn("completed", out.lower())
+        request = self.c.bus.last(companion.CLIP_TOPIC)
+        self.assertEqual(request["kind"], "video")
+        self.assertEqual(request["duration_sec"], 3.0)
+        self.assertTrue(request["confirmed"])
+
+    def test_clip_delete_requires_approved_plan(self):
+        out = self.c._execute_tool("manage_clips", {
+            "operation": "delete", "id": "clip-1", "confirmed": True})
+        self.assertIn("explicitly approved thinking plan", out.lower())
+        self.assertEqual(self.c.bus.of(companion.CLIP_TOPIC), [])
 
     def test_thinking_task_can_be_canceled_without_motion(self):
         event = threading.Event()

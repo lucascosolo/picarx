@@ -79,8 +79,10 @@ import queue
 import subprocess
 import socket
 import threading
+import wave
 from collections import deque
 from vosk import Model, KaldiRecognizer
+from clip_store import ClipError, ClipStore
 
 # The safety daemon is the sole owner of Robot HAT hardware. Audio requests
 # the amp-enable operation over its Unix socket instead of starting the
@@ -103,6 +105,8 @@ SPEAKER_ENABLE_INTERVAL = 5.0
 # throttle just keeps a chatty announcement stream from sending a safety
 # request on every single line.
 SPEAKER_REASSERT_INTERVAL = 10.0
+AUDIO_CLIP_CONTROL_TOPIC = "picarx/tools/clip/audio"
+AUDIO_CLIP_RESULT_TOPIC = "picarx/tools/clip/audio/result"
 
 try:
     import audioop  # stdlib; removed in 3.13+, hence the fallback below
@@ -525,6 +529,13 @@ class AudioNode:
         # "unmuted but silent" is the worst failure mode. Only gates TTS;
         # the radio stream has its own stop/play controls.
         self.speaker_enabled = True
+        # The microphone stream already belongs to this process. Short local
+        # audio clips therefore record from its bounded PCM chunks instead of
+        # opening a second ALSA handle and racing speech recognition.
+        self._clip_lock = threading.RLock()
+        self._audio_clip = None
+        self._clip_store = None
+        self._audio_stream_ready = False
 
         # TTS output path: a single dedicated worker thread drains a queue
         # and plays one clip at a time. Callers (the picarx/audio/speak bus
@@ -773,10 +784,123 @@ class AudioNode:
         self.bus.publish("picarx/audio/speaker_state",
                          {"enabled": self.speaker_enabled, "ts": time.time()})
 
+    def _get_clip_store(self):
+        if self._clip_store is None:
+            self._clip_store = ClipStore(robot_config.data_path("clips"))
+        return self._clip_store
+
+    def _clip_result(self, payload, ok=True, result=None, error=None):
+        response = {"ok": bool(ok), "command": "capture",
+                    "request_id": payload.get("request_id"),
+                    "ts": time.time()}
+        if result is not None:
+            response["result"] = result
+        if error:
+            response["error"] = str(error)[:300]
+        self.bus.publish(AUDIO_CLIP_RESULT_TOPIC, response)
+        return response
+
+    def _finish_audio_clip(self, error=None, now=None):
+        with self._clip_lock:
+            clip = self._audio_clip
+            self._audio_clip = None
+        if clip is None:
+            return None
+        try:
+            clip["wave"].close()
+            if error:
+                self._get_clip_store().abort(clip["reservation"])
+                result = self._clip_result(
+                    clip["payload"], ok=False, error=error)
+            else:
+                duration = max(0.0, (time.time() if now is None else now) -
+                               clip["started_at"])
+                result = self._clip_result(
+                    clip["payload"], result=self._get_clip_store().finalize(
+                        clip["reservation"], duration_sec=duration))
+        except (ClipError, OSError, wave.Error) as exc:
+            try:
+                self._get_clip_store().abort(clip["reservation"])
+            except Exception:
+                pass
+            result = self._clip_result(clip["payload"], ok=False, error=exc)
+        return result
+
+    def _write_audio_clip(self, data, now=None):
+        """Append one already-filtered PCM chunk, returning whether active."""
+        now = time.time() if now is None else float(now)
+        with self._clip_lock:
+            clip = self._audio_clip
+            if clip is None:
+                return False
+            should_finish = False
+            try:
+                clip["wave"].writeframesraw(data)
+            except (OSError, ValueError) as exc:
+                # Release the lock before finalization, which closes the same
+                # wave object and publishes the typed result.
+                pass_error = exc
+            else:
+                pass_error = None
+                if now >= clip["deadline"]:
+                    should_finish = True
+        if pass_error is not None:
+            self._finish_audio_clip(error=str(pass_error), now=now)
+        elif should_finish:
+            self._finish_audio_clip(now=now)
+        return True
+
+    def on_clip_control(self, payload):
+        """Start/stop a consented audio clip on the existing mic stream."""
+        payload = dict(payload or {})
+        command = str(payload.get("command") or payload.get("op") or "").lower()
+        if command == "stop":
+            result = self._finish_audio_clip(error="audio clip interrupted")
+            return result or self._clip_result(payload, ok=False,
+                                               error="no active audio clip")
+        if command != "capture":
+            return self._clip_result(payload, ok=False,
+                                     error="unsupported audio clip command")
+        if payload.get("confirmed") is not True:
+            return self._clip_result(payload, ok=False,
+                                     error="explicit recording confirmation is required")
+        if not self.mic_enabled or not self._audio_stream_ready:
+            return self._clip_result(payload, ok=False,
+                                     error="microphone stream is unavailable")
+        with self._clip_lock:
+            if self._audio_clip is not None:
+                return self._clip_result(payload, ok=False,
+                                         error="another audio clip is active")
+            try:
+                reservation = self._get_clip_store().begin(
+                    "audio", payload.get("duration_sec", 5.0))
+                recorder = wave.open(reservation["temporary_path"], "wb")
+                recorder.setnchannels(1)
+                recorder.setsampwidth(2)
+                recorder.setframerate(SAMPLE_RATE)
+                started = time.time()
+                self._audio_clip = {
+                    "payload": payload,
+                    "reservation": reservation,
+                    "wave": recorder,
+                    "started_at": started,
+                    "deadline": started + reservation["duration_sec"],
+                }
+            except (ClipError, OSError, wave.Error) as exc:
+                try:
+                    self._get_clip_store().abort(locals().get("reservation"))
+                except Exception:
+                    pass
+                return self._clip_result(payload, ok=False, error=exc)
+        return self._clip_result(payload, result={
+            "id": reservation["id"], "kind": "audio", "pending": True,
+            "duration_sec": reservation["duration_sec"]})
+
     def run(self):
         self.bus.subscribe("picarx/audio/speak", self.handle_speak_request)
         self.bus.subscribe("picarx/audio/mic_control", self.on_mic_control)
         self.bus.subscribe("picarx/audio/speaker_control", self.on_speaker_control)
+        self.bus.subscribe(AUDIO_CLIP_CONTROL_TOPIC, self.on_clip_control)
         self._enable_speakers()
         self._ensure_tts_worker()
 
@@ -807,6 +931,7 @@ class AudioNode:
         voice_filter = VoiceBandFilter() if BANDPASS_ENABLED else _PassThrough()
         print(f"Audio node: voice-band filter {'on' if BANDPASS_ENABLED else 'off'} "
               f"({BANDPASS_HP_HZ:.0f}-{BANDPASS_LP_HZ:.0f} Hz)")
+        self._audio_stream_ready = True
         prebuffer = deque(maxlen=PREBUFFER_CHUNKS)
         self._last_stop_reflex_at = 0.0
         gate_was_open = False
@@ -823,6 +948,8 @@ class AudioNode:
             # Remotely disabled (web console kill-switch): keep reading
             # so the arecord pipe never backs up, but decode nothing.
             if not self.mic_enabled:
+                if self._audio_clip is not None:
+                    self._finish_audio_clip(error="microphone was disabled")
                 prebuffer.clear()
                 continue
 
@@ -832,6 +959,8 @@ class AudioNode:
             # prebuffer (we don't want our own voice flushed into the
             # recognizer when the gate next opens).
             if now < self.mute_until:
+                if self._audio_clip is not None:
+                    self._finish_audio_clip(error="clip interrupted by speaker playback")
                 prebuffer.clear()
                 continue
 
@@ -840,6 +969,7 @@ class AudioNode:
             # rumble, and the gate below keys on voice-band energy.
             data = voice_filter.process(data)
             data = _apply_gain(data, AUDIO_GAIN)
+            self._write_audio_clip(data, now=now)
             rms = _chunk_rms(data)
 
             if not gate.process(data, rms, now):
@@ -877,6 +1007,9 @@ class AudioNode:
             # finalizes immediately; otherwise we wait for gate close.
             if self.rec.AcceptWaveform(data):
                 self._emit_result(self.rec.Result(), now)
+
+        self._audio_stream_ready = False
+        self._finish_audio_clip(error="microphone stream ended")
 
     def _emit_result(self, result_json, now):
         try:
