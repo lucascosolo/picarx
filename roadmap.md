@@ -389,16 +389,37 @@ targets; and never imply that label memory changed detector weights.
     opener on a sentence-length utterance. It routes to chat but deliberately
     does NOT open the conversation window, and companion's deterministic
     quality gate still decides whether an API call happens.
-  - *Still open:* a question that merely mentions robot vocabulary ("do you
-    like music") classifies as COMMAND_SHAPE and goes to the LLM intent
-    arbiter, which has a `chat` verdict for it — but under
-    `INTENT_REPAIR_COOLDOWN` it is dropped instead, so conversation is lost to
-    a command-repair throttle. The right fix is capability ownership: ask the
-    capability router whether anything actually claims the utterance before
-    treating it as a command, which belongs to the routing-unification item
-    below. Also unvalidated on the Pi: whether the artifact repair fires as
+  - *"Do you like music" hole (fixed 2026-07-29):* a question that merely
+    mentions a capability's vocabulary used to classify as COMMAND_SHAPE and go
+    to the LLM intent arbiter, where `INTENT_REPAIR_COOLDOWN` (a budget for
+    misheard *orders*) dropped it. `dialog._is_talk_about_a_capability()` now
+    asks the capability router whether anything actually PARSES the utterance;
+    talk that no capability claims, isn't shaped like an instruction, and
+    addresses the robot in the second person goes to chat instead. This is the
+    first piece of the router inversion in the Direction section.
+  - *Still open:* unvalidated on the Pi — whether the artifact repair fires as
     often as the field symptom suggests (watch the `raw` field), and whether
     CHAT_SHAPE raises LLM spend near a television.
+
+- **Stale intent lingers in context — Marco doesn't know when something stops
+  mattering (owner-reported, 2026-07-29):** he deletes a note successfully, the
+  conversation moves on, and turns later he appends "still waiting on your
+  go-ahead to delete that note!" to an unrelated reply. Diagnosed:
+  `companion._context_blurb()` recites `thinking plan <id> is
+  pending/approved/completed` into EVERY turn's context while the plan is in
+  any of those states, and a *completed* plan is never expired at all
+  (`ThinkingPlanManager._expire_locked` only expires `pending`/`approved`, and
+  only after the 600s TTL). So a finished note-delete plan sits in his context
+  and he dutifully narrates it. The same shape affects `pending_reminders` and
+  `awaiting_correction`: per-turn state injected with no link between "the task
+  is done / we changed subject" and "stop mentioning it." Symptom-level fix is
+  small (clear/tombstone a plan once its goal is satisfied, and don't recite
+  `completed` plans), but the RIGHT fix is the Direction one: relevance should
+  be something Marco judges from the conversation, not a status enum that
+  outlives the topic. A durable turn should carry an explicit "is this still
+  live?" notion — resolved intents drop out of context, and stale ones age out
+  by conversational distance, not just wall-clock TTL. Scope: `_context_blurb`,
+  `ThinkingPlanManager`, and how reminder/correction state is folded in.
 - **Unify utterance routing behind one arbiter (architecture debt):** today,
   "is this utterance for me, and who handles it" logic is split across several
   independently-maintained phrase/keyword lists that have to be hand-kept in
