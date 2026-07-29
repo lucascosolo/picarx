@@ -1,14 +1,14 @@
 # PiCar-X roadmap / engineering handoff
 
-Updated 2026-07-28. Repository: `lucascosolo/picarx`, branch `master`.
+Updated 2026-07-29. Repository: `lucascosolo/picarx`, branch `master`.
 This file is the compact source of truth for future coding sessions. Prefer
 small, scoped commits; run the full test suite before pushing. Never weaken the
 safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
 
-## Current state (2026-07-28)
+## Current state (2026-07-29)
 
 - The repository is on `master`; the local implementation currently passes
-  1,047 tests. The full suite is the source-of-truth regression gate, while
+  1,063 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -26,6 +26,12 @@ safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
   two-column layout on larger screens. Existing typed endpoints and RC
   dead-man behavior were not changed. Browser rendering and touch testing on
   the actual Pi remain outstanding.
+- Voice input got two owner-reported responsiveness fixes: the phantom leading
+  word Vosk invents is now stripped using the decoder's own per-word
+  confidence, and plain talk aimed at the robot (second person / question
+  shape) reaches the chat path instead of being dropped for not being an
+  order. Both are off-robot tested only; see the responsiveness item below for
+  what is still open.
 - Local clips are bounded and interruptible, but camera/ALSA codec behavior,
   playback devices, and service startup have not yet been validated on the
   target Pi. The gesture native runtime/package decision and provisioned-host
@@ -314,6 +320,40 @@ targets; and never imply that label memory changed detector weights.
   authoritative. Later add validated fingerprint thresholds, directed edges and
   traversal timestamps, conservative IMU quality policy, audited merge/split,
   then optional embeddings only after an evaluation corpus.
+- **Conversational responsiveness (owner-reported, 2026-07-29):** the robot
+  "imagines the word 'The' before almost every sentence and refuses to respond
+  to almost anything besides pre-programmed command phrases." Two causes, both
+  now addressed, plus what is still open.
+  - *Phantom lead word (fixed):* Vosk prepends a word nobody said — usually
+    "the" — as the cheapest acoustic explanation for a breath, a lip smack, or
+    the leading edge of a word the noise gate clipped. It shifts the sentence
+    one word right, and `speech_match.looks_directed_command()` keys on the
+    FIRST word, so "take me to the kitchen" arriving as "the take me to the
+    kitchen" stopped looking like an instruction and was dropped as chatter.
+    `speech_match.strip_decoder_artifacts()` now removes it using the decoder's
+    OWN per-word confidence (absolute floor, or well below the surrounding
+    words) rather than blanket-stripping articles, which would quietly rewrite
+    real speech; no word-level evidence means no strip. `audio_nodes` applies
+    it before averaging confidence and keeps the original as `raw` on
+    `picarx/audio/heard`.
+  - *Everything that wasn't an order was dropped (fixed):* `attention.classify`
+    recognized only wake phrase / open conversation window / command shape, so
+    outside the 45s window plain talk died silently in `dialog.on_directed`.
+    New weakest reason `attention.CHAT_SHAPE`
+    (`attention.looks_conversational()`): second-person address, or a question
+    opener on a sentence-length utterance. It routes to chat but deliberately
+    does NOT open the conversation window, and companion's deterministic
+    quality gate still decides whether an API call happens.
+  - *Still open:* a question that merely mentions robot vocabulary ("do you
+    like music") classifies as COMMAND_SHAPE and goes to the LLM intent
+    arbiter, which has a `chat` verdict for it — but under
+    `INTENT_REPAIR_COOLDOWN` it is dropped instead, so conversation is lost to
+    a command-repair throttle. The right fix is capability ownership: ask the
+    capability router whether anything actually claims the utterance before
+    treating it as a command, which belongs to the routing-unification item
+    below. Also unvalidated on the Pi: whether the artifact repair fires as
+    often as the field symptom suggests (watch the `raw` field), and whether
+    CHAT_SHAPE raises LLM spend near a television.
 - **Unify utterance routing behind one arbiter (architecture debt):** today,
   "is this utterance for me, and who handles it" logic is split across several
   independently-maintained phrase/keyword lists that have to be hand-kept in
@@ -456,7 +496,7 @@ safety daemon is the final authority.
 ## Delivery rules
 
 Use fake camera/MediaPipe/worker/process/servo/thermal/SSH tests off-robot,
-then field-test on the Pi. Current local full-suite baseline is 1,047 passing
+then field-test on the Pi. Current local full-suite baseline is 1,063 passing
 tests (`python3 -m unittest discover -s tests -p 'test_*.py'`); warnings from
 existing resource-cleanup tests are non-fatal.
 Keep commits scoped (for example, gesture worker; packaging; roadmap), push
