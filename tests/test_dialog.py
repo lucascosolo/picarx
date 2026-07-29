@@ -188,6 +188,22 @@ class DirectedRoutingTest(unittest.TestCase):
         self._directed(text="the weather is nice today")
         self.assertIsNone(self.d.bus.last(UNHANDLED))
 
+    def test_talk_aimed_at_the_robot_reaches_chat(self):
+        # No wake word, no open window, no command vocabulary - but plainly
+        # spoken TO the robot. This used to be dropped in silence.
+        self._directed(text="how are you feeling today", confidence=0.8)
+        self.assertEqual(self.d.bus.last(UNHANDLED)["text"],
+                         "how are you feeling today")
+        self.assertIsNone(self.d.bus.last(UNCERTAIN))
+
+    def test_chat_shaped_talk_does_not_open_the_window(self):
+        # Overhearing one question must not hand the next 45 seconds of room
+        # noise to the chat path.
+        self._directed(text="how are you feeling today")
+        self.d.bus.clear()
+        self._directed(text="the weather is nice today")
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+
     def test_empty_or_missing_text_is_a_noop(self):
         self._directed(text="   ")
         self._directed(confidence=0.5)

@@ -69,6 +69,46 @@ Addressing = namedtuple("Addressing", "addressed reason remainder")
 WAKE = "wake"                  # opened with a wake phrase ("robot, ...")
 CONVERSATION = "conversation"  # within the no-wake-word follow-up window
 COMMAND_SHAPE = "command_shape"  # robot vocabulary / imperative shape, no wake word
+CHAT_SHAPE = "chat_shape"      # spoken TO the robot, but as talk rather than an order
+
+# ---------------------------------------------------------------------
+# "Talk aimed at me" - the difference between a mute robot and a companion
+# ---------------------------------------------------------------------
+# The three reasons above all want an ORDER: a wake phrase, an open window, or
+# robot vocabulary / an imperative. Everything else was dropped in silence, so
+# outside the 45-second window the robot answered pre-programmed phrasings and
+# nothing else - "do you like music", "how are you", "what do you think that
+# is" all died before reaching the chat path.
+#
+# Second-person address is the signal that costs nothing and means everything:
+# people say "you" to the thing they're talking to. A question opener is the
+# weaker sibling (people also ask the room), so it takes a longer utterance to
+# count. Both are only a routing hint - companion.py's quality gate is still
+# what decides whether an LLM call happens, so a chatty television reaches a
+# deterministic word-list screen, not the API.
+_SECOND_PERSON = {"you", "your", "youre", "you're", "yours", "yourself", "u"}
+_QUESTION_OPENERS = {
+    "what", "whats", "what's", "where", "when", "why", "how", "who", "whos",
+    "who's", "which", "is", "are", "am", "do", "does", "did", "can", "could",
+    "would", "should", "will", "have", "has", "tell", "any",
+}
+# A lone "why" or "you" is as likely to be noise as speech; talk aimed at
+# someone is a sentence.
+CHAT_MIN_TOKENS = 3
+
+
+def looks_conversational(text):
+    """True when an utterance is aimed at the robot as SPEECH rather than as a
+    command - it addresses it in the second person, or opens like a question.
+
+    Deliberately shallow: this only decides whether the utterance gets to be
+    HEARD by the chat path, never whether anything is spent answering it."""
+    toks = speech_match.tokens(text)
+    if len(toks) < CHAT_MIN_TOKENS:
+        return False
+    if any(t in _SECOND_PERSON for t in toks):
+        return True
+    return toks[0] in _QUESTION_OPENERS
 
 
 def normalize_wake_phrases(value):
@@ -106,10 +146,10 @@ def classify(text, canon=None, *, wake_phrases=(), in_conversation=False):
     speech_match.canonicalize() form (pass it in so we don't recompute it);
     `in_conversation` is the caller's 'we spoke recently' window state.
 
-    Order matches the old field_agent forwarding tail exactly: an explicit
-    wake phrase wins, then an open conversation window, then a bare
-    command-shaped utterance. Pure - the caller owns the clock and the
-    window."""
+    Most-explicit first: an explicit wake phrase wins, then an open
+    conversation window, then a bare command-shaped utterance, and finally
+    plain talk aimed at the robot (see looks_conversational). Pure - the
+    caller owns the clock and the window."""
     remainder = strip_wake_phrase(text, wake_phrases)
     if remainder is not None:
         return Addressing(True, WAKE, remainder)
@@ -119,6 +159,8 @@ def classify(text, canon=None, *, wake_phrases=(), in_conversation=False):
         canon = speech_match.canonicalize(text)
     if speech_match.looks_command_like(canon) or speech_match.looks_directed_command(text):
         return Addressing(True, COMMAND_SHAPE, (text or "").lower().strip())
+    if looks_conversational(text):
+        return Addressing(True, CHAT_SHAPE, (text or "").lower().strip())
     return Addressing(False, None, None)
 
 

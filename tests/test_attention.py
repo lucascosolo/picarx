@@ -71,6 +71,38 @@ class ClassifyTest(unittest.TestCase):
         self.assertFalse(a.addressed)
         self.assertIsNone(a.reason)
 
+    def test_second_person_talk_is_addressed(self):
+        for text in ("do you like jokes", "what do you think",
+                     "how are you feeling", "you are funny"):
+            a = attention.classify(text, wake_phrases=WAKE)
+            self.assertEqual(a.reason, attention.CHAT_SHAPE, text)
+            self.assertEqual(a.remainder, text)
+
+    def test_question_shape_is_addressed(self):
+        a = attention.classify("why is the sky blue", wake_phrases=WAKE)
+        self.assertEqual(a.reason, attention.CHAT_SHAPE)
+
+    def test_overheard_statements_stay_unaddressed(self):
+        # No second person, no question opener - the television keeps talking
+        # to itself.
+        for text in ("the weather is nice today", "i had lunch already",
+                     "we should leave at six"):
+            self.assertFalse(attention.classify(text, wake_phrases=WAKE).addressed,
+                             text)
+
+    def test_fragments_are_too_short_to_be_talk(self):
+        for text in ("you", "why", "how come"):
+            self.assertFalse(attention.looks_conversational(text), text)
+
+    def test_command_shape_still_wins_over_chat_shape(self):
+        # "what time is it" is a capability, not conversation - it must keep
+        # routing to the command path. So does a question that merely mentions
+        # robot vocabulary ("do you like music"): it goes to the intent
+        # arbiter, which has its own chat verdict for exactly this case.
+        for text in ("what time is it", "do you like music"):
+            a = attention.classify(text, wake_phrases=WAKE)
+            self.assertEqual(a.reason, attention.COMMAND_SHAPE, text)
+
     def test_precedence_wake_over_conversation(self):
         # A wake phrase reports WAKE even mid-conversation (so the remainder is
         # stripped), not CONVERSATION.

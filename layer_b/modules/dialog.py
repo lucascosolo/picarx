@@ -220,6 +220,9 @@ class DialogBroker:
                                     so a chatty TV can't hold it open forever);
               bare command shape -> the LLM intent arbiter (UNCERTAIN_TOPIC),
                                     UNLESS it is already a repair (loop guard);
+              chat shape         -> chat (UNHANDLED_TOPIC): talk aimed at the
+                                    robot ("do you like music") with no wake
+                                    word and no open window; window NOT opened;
               not addressed      -> dropped.
         An utterance just routed as an ANSWER to an open question (on_heard) is
         also dropped here, so it reaches its asker only and isn't re-forwarded to
@@ -269,6 +272,14 @@ class DialogBroker:
             # A wake-less follow-up inside the window: chat, but don't re-extend.
             self.bus.publish(UNHANDLED_TOPIC, {"text": text, "confidence": confidence})
             print(f"Dialog: in-conversation chat -> companion: '{text}'")
+        elif addressing.reason == attention.CHAT_SHAPE:
+            # Talk aimed at the robot with no wake word and no open window
+            # ("do you like music"). Reaches chat, where companion's quality
+            # gate decides whether it's worth answering; the window is NOT
+            # opened, so overhearing one question doesn't hand the next 45
+            # seconds of room noise to the LLM.
+            self.bus.publish(UNHANDLED_TOPIC, {"text": text, "confidence": confidence})
+            print(f"Dialog: chat-shaped -> companion: '{text}'")
         else:
             print(f"Dialog: not addressed, dropping: '{text}'")
 
