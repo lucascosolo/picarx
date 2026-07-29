@@ -57,6 +57,7 @@
         "OBJECT_DETECTION",
         "SPEAKING",
         "REMOTE_ASSIST",
+        "LOCAL_CAPTURE",
         "RC"
       ]
     }

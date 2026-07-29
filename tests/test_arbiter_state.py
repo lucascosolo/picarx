@@ -32,6 +32,7 @@ class ArbiterStateGateTests(unittest.TestCase):
     def test_speaking_and_rc_drop_competing_head_commands(self):
         for mode, owner in (("SPEAKING", "audio_nodes"), ("RC", "web_console_rc"),
                             ("REMOTE_ASSIST", "remote_assist"),
+                            ("LOCAL_CAPTURE", "clip_daemon"),
                             ("SAFETY_STOP", "safety")):
             self.a.last_look_sent = None
             self.a.on_robot_state({"state": mode, "owner": owner})
@@ -42,6 +43,13 @@ class ArbiterStateGateTests(unittest.TestCase):
         self.a.on_intent({"source": "follow", "action": {"direction": "forward"}})
         self.assertIn("follow", self.a.intents)
         self.a.on_robot_state({"state": "GESTURE_TRACKING", "owner": "gesture_tracking"})
+        self.assertEqual(self.a.intents, {})
+
+    def test_local_capture_clears_existing_motion_and_rejects_new_motion(self):
+        self.a.on_intent({"source": "follow", "action": {"direction": "forward"}})
+        self.a.on_robot_state({"state": "LOCAL_CAPTURE", "owner": "clip_daemon"})
+        self.assertEqual(self.a.intents, {})
+        self.a.on_intent({"source": "follow", "action": {"direction": "forward"}})
         self.assertEqual(self.a.intents, {})
         self.a.on_intent({"source": "follow", "action": {"direction": "forward"}})
         self.assertEqual(self.a.intents, {})

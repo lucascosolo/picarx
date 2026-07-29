@@ -21,7 +21,8 @@ safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
   latest-frame subscriptions with requested FPS; no module may open
   Picamera2 directly. RobotState leases coordinate camera/head/speaker state.
 - RobotState states include `IDLE`, `GESTURE_TRACKING`,
-  `OBJECT_DETECTION`, `SPEAKING`, `REMOTE_ASSIST`, `RC`, and `SAFETY_STOP`.
+  `OBJECT_DETECTION`, `SPEAKING`, `REMOTE_ASSIST`, `LOCAL_CAPTURE`, `RC`, and
+  `SAFETY_STOP`.
   Safety, RC, and higher-priority claims preempt gesture; stale claims expire.
 - The SunFounder Robot HAT package is the git `2.5.x` branch. The unrelated
   PyPI package named `robot_hat` lacks `ADC` and breaks `picarx-safety`.

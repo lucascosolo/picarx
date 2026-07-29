@@ -95,7 +95,8 @@ class Arbiter:
             with self.state_lock:
                 self.robot_state = dict(payload)
             mode = str(payload.get("state") or "")
-            if mode in {"GESTURE_TRACKING", "REMOTE_ASSIST", "SAFETY_STOP"}:
+            if mode in {"GESTURE_TRACKING", "REMOTE_ASSIST", "LOCAL_CAPTURE",
+                        "SAFETY_STOP"}:
                 with self.lock:
                     self.intents.clear()
                     self.last_sent_action = None
@@ -119,7 +120,8 @@ class Arbiter:
         source = str(payload.get("source") or "")
         if mode == "RC":
             return source == "rc"
-        if mode in {"GESTURE_TRACKING", "REMOTE_ASSIST", "SAFETY_STOP"}:
+        if mode in {"GESTURE_TRACKING", "REMOTE_ASSIST", "LOCAL_CAPTURE",
+                    "SAFETY_STOP"}:
             return False
         return True
 
@@ -136,7 +138,8 @@ class Arbiter:
         # Speech, RC, remote assistance, and an active safety stop own the
         # robot exclusively. None of those modes should move the head from a
         # competing module while they are active.
-        if mode in {"SPEAKING", "RC", "REMOTE_ASSIST", "SAFETY_STOP"}:
+        if mode in {"SPEAKING", "RC", "REMOTE_ASSIST", "LOCAL_CAPTURE",
+                    "SAFETY_STOP"}:
             return source == owner and mode == "SPEAKING" and owner == "audio_nodes"
         return True
 

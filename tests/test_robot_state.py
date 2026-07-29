@@ -12,6 +12,7 @@ from robot_state import RobotState, StateManager, parse_state  # noqa: E402
 class RobotStateTests(unittest.TestCase):
     def test_parse_and_reject_invalid_claims(self):
         self.assertEqual(parse_state("gesture_tracking"), RobotState.GESTURE_TRACKING)
+        self.assertEqual(parse_state("local_capture"), RobotState.LOCAL_CAPTURE)
         manager = StateManager()
         self.assertFalse(manager.claim("", "IDLE")["accepted"])
         self.assertFalse(manager.claim("x", "not-a-state")["accepted"])

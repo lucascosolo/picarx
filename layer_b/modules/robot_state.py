@@ -36,6 +36,7 @@ class RobotState(str, enum.Enum):
     OBJECT_DETECTION = "OBJECT_DETECTION"
     SPEAKING = "SPEAKING"
     REMOTE_ASSIST = "REMOTE_ASSIST"
+    LOCAL_CAPTURE = "LOCAL_CAPTURE"
     RC = "RC"
     SAFETY_STOP = "SAFETY_STOP"
 
@@ -51,6 +52,9 @@ STATE_PRIORITY = {
     # camera/CPU budget; its file operations are paused while speech owns the
     # active state and resume when the speech lease is released.
     RobotState.REMOTE_ASSIST: 40,
+    # Local media capture owns camera/microphone resources while active, but
+    # remains below speech, manual control, and safety stop.
+    RobotState.LOCAL_CAPTURE: 45,
     RobotState.SPEAKING: 50,
     RobotState.RC: 80,
     RobotState.SAFETY_STOP: 100,
