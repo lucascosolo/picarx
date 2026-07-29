@@ -251,6 +251,11 @@ targets; and never imply that label memory changed detector weights.
   paths, atomic media/metadata finalization, incomplete-capture cleanup, and
   bounded per-clip/count/total-storage limits. Capture and playback control
   integration remains next.
+- **Responsive web UI:** refresh the existing web console with a lightweight,
+  attractive responsive design that remains usable on phones and desktops.
+  Preserve the current typed safety/control boundaries, keep pages fast on the
+  Pi, and validate touch targets, narrow-screen layout, live status updates,
+  and degraded/offline behavior.
 - **Location graph:** completed telemetry/provenance and veto evidence remain
   authoritative. Later add validated fingerprint thresholds, directed edges and
   traversal timestamps, conservative IMU quality policy, audited merge/split,
