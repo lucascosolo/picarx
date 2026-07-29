@@ -62,6 +62,17 @@
   <pre id="remote-output" class="hint">No remote result yet.</pre>
 </div>
 
+<div class="card">
+  <h2>Thinking task approval</h2>
+  <div class="hint">The thinking robot may propose a plan, but it cannot approve
+    destructive work for itself. Approve or cancel a displayed plan explicitly.</div>
+  <div class="row"><input id="thinking-plan-id" placeholder="plan ID">
+    <button class="primary" onclick="thinkingPlan('approve_plan', true)">Approve plan</button>
+    <button class="danger" onclick="thinkingPlan('reject_plan', true)">Reject plan</button>
+    <button onclick="thinkingPlan('cancel')">Cancel task</button></div>
+  <div class="stat"><span>Thinking status</span><span id="thinking-status">idle</span></div>
+</div>
+
 <script src="/app.js"></script>
 <script>
 async function setGesture(enabled) {
@@ -117,6 +128,10 @@ function remoteWriteFile() {
     expected_sha256: document.getElementById('remote-sha').value.trim() || undefined,
     confirmed: true});
 }
+function thinkingPlan(command, confirmed) {
+  PX.post('/thinking', {command, plan_id: document.getElementById('thinking-plan-id').value.trim(), confirmed});
+  setTimeout(PX.poll, 150);
+}
 PX.onPoll(s => {
   const mode = s.robot_state || {};
   document.getElementById('robot-state').textContent = mode.state || 'IDLE';
@@ -131,6 +146,8 @@ PX.onPoll(s => {
     document.getElementById('remote-output').textContent = JSON.stringify(r, null, 2);
   document.getElementById('remote-write-status').textContent = r.write_authorized
     ? 'writes authorized for this session' : 'writes not authorized';
+  const thinking = s.thinking || {};
+  document.getElementById('thinking-status').textContent = thinking.state || 'idle';
 });
 PX.startPolling(2000);
 </script>

@@ -341,7 +341,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "operation": {"type": "string", "enum": ["list", "delete"]},
          "id": {"type": "string"}, "query": {"type": "string"},
-         "confirmed": {"type": "boolean"}}, "required": ["operation"]}},
+         "confirmed": {"type": "boolean"}, "plan_id": {"type": "string"}},
+         "required": ["operation"]}},
     {"name": "create_note",
      "description": "Save one user-authored note in durable memory. Use for "
                     "'take a note ...', not for an ongoing meeting transcript.",
@@ -354,7 +355,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "operation": {"type": "string", "enum": ["list", "get", "search",
                        "export", "delete"]}, "id": {"type": "string"},
-         "query": {"type": "string"}, "confirmed": {"type": "boolean"}},
+         "query": {"type": "string"}, "confirmed": {"type": "boolean"},
+         "plan_id": {"type": "string"}},
          "required": ["operation"]}},
     {"name": "control_meeting_notes",
      "description": "Start, pause, resume, or stop a consented meeting-note "
@@ -363,7 +365,8 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "action": {"type": "string", "enum": ["start", "pause", "resume", "stop"]},
          "title": {"type": "string"}, "id": {"type": "string"},
-         "confirmed": {"type": "boolean"}}, "required": ["action"]}},
+         "confirmed": {"type": "boolean"}, "plan_id": {"type": "string"}},
+         "required": ["action"]}},
     {"name": "share_connection",
      "description": "Get internet by tethering over BLUETOOTH to the person's "
                     "already-paired phone, so radio and chat keep working where "
@@ -420,6 +423,15 @@ TOOLS = [
                     "remote-session status. Use this before deciding what to do next "
                     "or when the person asks what is happening.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "propose_plan",
+     "description": "Propose a bounded non-movement plan before doing a long-running "
+                    "or destructive task. This only asks the person for approval; "
+                    "it never approves itself or executes a step. Include the goal "
+                    "and ordered steps.",
+     "input_schema": {"type": "object", "properties": {
+         "goal": {"type": "string"},
+         "steps": {"type": "array", "items": {"type": "string"}}},
+         "required": ["goal", "steps"]}},
     {"name": "cancel_current_task",
      "description": "Cancel the current thinking/tool task without moving the robot. "
                     "Use when the person says to stop the current research, coding, "
@@ -458,7 +470,10 @@ TOOLS = [
                     "Read/list/search/preview/logs are safe. Grant write access once "
                     "with authorize_write after the person explicitly approves it; "
                     "that grant covers file edits, apply_patch, and rollback until "
-                    "disconnect. File overwrites use expected_sha256 when available "
+                    "disconnect. Destructive or long-running operations require a "
+                    "bounded plan approved through the local control path; include "
+                    "its plan_id after approval. File overwrites use expected_sha256 "
+                    "when available "
                     "to avoid clobbering a concurrent edit. "
                     "For run, set confirmed=true ONLY after the person explicitly "
                     "approves that specific command; otherwise ask for approval. Commands remain "
@@ -476,7 +491,8 @@ TOOLS = [
          "expected_sha256": {"type": "string"},
          "command": {"type": "string"},
          "cwd": {"type": "string"},
-         "confirmed": {"type": "boolean"}},
+         "confirmed": {"type": "boolean"},
+         "plan_id": {"type": "string"}},
          "required": ["operation"]}},
 ]
 
@@ -513,6 +529,88 @@ def _known_people():
                       if os.path.isdir(os.path.join(PEOPLE_DIR, d)))
     except OSError:
         return []
+
+
+class ThinkingPlanManager:
+    """Ephemeral approval state for model-selected non-movement plans.
+
+    A model may propose a plan, but it cannot approve its own plan. Approval
+    arrives through the typed local control topic (or an equally explicit UI
+    path), expires automatically, and is required again after reconnect or
+    restart. Keeping this state separate from the LLM transcript prevents a
+    model-generated ``confirmed=true`` from becoming human consent.
+    """
+
+    def __init__(self, clock=None, ttl_sec=600.0):
+        self.clock = clock or time.time
+        self.ttl_sec = max(30.0, float(ttl_sec))
+        self._lock = threading.Lock()
+        self._plan = None
+
+    def propose(self, goal, steps):
+        goal = str(goal or "").strip()
+        if not goal or len(goal) > 500:
+            raise ValueError("plan goal is empty or too long")
+        if not isinstance(steps, list) or not steps or len(steps) > 12:
+            raise ValueError("plan needs between 1 and 12 steps")
+        normalized = []
+        for step in steps:
+            step = str(step or "").strip()
+            if not step or len(step) > 300:
+                raise ValueError("each plan step must be 1-300 characters")
+            normalized.append(step)
+        now = float(self.clock())
+        with self._lock:
+            if self._plan and self._plan["status"] in {"pending", "approved"}:
+                raise ValueError("another thinking plan is already active")
+            self._plan = {
+                "plan_id": uuid.uuid4().hex,
+                "goal": goal,
+                "steps": normalized,
+                "status": "pending",
+                "created_at": now,
+                "expires_at": now + self.ttl_sec,
+                "used_tools": [],
+            }
+            return dict(self._plan)
+
+    def _expire_locked(self, now):
+        if self._plan and self._plan["status"] in {"pending", "approved"} and \
+                now >= self._plan["expires_at"]:
+            self._plan["status"] = "expired"
+
+    def current(self):
+        with self._lock:
+            self._expire_locked(float(self.clock()))
+            return dict(self._plan) if self._plan else None
+
+    def approve(self, plan_id):
+        with self._lock:
+            self._expire_locked(float(self.clock()))
+            if not self._plan or self._plan["plan_id"] != str(plan_id):
+                return None
+            if self._plan["status"] != "pending":
+                return dict(self._plan)
+            self._plan["status"] = "approved"
+            self._plan["approved_at"] = float(self.clock())
+            return dict(self._plan)
+
+    def reject(self, plan_id, status="rejected"):
+        with self._lock:
+            if not self._plan or self._plan["plan_id"] != str(plan_id):
+                return None
+            self._plan["status"] = status
+            return dict(self._plan)
+
+    def allows(self, plan_id, tool_name=None):
+        with self._lock:
+            self._expire_locked(float(self.clock()))
+            if not self._plan or self._plan["status"] != "approved" or \
+                    self._plan["plan_id"] != str(plan_id):
+                return False
+            if tool_name and tool_name not in self._plan["used_tools"]:
+                self._plan["used_tools"].append(str(tool_name))
+            return True
 
 
 def _spoken_age(seconds):
@@ -610,6 +708,7 @@ class Companion:
         self._tool_results = {}
         self._thinking_runs_lock = threading.Lock()
         self._thinking_runs = {}
+        self.plan_manager = ThinkingPlanManager()
         # The reminder daemon owns timers; this is only a small read-only cache
         # of its published state so follow-up questions can be answered locally
         # without asking Claude to reconstruct an asynchronous tool call.
@@ -1379,6 +1478,12 @@ class Companion:
         if reminder_note:
             parts.append(reminder_note)
 
+        plan = self._plan_manager().current()
+        if plan and plan.get("status") in {"pending", "approved"}:
+            parts.append("thinking plan " + str(plan.get("plan_id")) +
+                         " is " + str(plan.get("status")) +
+                         f" with {len(plan.get('steps') or [])} steps")
+
         # Its own recent EXPERIENCE: how it's moving/being handled right now,
         # a bump/pickup it just felt, what it did earlier today, and anything it
         # learned from practising. All fail-soft (see _experience_notes).
@@ -1739,6 +1844,45 @@ class Companion:
 
     # ---------- LLM tool loop ----------
 
+    def _plan_manager(self):
+        manager = getattr(self, "plan_manager", None)
+        if manager is None:
+            self.plan_manager = manager = ThinkingPlanManager()
+        return manager
+
+    def _publish_plan_event(self, plan, event, reason, plan_id=None):
+        plan_id = plan_id or (plan or {}).get("plan_id")
+        payload = {
+            "state": "plan_" + str(event),
+            "plan_id": plan_id,
+            "plan_status": (plan or {}).get("status"),
+            "step_count": len((plan or {}).get("steps") or []),
+            "ts": time.time(),
+        }
+        self.bus.publish(THINKING_STATUS_TOPIC, payload)
+        self.bus.publish("picarx/decision", {
+            "source": "companion", "kind": "thinking_plan",
+            "choice": {"event": event, "plan_status": (plan or {}).get("status"),
+                        "plan_id": plan_id,
+                        "step_count": len((plan or {}).get("steps") or [])},
+            "reason": str(reason)[:240], "ts": time.time(),
+        })
+
+    def _approved_plan_required(self, tool_input, tool_name):
+        plan_id = str((tool_input or {}).get("plan_id") or "").strip()
+        if not plan_id:
+            current = self._plan_manager().current()
+            suffix = (f" Plan {current['plan_id']} is waiting for your approval."
+                      if current and current.get("status") == "pending" else "")
+            return ("This operation needs an explicitly approved thinking plan. "
+                    "Propose a plan first, then approve it through the local control "
+                    "path." + suffix)
+        if not self._plan_manager().allows(plan_id, tool_name):
+            current = self._plan_manager().current()
+            state = current.get("status") if current else "missing"
+            return f"Plan approval is not valid for this operation (state: {state})."
+        return None
+
     def _thinking_registry(self):
         lock = getattr(self, "_thinking_runs_lock", None)
         if lock is None:
@@ -1784,6 +1928,25 @@ class Companion:
         payload = dict(payload or {})
         command = str(payload.get("command") or payload.get("operation") or
                       "status").lower()
+        if command in {"approve_plan", "reject_plan", "cancel_plan"}:
+            plan_id = str(payload.get("plan_id") or "").strip()
+            if command == "approve_plan":
+                if payload.get("confirmed") is not True:
+                    self._publish_plan_event(
+                        self._plan_manager().current(), "approval_failed",
+                        "confirmed=true is required", plan_id=plan_id)
+                    return
+                plan = self._plan_manager().approve(plan_id)
+                event = "approved" if plan and plan.get("status") == "approved" else "approval_failed"
+                self._publish_plan_event(plan, event, "explicit local approval",
+                                         plan_id=plan_id)
+                return
+            plan = self._plan_manager().reject(plan_id, "canceled" if command == "cancel_plan"
+                                               else "rejected")
+            self._publish_plan_event(
+                plan, "canceled" if command == "cancel_plan" else "rejected",
+                "explicit local plan rejection", plan_id=plan_id)
+            return
         if command == "cancel":
             self._cancel_thinking_runs(payload.get("run_id"))
             return
@@ -1997,11 +2160,22 @@ class Companion:
                 if remote:
                     parts.append("remote session " + str(
                         remote.get("command") or remote.get("state") or "active"))
+                plan = self._plan_manager().current()
+                if plan and plan.get("status") in {"pending", "approved"}:
+                    parts.append("plan " + str(plan.get("plan_id")) +
+                                 " is " + str(plan.get("status")))
                 lock, runs = self._thinking_registry()
                 with lock:
                     if runs:
                         parts.append(f"thinking task active ({len(runs)})")
                 return "Current robot status: " + "; ".join(parts) + "."
+            if name == "propose_plan":
+                plan = self._plan_manager().propose(
+                    tool_input.get("goal"), tool_input.get("steps"))
+                self._publish_plan_event(plan, "proposed",
+                                         "thinking model proposed a bounded plan")
+                return (f"Plan {plan['plan_id']} proposed and waiting for explicit "
+                        "local approval; do not execute its destructive steps yet.")
             if name == "cancel_current_task":
                 canceled = self._cancel_thinking_runs()
                 return (f"Cancellation requested for {len(canceled)} thinking task(s)."
@@ -2038,6 +2212,11 @@ class Companion:
                 if operation == "delete" and not bool(tool_input.get("confirmed")):
                     return ("I need explicit approval before deleting a reminder. "
                             "Tell me which one to remove and confirm it.")
+                if operation == "delete":
+                    blocked = self._approved_plan_required(
+                        tool_input, "manage_reminders.delete")
+                    if blocked:
+                        return blocked
                 request = {"command": operation}
                 for key in ("id", "query", "confirmed"):
                     if tool_input.get(key) not in (None, ""):
@@ -2061,6 +2240,11 @@ class Companion:
                     return "That notes operation is not supported."
                 if operation == "delete" and not bool(tool_input.get("confirmed")):
                     return ("I need explicit approval before deleting a note or meeting log.")
+                if operation == "delete":
+                    blocked = self._approved_plan_required(
+                        tool_input, "manage_notes.delete")
+                    if blocked:
+                        return blocked
                 request = {"command": "list" if operation == "search" else operation,
                            "source": "voice"}
                 for key in ("id", "query", "confirmed"):
@@ -2075,6 +2259,11 @@ class Companion:
                     return "I can start, pause, resume, or stop meeting notes."
                 if action == "start" and not bool(tool_input.get("confirmed")):
                     return "I need explicit consent before starting meeting notes."
+                if action == "start":
+                    blocked = self._approved_plan_required(
+                        tool_input, "control_meeting_notes.start")
+                    if blocked:
+                        return blocked
                 request = {"command": action, "source": "voice"}
                 for key in ("title", "id", "confirmed"):
                     if tool_input.get(key) not in (None, ""):
@@ -2156,9 +2345,15 @@ class Companion:
                         not bool(tool_input.get("confirmed")):
                     return ("I need your explicit approval before I can edit the "
                             "remote project or run a remote command.")
+                if operation in {"run", "write_file", "delete_path", "authorize_write",
+                                 "apply_patch", "rollback"}:
+                    blocked = self._approved_plan_required(tool_input,
+                                                           "remote." + operation)
+                    if blocked:
+                        return blocked
                 request = {"command": operation}
                 fields = ("path", "pattern", "patch", "content", "expected_sha256",
-                          "command", "cwd", "confirmed")
+                          "command", "cwd", "confirmed", "plan_id")
                 for key in fields:
                     value = tool_input.get(key)
                     if value not in (None, ""):

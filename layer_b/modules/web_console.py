@@ -142,6 +142,7 @@ class ConsoleState:
         self.robot_state = {}
         self.gesture = {}
         self.remote = {}
+        self.thinking = {}
         self.llm = {}
         self.intent_recovery = {}
         self.notes = {}
@@ -240,6 +241,7 @@ class ConsoleState:
                 "robot_state": self.robot_state,
                 "gesture": self.gesture,
                 "remote": self.remote,
+                "thinking": self.thinking,
                 "llm": self.llm,
                 "intent_recovery": self.intent_recovery,
                 "notes": self.notes,
@@ -707,6 +709,19 @@ class Handler(BaseHTTPRequestHandler):
             request = {k: v for k, v in body.items() if k in fields}
             BUS.publish("picarx/tools/remote_assist", request)
             self._send(200, {"ok": True})
+        elif self.path == "/thinking":
+            command = str(body.get("command") or "status").lower()
+            allowed = {"status", "cancel", "approve_plan", "reject_plan",
+                       "cancel_plan"}
+            if command not in allowed:
+                self._send(400, {"error": "unsupported thinking command"})
+                return
+            request = {"command": command}
+            for key in ("plan_id", "confirmed"):
+                if key in body:
+                    request[key] = body[key]
+            BUS.publish("picarx/companion/thinking/control", request)
+            self._send(200, {"ok": True})
         elif self.path == "/config/save":
             # Persist edited knobs to config.json (merged, so untouched keys and
             # the _readme survive). Announce the change for any future live
@@ -803,6 +818,10 @@ def on_remote_result(p):
     with STATE.lock:
         STATE.remote = p
 
+def on_thinking_status(p):
+    with STATE.lock:
+        STATE.thinking = p
+
 def on_llm_status(p):
     with STATE.lock:
         STATE.llm = p
@@ -868,6 +887,7 @@ def main():
     BUS.subscribe("picarx/state/current", on_robot_state)
     BUS.subscribe("picarx/gesture/status", on_gesture_status)
     BUS.subscribe("picarx/tools/remote_assist/result", on_remote_result)
+    BUS.subscribe("picarx/companion/thinking/status", on_thinking_status)
     BUS.subscribe("picarx/llm/status", on_llm_status)
     BUS.subscribe("picarx/intent/recovery/status", on_intent_recovery_status)
     BUS.subscribe("picarx/tools/notes/state", on_notes_state)

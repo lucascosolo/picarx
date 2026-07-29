@@ -13,6 +13,31 @@ import companion  # noqa: E402
 from semantic_store import SemanticStore  # noqa: E402
 
 
+class ThinkingPlanManagerTest(unittest.TestCase):
+    def test_plan_requires_external_approval_and_expires(self):
+        now = [100.0]
+        manager = companion.ThinkingPlanManager(clock=lambda: now[0], ttl_sec=30)
+        plan = manager.propose("inspect and repair", ["inspect", "repair"])
+        self.assertEqual(plan["status"], "pending")
+        self.assertFalse(manager.allows(plan["plan_id"], "remote.run"))
+        self.assertIsNone(manager.approve("not-the-plan"))
+        approved = manager.approve(plan["plan_id"])
+        self.assertEqual(approved["status"], "approved")
+        self.assertTrue(manager.allows(plan["plan_id"], "remote.run"))
+        now[0] += 31
+        self.assertEqual(manager.current()["status"], "expired")
+        self.assertFalse(manager.allows(plan["plan_id"], "remote.run"))
+
+    def test_new_plan_cannot_replace_an_active_one(self):
+        manager = companion.ThinkingPlanManager(clock=lambda: 100.0)
+        manager.propose("first", ["one"])
+        with self.assertRaises(ValueError):
+            manager.propose("second", ["two"])
+        first = manager.current()
+        manager.reject(first["plan_id"])
+        self.assertEqual(manager.propose("second", ["two"])["status"], "pending")
+
+
 def _text(t):
     return SimpleNamespace(type="text", text=t)
 
@@ -45,6 +70,18 @@ class CompanionToolTest(unittest.TestCase):
             readonly=True, db_path=os.path.join(tempfile.mkdtemp(), "none.db"))
         self.c.history = deque(maxlen=20)
         self.c.last_turn_at = None
+
+    def _approved_plan(self):
+        out = self.c._execute_tool("propose_plan", {
+            "goal": "complete a bounded test task",
+            "steps": ["inspect", "change", "verify"]})
+        self.assertIn("waiting", out.lower())
+        plan = self.c._plan_manager().current()
+        self.c.on_thinking_control({"command": "approve_plan",
+                                    "plan_id": plan["plan_id"],
+                                    "confirmed": True})
+        self.assertEqual(self.c._plan_manager().current()["status"], "approved")
+        return plan["plan_id"]
 
     # ---- direct tool dispatch ----
 
@@ -161,19 +198,30 @@ class CompanionToolTest(unittest.TestCase):
             "content": "print('edited')\n"})
         self.assertIn("explicit approval", out.lower())
         self.assertEqual(self.c.bus.of(companion.REMOTE_ASSIST_TOPIC), [])
-        self.c._execute_tool("remote_project_operation", {
+        out = self.c._execute_tool("remote_project_operation", {
             "operation": "write_file", "path": "main.py",
             "content": "print('edited')\n", "confirmed": True})
-        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
-        self.assertEqual(request["command"], "write_file")
-        self.assertEqual(request["content"], "print('edited')\n")
+        self.assertIn("approved thinking plan", out.lower())
+        self.assertEqual(self.c.bus.of(companion.REMOTE_ASSIST_TOPIC), [])
+
+    def test_plan_cannot_be_approved_by_model_shaped_tool_input(self):
+        self.c._execute_tool("propose_plan", {
+            "goal": "delete stale notes", "steps": ["list", "delete"]})
+        plan_id = self.c._plan_manager().current()["plan_id"]
+        blocked = self.c._execute_tool("manage_notes", {
+            "operation": "delete", "id": "n1", "confirmed": True,
+            "plan_id": plan_id})
+        self.assertIn("approval", blocked.lower())
+        self.c.on_thinking_control({"command": "approve_plan", "plan_id": plan_id})
+        self.assertEqual(self.c._plan_manager().current()["status"], "pending")
 
     def test_note_and_meeting_tools_publish_typed_requests(self):
         out = self.c._execute_tool("create_note", {"text": "buy milk"})
         self.assertIn("request sent", out.lower())
         self.assertEqual(self.c.bus.last(companion.NOTES_TOPIC)["command"], "create")
         self.c._execute_tool("control_meeting_notes",
-                             {"action": "start", "confirmed": True})
+                             {"action": "start", "confirmed": True,
+                              "plan_id": self._approved_plan()})
         request = self.c.bus.last(companion.NOTES_TOPIC)
         self.assertEqual(request["command"], "start")
         self.assertTrue(request["confirmed"])
@@ -185,20 +233,24 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(self.c.bus.of(companion.REMINDER_CONTROL_TOPIC), [])
 
     def test_remote_write_access_is_granted_once_but_commands_stay_confirmed(self):
+        plan_id = self._approved_plan()
         out = self.c._execute_tool(
             "remote_project_operation",
-            {"operation": "apply_patch", "patch": "diff --git ..."})
+            {"operation": "apply_patch", "patch": "diff --git ...",
+             "confirmed": True, "plan_id": plan_id})
         self.assertIn("request sent", out)
         request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
         self.assertEqual(request["command"], "apply_patch")
         self.c._execute_tool(
             "remote_project_operation",
-            {"operation": "authorize_write", "confirmed": True})
+            {"operation": "authorize_write", "confirmed": True,
+             "plan_id": plan_id})
         request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
         self.assertEqual(request["command"], "authorize_write")
         self.c._execute_tool(
             "remote_project_operation",
-            {"operation": "run", "command": "pytest", "confirmed": True})
+            {"operation": "run", "command": "pytest", "confirmed": True,
+             "plan_id": plan_id})
         request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
         self.assertEqual(request["command"], "run")
         self.assertEqual(request["argv"], "pytest")

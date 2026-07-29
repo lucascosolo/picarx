@@ -128,7 +128,14 @@ including `describe_tools`, `get_robot_status`, and typed radio control;
 movement tools are filtered at both catalog construction and dispatch. The
 tool loop is expanded to eight rounds/16 calls with a hard exhaustion reply,
 and latest state mirrors are subscribed for honest “what am I doing?” answers.
-Next: add explicit plan/approval state for long-running or destructive work.
+Progress (2026-07-28): Companion now has an ephemeral, expiring plan manager.
+The thinking model can propose a bounded goal and ordered steps but cannot approve
+its own plan. A typed local control path and the web tools page can approve, reject,
+or cancel a plan; destructive meeting-note, reminder, note, and remote coding
+operations require the approved plan ID before they publish a request. Plan events
+and safe outcomes enter the decision journal for later reflection. Voice-native
+approval and resumable plan execution remain next, along with transport-level
+cancellation for long-running remote work.
 
 Progress (2026-07-28): Companion now attaches correlation IDs to reminder,
 notes, and remote-assist requests, briefly waits for fast daemon results, and
