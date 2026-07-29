@@ -5,10 +5,48 @@ This file is the compact source of truth for future coding sessions. Prefer
 small, scoped commits; run the full test suite before pushing. Never weaken the
 safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
 
+## Direction (owner, 2026-07-29) — Marco as an individual, not a pipeline
+
+The target architecture is genuine learning and growth, not a wider net of
+hand-authored rules. Regex and phrase matching are the old chatbot shape: they
+make the robot *appear* to understand a fixed set of sentences and understand
+nothing else. Marco should be an individual with memories, abilities, and tools
+he reaches for when he needs them, the way a person does. Concretely, every
+change from here should move in this direction:
+
+- **Deterministic tables become derived, not authored.** A phrase table is
+  acceptable only as a *cache* of decisions Marco already made — populated by
+  what worked, aged out when it stops working — never as the definition of what
+  he can understand. Adding a hand-written pattern to make one more sentence
+  work is the anti-pattern; ask instead why he could not work it out himself.
+- **Invert the router.** Today: deterministic match first, model as last-resort
+  repair. Target: anything addressed to Marco is his to interpret, with the
+  local layer demoted to a fast path for things he has already learned, plus a
+  cost/offline gate. This is the real content of the "unify utterance routing"
+  item below — the unification is not a tidier keyword list, it is deleting the
+  keyword lists' authority.
+- **Capabilities are tools he chooses, not phrases he waits for.** A capability
+  declares itself once and is reachable both ways (landed: `CapabilityTool` in
+  `capability_registry.py`). He should be able to decide to check the clock or
+  roll a die because the moment calls for it.
+- **Continuity of self.** Memory (`semantic_store`, `label_memory`,
+  `person_memory`, reflection, the coach's bandit policies) already exists and
+  is the right substrate; what is missing is a persistent identity and history
+  that shapes how he answers, so he is the same individual across restarts
+  rather than a fresh assistant each turn.
+
+**The boundary that does not move.** Layer A stays hardcoded and Marco has no
+authority over it: the safety daemon remains the final motion veto, movement is
+never an LLM/thinking-plane capability, and "stop"/"halt" are never filtered or
+routed through anything that can think about them. Autonomy grows everywhere
+above that line and nowhere below it. Cost, latency, and offline operation are
+the other real constraints — the answer to them is a learned cache, not a
+hand-written matcher.
+
 ## Current state (2026-07-29)
 
 - The repository is on `master`; the local implementation currently passes
-  1,063 tests. The full suite is the source-of-truth regression gate, while
+  1,072 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -32,6 +70,13 @@ safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
   shape) reaches the chat path instead of being dropped for not being an
   order. Both are off-robot tested only; see the responsiveness item below for
   what is still open.
+- Capability unification has started: `dialog.py` now asks the capability
+  router whether anything actually claims an utterance before spending the
+  command-repair budget on it, and capabilities declare an optional
+  `CapabilityTool` next to their phrase rules so dice and clock are reachable
+  from the thinking plane. Both are steps toward the Direction above; the
+  phrase tables still hold routing authority and that is the next thing to
+  invert.
 - Local clips are bounded and interruptible, but camera/ALSA codec behavior,
   playback devices, and service startup have not yet been validated on the
   target Pi. The gesture native runtime/package decision and provisioned-host
@@ -496,7 +541,7 @@ safety daemon is the final authority.
 ## Delivery rules
 
 Use fake camera/MediaPipe/worker/process/servo/thermal/SSH tests off-robot,
-then field-test on the Pi. Current local full-suite baseline is 1,063 passing
+then field-test on the Pi. Current local full-suite baseline is 1,072 passing
 tests (`python3 -m unittest discover -s tests -p 'test_*.py'`); warnings from
 existing resource-cleanup tests are non-fatal.
 Keep commits scoped (for example, gesture worker; packaging; roadmap), push
