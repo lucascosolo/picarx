@@ -7,6 +7,7 @@ import os
 import re
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -68,14 +69,56 @@ class RemoteSession:
         self.remote_script = None
         self._destination = None
         self._port = None
+        # A password is an intentionally transient connect-time credential.
+        # It is fed to sshpass through an inherited pipe, never placed in an
+        # argv/environment value, and cleared when the session closes.
+        self._password = None
 
     def _base_ssh(self, destination, port=None):
-        argv = [self.ssh_bin, "-T", "-o", "BatchMode=yes",
+        batch_mode = "no" if self._password is not None else "yes"
+        argv = [self.ssh_bin, "-T", "-o", f"BatchMode={batch_mode}",
                 "-o", "StrictHostKeyChecking=yes",
                 "-o", f"ConnectTimeout={int(self.connect_timeout)}"]
         if port is not None:
             argv += ["-p", str(port)]
         return argv + [destination]
+
+    @staticmethod
+    def _validate_password(password):
+        if password in (None, ""):
+            return None
+        if (not isinstance(password, str) or len(password) > 512 or
+                any(ord(char) < 32 for char in password)):
+            raise ValueError("invalid SSH password")
+        return password
+
+    def _popen_ssh(self, argv, **kwargs):
+        """Start an SSH command without exposing a transient password.
+
+        ``ssh`` itself intentionally runs in BatchMode, so password-backed
+        hosts use the optional ``sshpass`` utility.  The password crosses a
+        short-lived anonymous pipe to ``sshpass -d``; it never appears in the
+        command line, process environment, MQTT payload, audit log, or an LLM
+        request.  The fd is closed in the parent immediately after spawn.
+        """
+        password = self._password
+        if password is None:
+            return self._popen(argv, **kwargs)
+        sshpass = shutil.which("sshpass")
+        if not sshpass:
+            raise RuntimeError(
+                "SSH password authentication needs the sshpass utility; "
+                "install it or provision an SSH key")
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, password.encode("utf-8") + b"\n")
+        finally:
+            os.close(write_fd)
+        try:
+            return self._popen([sshpass, "-d", str(read_fd), *argv],
+                               pass_fds=(read_fd,), **kwargs)
+        finally:
+            os.close(read_fd)
 
     def _bootstrap_helper(self, destination, port=None):
         """Copy the helper from the robot tree to a private remote temp file.
@@ -92,8 +135,9 @@ class RemoteSession:
         self.remote_script = f"/tmp/picarx_host_helper_{token}.py"
         argv = self._base_ssh(destination, port) + ["python3", "-c",
                                                      BOOTSTRAP_CODE, self.remote_script]
-        proc = self._popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, text=True, bufsize=1)
+        proc = self._popen_ssh(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1)
         try:
             encoded = base64.b64encode(source).decode("ascii")
             out, err = proc.communicate(encoded, timeout=self.connect_timeout + 5)
@@ -104,10 +148,15 @@ class RemoteSession:
                 pass
             raise
         if proc.returncode != 0:
+            try:
+                proc.kill()
+            except Exception:
+                pass
             raise RuntimeError((err or out or "could not bootstrap host helper")[-500:])
         return self.remote_script
 
-    def connect(self, host, user=None, port=None, project_root="."):
+    def connect(self, host, user=None, port=None, project_root=".",
+                password=None):
         host = valid_host(host)
         if not host:
             raise ValueError("invalid host or IP address")
@@ -125,23 +174,35 @@ class RemoteSession:
                 raise ValueError("invalid SSH port")
             if not 1 <= port <= 65535:
                 raise ValueError("invalid SSH port")
-        if self.bootstrap:
-            remote_script = self._bootstrap_helper(destination, port)
-            # The helper is a robot-owned source file copied into a private
-            # per-session path. The host need only have python3, not a package
-            # installation or a pre-existing script.
-            helper_argv = ["python3", "-u", remote_script,
-                           "--root", project_root, "--allow-write"]
-        else:
-            helper_argv = shlex.split(self.helper_command)
-        argv = self._base_ssh(destination, port) + helper_argv
-        self.proc = self._popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, bufsize=1)
+        self._password = self._validate_password(password)
+        # Set the cleanup destination before bootstrap: if the first SSH
+        # channel fails after creating its private helper, close() can still
+        # remove that helper using the same transient credential.
         self.host = host
         self._destination = destination
         self._port = port
-        return {"host": host, "user": user, "port": port,
-                "project_root": project_root, "bootstrapped": self.bootstrap}
+        try:
+            if self.bootstrap:
+                remote_script = self._bootstrap_helper(destination, port)
+                # The helper is a robot-owned source file copied into a private
+                # per-session path. The host need only have python3, not a package
+                # installation or a pre-existing script.
+                helper_argv = ["python3", "-u", remote_script,
+                               "--root", project_root, "--allow-write"]
+            else:
+                helper_argv = shlex.split(self.helper_command)
+            argv = self._base_ssh(destination, port) + helper_argv
+            self.proc = self._popen_ssh(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1)
+            return {"host": host, "user": user, "port": port,
+                    "project_root": project_root, "bootstrapped": self.bootstrap}
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                self._password = None
+            raise
 
     def request(self, payload, timeout=None):
         if self.proc is None or self.proc.poll() is not None:
@@ -190,7 +251,7 @@ class RemoteSession:
         if old_script and old_destination:
             cleanup_code = "import os,sys; os.unlink(sys.argv[1]) if os.path.exists(sys.argv[1]) else None"
             try:
-                cleanup = self._popen(
+                cleanup = self._popen_ssh(
                     self._base_ssh(old_destination, old_port) +
                     ["python3", "-c", cleanup_code, old_script],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -199,6 +260,7 @@ class RemoteSession:
             except Exception:
                 pass
         self.remote_script = None
+        self._password = None
 
 
 class RemoteAssist:

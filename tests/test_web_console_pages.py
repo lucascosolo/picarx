@@ -152,7 +152,9 @@ class RouteTableTest(unittest.TestCase):
         for marker in ("setGesture(true)", "remoteConnect()", "remoteRead()",
                        "remotePatch('preview_patch')", "remotePatch('apply_patch')",
                        "remoteRun()", "authorizeRemoteWrites()", "revoke_write",
-                       "remote-confirm", "argv: document.getElementById('remote-command')"):
+                       "remote-confirm", "remote-password",
+                       "not saved or sent to the language model",
+                       "argv: document.getElementById('remote-command')"):
             self.assertIn(marker, page)
 
     def test_notes_page_exposes_note_meeting_and_reminder_controls(self):

@@ -415,10 +415,12 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "connect_remote_host",
      "description": "Connect to a developer's computer over SSH using the robot's "
-                    "already-provisioned key. Use only when the person explicitly "
-                    "gives a host/IP and project scope; never invent a host or ask "
-                    "them to speak a password. The robot copies and runs its own "
-                    "bounded helper on the host, so no host installation is needed.",
+                    "already-provisioned key, or a password entered in the tools "
+                    "page. Use only when the person explicitly gives a host/IP "
+                    "and project scope; never invent a host or ask them to speak "
+                    "a password. Passwords are never part of this tool input or "
+                    "sent to the model. The robot copies and runs its own bounded "
+                    "helper on the host, so no host installation is needed.",
      "input_schema": {"type": "object", "properties": {
          "host": {"type": "string", "description": "IPv4, IPv6, or hostname"},
          "user": {"type": "string", "description": "optional SSH username"},

@@ -29,9 +29,12 @@
   <h2>Remote project helper</h2>
   <div class="hint">The robot verifies SSH host keys, then streams its own helper
     script to a private host temp path. No host installation or separate launch
-    is required.</div>
+    is required. A password is optional and is used only for this connection;
+    it is not saved or sent to the language model.</div>
   <div class="row"><input id="remote-host" placeholder="host IP or DNS name">
-    <input id="remote-user" placeholder="SSH user (optional)"></div>
+    <input id="remote-user" placeholder="SSH user (optional)">
+    <input id="remote-password" type="password" autocomplete="off"
+           placeholder="SSH password (not saved)"></div>
   <div class="row"><input id="remote-root" placeholder="project root, e.g. ~/src/project">
     <button class="primary" onclick="remoteConnect()">Connect</button>
     <button onclick="remoteCommand('disconnect')">Disconnect</button></div>
@@ -77,9 +80,12 @@ function authorizeRemoteWrites() {
 function remoteConnect() {
   const host = document.getElementById('remote-host').value.trim();
   if (!host) return;
+  const password = document.getElementById('remote-password').value;
+  document.getElementById('remote-password').value = '';
   remoteCommand('connect', {host,
     user: document.getElementById('remote-user').value.trim() || undefined,
-    project_root: document.getElementById('remote-root').value.trim() || '.'});
+    project_root: document.getElementById('remote-root').value.trim() || '.',
+    password: password || undefined});
 }
 function remoteRead() {
   remoteCommand('read', {path: document.getElementById('remote-path').value.trim()});

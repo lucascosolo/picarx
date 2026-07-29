@@ -209,6 +209,64 @@ class RemoteAssistTests(unittest.TestCase):
         self.assertIn("~/project", calls[1])
         self.assertIn("--allow-write", calls[1])
 
+    def test_password_is_pipe_only_and_not_returned_or_put_in_argv(self):
+        class Proc:
+            def __init__(self):
+                self.returncode = 0
+                self.stdin = type("In", (), {"close": lambda *_: None})()
+                self.stdout = type("Out", (), {"readline": lambda *_: ""})()
+                self.stderr = type("Err", (), {})()
+            def communicate(self, *_args, **_kwargs):
+                return "", ""
+            def poll(self):
+                return None
+            def terminate(self):
+                pass
+            def wait(self, **_kwargs):
+                return 0
+            def kill(self):
+                pass
+
+        calls = []
+        session = RemoteSession(popen=lambda argv, **kwargs: (
+            calls.append((argv, kwargs)) or Proc()))
+        session._password = "temporary secret"
+        # Replace executable discovery at the narrow seam; this test must not
+        # need the optional host utility installed in the test environment.
+        import remote_assist
+        saved = remote_assist.shutil.which
+        remote_assist.shutil.which = lambda name: "/usr/bin/sshpass"
+        try:
+            result = session._popen_ssh(session._base_ssh("host"),
+                                       stdin=subprocess.PIPE)
+        finally:
+            remote_assist.shutil.which = saved
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[:2], ["/usr/bin/sshpass", "-d"])
+        self.assertNotIn("temporary secret", argv)
+        self.assertIn("BatchMode=no", argv)
+        self.assertEqual(len(kwargs["pass_fds"]), 1)
+        self.assertEqual(result.returncode, 0)
+
+    def test_password_is_not_in_connection_metadata(self):
+        session = RemoteSession(bootstrap=False,
+                                helper_command="python3 helper.py")
+        calls = []
+        session._popen = lambda argv, **kwargs: (
+            calls.append((argv, kwargs)) or type("P", (), {
+                "returncode": 0, "stdin": None, "stdout": None,
+                "stderr": None, "poll": lambda self: None})())
+        import remote_assist
+        saved = remote_assist.shutil.which
+        remote_assist.shutil.which = lambda name: "/usr/bin/sshpass"
+        try:
+            target = session.connect("192.168.1.20", password="secret")
+        finally:
+            remote_assist.shutil.which = saved
+        self.assertNotIn("password", target)
+        self.assertNotIn("secret", repr(calls))
+        session.close()
+
 
 if __name__ == "__main__":
     unittest.main()

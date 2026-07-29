@@ -699,7 +699,7 @@ class Handler(BaseHTTPRequestHandler):
             # Keep this endpoint a typed control surface, not arbitrary MQTT
             # forwarding. The remote module still validates all paths,
             # commands, hosts, and write confirmation.
-            fields = {"command", "host", "user", "port", "project_root", "path",
+            fields = {"command", "host", "user", "port", "project_root", "password", "path",
                       "pattern", "ignore_case", "start_line", "end_line", "cwd",
                       "argv", "patch", "timeout_sec", "confirmed"}
             request = {k: v for k, v in body.items() if k in fields}

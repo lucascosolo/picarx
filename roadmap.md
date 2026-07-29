@@ -99,6 +99,12 @@ cancellation, command/output/time limits, metadata-only audit logs, and
 explicit confirmation for destructive operations. Do not turn this into
 unauthenticated remote code execution.
 
+Progress (2026-07-28): the web tools console now accepts an optional
+password-only-for-connect field. It is cleared from the browser field after
+submission and is carried to `sshpass -d` through an anonymous pipe, never in
+argv, environment, MQTT results, metadata, or companion/LLM tool input. The
+full user-directed coding-session redesign remains next for this P0 item.
+
 ### 4. Follow/perception reliability
 
 Follow already has freshness telemetry, bounded reacquisition, arbitration and
