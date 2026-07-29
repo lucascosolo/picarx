@@ -1019,9 +1019,18 @@ class AudioNode:
             return
         if not text:
             return
+        words = result.get("result") or []
+        # Drop a hallucinated leading filler ("the take me to the kitchen")
+        # before anything downstream keys on the first word - and before
+        # averaging confidence, since the invented word drags the mean down
+        # with it. See speech_match.strip_decoder_artifacts.
+        raw_text = text
+        text, words = speech_match.strip_decoder_artifacts(text, words)
+        if text != raw_text:
+            print(f"(dropped decoder artifact: '{raw_text}' -> '{text}')")
+
         # Mean per-word decoder confidence (0-1), present because of
         # SetWords(True) above; None if Kaldi didn't attach word info.
-        words = result.get("result") or []
         confidence = (round(sum(w.get("conf", 1.0) for w in words) / len(words), 3)
                       if words else None)
 
@@ -1046,7 +1055,10 @@ class AudioNode:
             return
 
         print(f"Heard locally: '{text}' (conf {confidence})")
-        self.bus.publish("picarx/audio/heard", {"text": text, "confidence": confidence})
+        heard = {"text": text, "confidence": confidence}
+        if text != raw_text:
+            heard["raw"] = raw_text   # what the decoder actually said, for debugging
+        self.bus.publish("picarx/audio/heard", heard)
         # Core local reflex - throttled (see STOP_REFLEX_COOLDOWN) so
         # repeating "stop" doesn't queue a pile of blocking TTS.
         if ("halt" in text or "stop" in text) and (now - self._last_stop_reflex_at) > STOP_REFLEX_COOLDOWN:

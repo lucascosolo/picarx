@@ -44,6 +44,60 @@ class QualityScoreTest(unittest.TestCase):
         self.assertLess(speech_match.quality_score("it that", 0.4), 0.2)
 
 
+class DecoderArtifactTest(unittest.TestCase):
+    """speech_match.strip_decoder_artifacts - the phantom leading 'the'."""
+
+    def _words(self, text, confs):
+        return [{"word": w, "conf": c} for w, c in zip(text.split(), confs)]
+
+    def _strip(self, text, confs):
+        return speech_match.strip_decoder_artifacts(
+            text, self._words(text, confs))[0]
+
+    def test_unsure_leading_the_is_dropped(self):
+        text = "the take me to the kitchen"
+        self.assertEqual(self._strip(text, [0.3, 0.9, 0.9, 0.9, 0.9, 0.9]),
+                         "take me to the kitchen")
+
+    def test_relatively_unsure_lead_is_dropped(self):
+        # Above the absolute floor, but far below the words around it.
+        self.assertEqual(self._strip("the play the radio", [0.5, 0.95, 0.95, 0.95]),
+                         "play the radio")
+
+    def test_confidently_heard_article_is_kept(self):
+        # "the radio is loud" - a real leading article must survive.
+        text = "the radio is loud"
+        self.assertEqual(self._strip(text, [0.92, 0.95, 0.9, 0.93]), text)
+
+    def test_only_leading_fillers_are_candidates(self):
+        text = "play the radio"
+        self.assertEqual(self._strip(text, [0.2, 0.9, 0.9]), text)
+
+    def test_lone_word_is_never_stripped_to_nothing(self):
+        # A bare "the" stays a bare "the" - the noise gate rejects it, not this.
+        self.assertEqual(self._strip("the", [0.1]), "the")
+
+    def test_no_word_evidence_means_no_strip(self):
+        text = "the take me to the kitchen"
+        self.assertEqual(speech_match.strip_decoder_artifacts(text, [])[0], text)
+        self.assertEqual(speech_match.strip_decoder_artifacts(text, None)[0], text)
+
+    def test_kept_words_track_the_kept_text(self):
+        text, words = speech_match.strip_decoder_artifacts(
+            "the explore the room", self._words("the explore the room",
+                                                [0.2, 0.9, 0.9, 0.9]))
+        self.assertEqual(text, "explore the room")
+        self.assertEqual([w["word"] for w in words], ["explore", "the", "room"])
+
+    def test_repair_makes_a_dropped_instruction_addressable(self):
+        # The whole point: a phantom lead word hid the imperative verb.
+        self.assertFalse(speech_match.looks_directed_command(
+            "the take me to the kitchen"))
+        self.assertTrue(speech_match.looks_directed_command(
+            self._strip("the take me to the kitchen",
+                        [0.3, 0.9, 0.9, 0.9, 0.9, 0.9])))
+
+
 class AudioHeardGateTest(unittest.TestCase):
     """_emit_result drops noise before it ever reaches the bus."""
 
@@ -98,6 +152,20 @@ class AudioHeardGateTest(unittest.TestCase):
         node._utt_peak_rms = 120.0
         self._emit(node, "stop", conf_word=0.15)   # fails every other check
         self.assertEqual(len(node.bus.of("picarx/audio/heard")), 1)
+
+    def test_artifact_is_stripped_before_publishing(self):
+        node = self._node()
+        node._utt_floor, node._utt_peak_rms = 100.0, 900.0
+        import json
+        words = [{"word": w, "conf": c} for w, c in
+                 zip("the play the radio".split(), [0.25, 0.95, 0.9, 0.95])]
+        node._emit_result(json.dumps({"text": "the play the radio",
+                                      "result": words}), time.time())
+        heard = node.bus.of("picarx/audio/heard")[0]
+        self.assertEqual(heard["text"], "play the radio")
+        self.assertEqual(heard["raw"], "the play the radio")
+        # The invented word must not drag the published confidence down.
+        self.assertGreater(heard["confidence"], 0.9)
 
     def test_peak_resets_between_utterances(self):
         node = self._node()

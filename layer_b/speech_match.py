@@ -145,6 +145,47 @@ def looks_directed_command(text):
 
 
 # ---------------------------------------------------------------------
+# Decoder artifact repair ("the take me to the kitchen")
+# ---------------------------------------------------------------------
+# Vosk regularly prepends a word nobody said, and "the" is far and away the
+# most common: it's the acoustic model's cheapest explanation for a breath, a
+# lip smack, or the leading edge of a real word the noise gate clipped. It
+# reads as harmless, but it shifts the whole sentence one word right, and
+# several routers key on the FIRST word - looks_directed_command() stops
+# recognizing "take me to the kitchen" the moment it arrives as "the take me
+# to the kitchen", so a real instruction is dropped as chatter.
+#
+# The repair uses the decoder's OWN evidence rather than blanket-stripping
+# articles (which would quietly rewrite real speech): Vosk attaches a per-word
+# confidence, and a word it invented scores visibly worse than the words
+# around it. A leading filler is dropped only when the decoder is itself
+# unsure of it AND something is left standing without it. No evidence means no
+# strip - a false strip corrupts real speech, so ambiguity keeps the word.
+LEADING_ARTIFACTS = {"the", "a", "and", "uh", "um", "oh", "but", "so", "to"}
+ARTIFACT_MAX_CONF = 0.55     # below this the decoder is outright guessing
+ARTIFACT_CONF_RATIO = 0.6    # or: far less certain than the rest of the words
+
+
+def strip_decoder_artifacts(text, words=None):
+    """(repaired_text, kept_words) with a hallucinated leading filler removed.
+
+    `words` is Vosk's per-word list ([{"word": ..., "conf": ...}, ...]) as it
+    arrives on a recognizer result. The words are returned alongside the text
+    so a caller averaging confidence averages the words it actually kept."""
+    toks = (text or "").split()
+    if len(toks) < 2 or toks[0].lower() not in LEADING_ARTIFACTS:
+        return text, words
+    confs = [w.get("conf") for w in (words or []) if isinstance(w, dict)]
+    if len(confs) != len(toks) or any(c is None for c in confs):
+        return text, words       # can't align the evidence to the words
+    lead, rest = confs[0], confs[1:]
+    rest_mean = sum(rest) / len(rest)
+    if lead < ARTIFACT_MAX_CONF or lead < ARTIFACT_CONF_RATIO * rest_mean:
+        return " ".join(toks[1:]), list(words)[1:]
+    return text, words
+
+
+# ---------------------------------------------------------------------
 # Intent-feedback phrases ("that's not what I meant")
 # ---------------------------------------------------------------------
 # Spoken judgments on the robot's LAST interpretation. Deliberately
