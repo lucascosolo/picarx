@@ -116,6 +116,13 @@ avoid clobbering concurrent edits, and keep file contents out of audit logs;
 edits and deletion require confirmation. Patch operations remain as a
 backward-compatible path while the session/LLM orchestration is completed.
 
+Progress (2026-07-28): the Companion coding workflow now tells the thinking model
+to inspect before editing, use the approved/resumable plan, preserve expected
+hashes, rely only on typed helper results, and run bounded allowlisted diagnostics.
+It explicitly forbids claiming edits or passing tests without returned evidence;
+the remaining redesign work is end-to-end validation against a provisioned host
+and richer session-level coding UX.
+
 ### Thinking-plane tool access (new priority)
 
 The conversational robot should receive the complete typed catalog of

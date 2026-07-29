@@ -96,6 +96,11 @@ class CompanionMemoryTest(unittest.TestCase):
         # ...and no self-model block when there is no self-model yet.
         self.assertNotIn("self-understanding", prompt)
 
+    def test_system_prompt_requires_evidence_for_remote_coding_claims(self):
+        self.assertIn("expected_sha256", companion.SYSTEM_PROMPT)
+        self.assertIn("typed remote result confirms it", companion.SYSTEM_PROMPT)
+        self.assertIn("allowlisted tests", companion.SYSTEM_PROMPT)
+
 
 if __name__ == "__main__":
     unittest.main()
