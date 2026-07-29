@@ -41,6 +41,10 @@
   <div class="row"><button onclick="authorizeRemoteWrites()">Authorize writes for this session</button>
     <button onclick="remoteCommand('revoke_write')">Revoke writes</button>
     <span id="remote-write-status" class="hint">writes not authorized</span></div>
+  <div class="row"><button class="primary" onclick="beginCoding()">Begin coding session</button>
+    <button onclick="endCoding()">End coding session</button>
+    <input id="remote-coding-session" placeholder="coding session ID (thinking sessions)">
+  </div>
   <div class="row"><input id="remote-path" placeholder="relative path, e.g. src/main.py">
     <button onclick="remoteRead()">Read file</button>
     <button onclick="remoteList()">List directory</button></div>
@@ -92,6 +96,16 @@ function authorizeRemoteWrites() {
   }
   remoteCommand('authorize_write', {confirmed: true});
 }
+function beginCoding() {
+  if (!document.getElementById('remote-confirm').checked) {
+    alert('Check the confirmation box first.'); return;
+  }
+  remoteCommand('begin_coding', {confirmed: true});
+}
+function endCoding() {
+  remoteCommand('end_coding', {
+    coding_session_id: document.getElementById('remote-coding-session').value.trim() || undefined});
+}
 function remoteConnect() {
   const host = document.getElementById('remote-host').value.trim();
   if (!host) return;
@@ -141,8 +155,15 @@ PX.onPoll(s => {
   document.getElementById('gesture-pose').textContent =
     (g.pan != null && g.tilt != null) ? `${g.pan}° pan / ${g.tilt}° tilt` : '–';
   const r = s.remote || {};
-  document.getElementById('remote-status').textContent = r.target
-    ? `connected to ${r.target.host || 'host'}` : (r.error || 'not connected');
+  const codingId = r.coding_session_id || (r.result && r.result.coding_session_id);
+  const target = r.target || (r.result && r.result.target);
+  document.getElementById('remote-status').textContent = target
+    ? `connected to ${target.host || 'host'}${codingId ? ' · coding session active' : ''}`
+    : (r.error || 'not connected');
+  if (codingId)
+    document.getElementById('remote-coding-session').value = codingId;
+  if (r.command === 'end_coding')
+    document.getElementById('remote-coding-session').value = '';
   if (Object.keys(r).length)
     document.getElementById('remote-output').textContent = JSON.stringify(r, null, 2);
   document.getElementById('remote-write-status').textContent = r.write_authorized

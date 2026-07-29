@@ -292,6 +292,7 @@ class RemoteAssist:
         self.lock = threading.RLock()
         self.connected = False
         self.target = None
+        self.coding_session_id = None
         # Authorization is deliberately robot-side session state.  The host
         # helper remains launched with its write-capable protocol, but no
         # write request reaches it until this one-time grant is made.
@@ -308,6 +309,12 @@ class RemoteAssist:
             text = "Connected. The remote project helper is ready."
         elif message.get("command") == "disconnect":
             text = "Remote project session closed."
+        elif message.get("command") == "begin_coding":
+            result = message.get("result") or {}
+            text = ("Remote coding session started: " +
+                    str(result.get("coding_session_id") or "ready") + ".")
+        elif message.get("command") == "end_coding":
+            text = "Remote coding session closed; the SSH project connection remains available."
         elif message.get("command") == "run":
             result = message.get("result") or {}
             if result.get("canceled"):
@@ -404,6 +411,7 @@ class RemoteAssist:
                                                   password=payload.get("password"))
                     self.target, self.connected = target, True
                     self.write_authorized = False
+                    self.coding_session_id = None
                     self._claim()
                     response = {"ok": True, "command": command, "request_id": request_id,
                                 "target": target}
@@ -412,6 +420,7 @@ class RemoteAssist:
                     self.connected = False
                     self.target = None
                     self.write_authorized = False
+                    self.coding_session_id = None
                     self._release()
                     response = {"ok": True, "command": "disconnect",
                                 "request_id": request_id}
@@ -419,13 +428,43 @@ class RemoteAssist:
                     response = {"ok": True, "command": command,
                                 "request_id": request_id, "connected": self.connected,
                                 "target": self.target,
-                                "write_authorized": self.write_authorized}
+                                "write_authorized": self.write_authorized,
+                                "coding_session_id": self.coding_session_id}
+                elif command == "begin_coding":
+                    if not self.connected:
+                        raise RuntimeError("not connected; connect to a host first")
+                    if not payload.get("confirmed"):
+                        raise PermissionError(
+                            "explicit confirmation is required to begin a coding session")
+                    if self.coding_session_id is None:
+                        self.coding_session_id = uuid.uuid4().hex
+                    response = {"ok": True, "command": command,
+                                "request_id": request_id,
+                                "result": {"coding_session_id": self.coding_session_id,
+                                           "target": self.target,
+                                           "write_authorized": self.write_authorized}}
+                elif command == "end_coding":
+                    requested = payload.get("coding_session_id")
+                    if (payload.get("source") == "thinking" and requested and
+                            requested != self.coding_session_id):
+                        raise PermissionError("coding session ID does not match the active session")
+                    old_session = self.coding_session_id
+                    self.coding_session_id = None
+                    response = {"ok": True, "command": command,
+                                "request_id": request_id,
+                                "result": {"coding_session_id": None,
+                                           "ended_session_id": old_session,
+                                           "ended": bool(old_session)}}
                 elif not self.connected:
                     raise RuntimeError("not connected; connect to a host first")
                 elif command == "authorize_write":
                     if not payload.get("confirmed"):
                         raise PermissionError(
                             "explicit confirmation is required to grant remote write access")
+                    if (payload.get("source") == "thinking" and
+                            payload.get("coding_session_id") != self.coding_session_id):
+                        raise PermissionError(
+                            "thinking-originated writes require an active coding session")
                     self.write_authorized = True
                     response = {"ok": True, "command": command,
                                 "request_id": request_id,
@@ -438,6 +477,11 @@ class RemoteAssist:
                 elif command in {"list", "read", "search", "stat", "logs",
                                  "write_file", "delete_path", "preview_patch",
                                  "apply_patch", "rollback", "run"}:
+                    if (payload.get("source") == "thinking" and command in {
+                            "write_file", "delete_path", "apply_patch", "rollback", "run"}
+                            and payload.get("coding_session_id") != self.coding_session_id):
+                        raise PermissionError(
+                            "thinking-originated work requires an active coding session")
                     request = dict(payload)
                     request["op"] = command
                     if command in {"write_file", "delete_path", "apply_patch", "rollback"}:
@@ -471,6 +515,7 @@ class RemoteAssist:
                 self.connected = False
                 self.target = None
                 self.write_authorized = False
+                self.coding_session_id = None
             self._publish({"ok": False, "command": command, "request_id": request_id,
                            "error": str(e)[:500]})
 

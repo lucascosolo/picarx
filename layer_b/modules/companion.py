@@ -501,6 +501,23 @@ TOOLS = [
                            "description": "host project directory to scope access to"},
          "port": {"type": "integer", "description": "optional SSH port"}},
          "required": ["host"]}},
+    {"name": "start_coding_session",
+     "description": "Begin a user-directed coding session inside the already connected, "
+                    "explicitly scoped remote project. Require an approved plan_id; "
+                    "this creates a bounded session ID but does not edit files or run "
+                    "commands. Carry the returned coding_session_id on later remote "
+                    "operations.",
+     "input_schema": {"type": "object", "properties": {
+         "plan_id": {"type": "string"},
+         "objective": {"type": "string"}},
+         "required": ["plan_id", "objective"]}},
+    {"name": "end_coding_session",
+     "description": "End the current user-directed coding session while leaving the "
+                    "verified SSH project connection available for read-only inspection. "
+                    "Use when the planned coding work is complete or the person asks "
+                    "to close that workflow.",
+     "input_schema": {"type": "object", "properties": {
+         "coding_session_id": {"type": "string"}}, "required": []}},
     {"name": "remote_project_operation",
      "description": "Use the connected host helper to inspect, edit, or debug the scoped "
                     "project. Supported operations are status, list, read, search, "
@@ -514,7 +531,8 @@ TOOLS = [
                     "that grant covers file edits, apply_patch, and rollback until "
                     "disconnect. Destructive or long-running operations require a "
                     "bounded plan approved through the local control path; include "
-                    "its plan_id after approval. File overwrites use expected_sha256 "
+                    "its plan_id after approval and coding_session_id after starting "
+                    "a coding session. File overwrites use expected_sha256 "
                     "when available "
                     "to avoid clobbering a concurrent edit. "
                     "For run, set confirmed=true ONLY after the person explicitly "
@@ -534,7 +552,8 @@ TOOLS = [
          "command": {"type": "string"},
          "cwd": {"type": "string"},
          "confirmed": {"type": "boolean"},
-         "plan_id": {"type": "string"}},
+         "plan_id": {"type": "string"},
+         "coding_session_id": {"type": "string"}},
          "required": ["operation"]}},
 ]
 
@@ -2491,6 +2510,29 @@ class Companion:
                 result = self._dispatch_thinking_request(
                     REMOTE_ASSIST_TOPIC, request, REMOTE_RESULT_TOPIC)
                 return ("Connecting to the host over verified SSH; " + result)
+            if name == "start_coding_session":
+                objective = str(tool_input.get("objective") or "").strip()
+                if not objective:
+                    return "I need the coding objective before starting a session."
+                blocked = self._approved_plan_required(
+                    tool_input, "remote.coding_session.start")
+                if blocked:
+                    return blocked
+                # The objective stays in the plan/conversation. It is not sent
+                # to the host or stored in the remote helper's audit log.
+                result = self._dispatch_thinking_request(
+                    REMOTE_ASSIST_TOPIC, {
+                        "command": "begin_coding", "source": "thinking",
+                        "confirmed": True}, REMOTE_RESULT_TOPIC)
+                return "Remote coding session start requested; " + result
+            if name == "end_coding_session":
+                request = {"command": "end_coding", "source": "thinking"}
+                if tool_input.get("coding_session_id"):
+                    request["coding_session_id"] = str(
+                        tool_input["coding_session_id"])[:100]
+                result = self._dispatch_thinking_request(
+                    REMOTE_ASSIST_TOPIC, request, REMOTE_RESULT_TOPIC)
+                return "Remote coding session end requested; " + result
             if name == "remote_project_operation":
                 operation = str(tool_input.get("operation") or "").lower()
                 allowed = {"status", "list", "read", "search", "stat", "logs",
@@ -2509,9 +2551,10 @@ class Companion:
                                                            "remote." + operation)
                     if blocked:
                         return blocked
-                request = {"command": operation}
+                request = {"command": operation, "source": "thinking"}
                 fields = ("path", "pattern", "patch", "content", "expected_sha256",
-                          "command", "cwd", "confirmed", "plan_id")
+                          "command", "cwd", "confirmed", "plan_id",
+                          "coding_session_id")
                 for key in fields:
                     value = tool_input.get(key)
                     if value not in (None, ""):

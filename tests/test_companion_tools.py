@@ -207,6 +207,31 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(request["project_root"], "~/src/picarx")
         self.assertNotIn("password", request)
 
+    def test_approved_plan_starts_coding_session_and_scopes_remote_work(self):
+        parent = self.c
+        class ReplyBus(harness.FakeBus):
+            def publish(self, topic, payload):
+                super().publish(topic, payload)
+                if (topic == companion.REMOTE_ASSIST_TOPIC and
+                        payload.get("command") == "begin_coding"):
+                    parent.on_remote_result({
+                        "request_id": payload["request_id"], "ok": True,
+                        "result": {"coding_session_id": "coding-1"}})
+        self.c.bus = ReplyBus()
+        plan_id = self._approved_plan()
+        started = self.c._execute_tool("start_coding_session", {
+            "plan_id": plan_id, "objective": "inspect and test the project"})
+        self.assertIn("coding-1", started)
+        begin = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(begin["command"], "begin_coding")
+        self.assertTrue(begin["confirmed"])
+        self.c._execute_tool("remote_project_operation", {
+            "operation": "run", "command": "pytest", "confirmed": True,
+            "plan_id": plan_id, "coding_session_id": "coding-1"})
+        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(request["coding_session_id"], "coding-1")
+        self.assertEqual(request["source"], "thinking")
+
     def test_remote_coding_write_requires_explicit_confirmation(self):
         out = self.c._execute_tool("remote_project_operation", {
             "operation": "write_file", "path": "main.py",

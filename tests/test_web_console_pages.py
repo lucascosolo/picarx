@@ -154,7 +154,8 @@ class RouteTableTest(unittest.TestCase):
                        "remoteRun()", "authorizeRemoteWrites()", "revoke_write",
                        "remote-confirm", "remote-password",
                        "not saved or sent to the language model",
-                       "remoteWriteFile()", "write_file",
+                       "remoteWriteFile()", "write_file", "beginCoding()",
+                       "endCoding()", "coding session active",
                        "thinkingPlan('approve_plan', true)", "Approve plan",
                        "thinking-plan-progress", "completed_step_count",
                        "argv: document.getElementById('remote-command')"):

@@ -213,6 +213,29 @@ class RemoteAssistTests(unittest.TestCase):
         self.assertEqual(session.cancel_calls, 1)
         self.assertTrue(remote.connected)
 
+    def test_thinking_destructive_work_requires_active_coding_session(self):
+        session = FakeSession()
+        bus = harness.FakeBus()
+        remote = RemoteAssist(session=session, bus=bus)
+        remote._handle({"command": "connect", "host": "192.168.1.20"})
+        remote._handle({"command": "begin_coding", "confirmed": True})
+        coding_id = remote.coding_session_id
+        remote._handle({"command": "authorize_write", "confirmed": True,
+                        "source": "thinking"})
+        self.assertFalse(remote.write_authorized)
+        remote._handle({"command": "authorize_write", "confirmed": True,
+                        "source": "thinking", "coding_session_id": coding_id})
+        self.assertTrue(remote.write_authorized)
+        remote._handle({"command": "run", "argv": ["python3", "-m", "pytest"],
+                        "confirmed": True, "source": "thinking",
+                        "coding_session_id": coding_id})
+        self.assertEqual(session.requests[-1]["op"], "run")
+        remote._handle({"command": "end_coding", "source": "thinking",
+                        "coding_session_id": coding_id})
+        self.assertIsNone(remote.coding_session_id)
+        self.assertIsNone(bus.last("picarx/tools/remote_assist/result")
+                          ["result"]["coding_session_id"])
+
     def test_remote_connect_forwards_password_only_to_session(self):
         session = FakeSession()
         bus = harness.FakeBus()

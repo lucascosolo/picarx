@@ -103,7 +103,8 @@ Progress (2026-07-28): the web tools console now accepts an optional
 password-only-for-connect field. It is cleared from the browser field after
 submission and is carried to `sshpass -d` through an anonymous pipe, never in
 argv, environment, MQTT results, metadata, or companion/LLM tool input. The
-full user-directed coding-session redesign remains next for this P0 item.
+remaining coding-session work is now focused on target-host validation and
+workflow polish.
 
 Audit correction (2026-07-28): `RemoteAssist` now forwards that transient
 credential only to `RemoteSession.connect`; the typed result and regression
@@ -121,7 +122,14 @@ to inspect before editing, use the approved/resumable plan, preserve expected
 hashes, rely only on typed helper results, and run bounded allowlisted diagnostics.
 It explicitly forbids claiming edits or passing tests without returned evidence;
 the remaining redesign work is end-to-end validation against a provisioned host
-and richer session-level coding UX.
+and recovery behavior under real network/session failures.
+
+Progress (2026-07-28): a thinking model must now begin an explicit, plan-approved
+coding session and carry its returned session ID through destructive remote work.
+RemoteAssist enforces that boundary for thinking-originated writes, patches,
+rollbacks, and commands, while human web controls remain available separately.
+The web tools page can begin/end the scoped session and shows its ID; disconnect
+always clears it.
 
 ### Thinking-plane tool access (new priority)
 
