@@ -112,6 +112,27 @@ avoid clobbering concurrent edits, and keep file contents out of audit logs;
 edits and deletion require confirmation. Patch operations remain as a
 backward-compatible path while the session/LLM orchestration is completed.
 
+### Thinking-plane tool access (new priority)
+
+The conversational robot should receive the complete typed catalog of
+non-movement tools on every thinking turn, rather than a lexical subset that
+made multi-step work appear unavailable. It may inspect capabilities and
+current activity, query health/perception/session state, manage reminders,
+notes, radio, memory, people, Bluetooth, remote coding, and other bounded
+services. Movement remains exclusively on the local safety-critical command
+path; it must not be exposed as an LLM tool or accepted if a model attempts
+to call it anyway.
+
+Progress (2026-07-28): Companion now advertises all non-movement tools,
+including `describe_tools`, `get_robot_status`, and typed radio control;
+movement tools are filtered at both catalog construction and dispatch. The
+tool loop is expanded to eight rounds/16 calls with a hard exhaustion reply,
+and latest state mirrors are subscribed for honest “what am I doing?” answers.
+Next: add correlated asynchronous tool results and cancellation so a
+multi-tool plan can observe each daemon’s actual result before choosing its
+next step, and add explicit plan/approval state for long-running or
+destructive work.
+
 ### 4. Follow/perception reliability
 
 Follow already has freshness telemetry, bounded reacquisition, arbitration and

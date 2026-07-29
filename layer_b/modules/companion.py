@@ -17,14 +17,13 @@ its system prompt tells it to point them at the actual command words
 instead. That split (fast local safety-relevant commands vs. this slower,
 LLM-backed chat layer) is deliberate and should not be blurred.
 
-It does expose a small set of LLM TOOLS (see TOOLS) that let the model
-ACT by TOGGLING other daemons over picarx/tools/* topics - never by
+It exposes a typed set of non-movement LLM TOOLS (see TOOLS) that let the
+model ACT by TOGGLING other daemons over picarx/tools/* topics - never by
 emitting motion. schedule_reminder arms reminder_daemon, share_connection
-asks bluetooth_daemon to tether to a paired phone, and start/stop_following
-flip follow_daemon's mode. Even start_following only sets a switch: follow_daemon
-generates the actual motion deterministically from vision and every command
-still flows through the safety daemon, so "motion never starts from raw LLM
-output" holds - the model chooses a behaviour, not a maneuver.
+asks bluetooth_daemon to tether to a paired phone, and the other typed tools
+query or control bounded services. Movement stays on the local command path;
+the thinking model cannot start or stop following. The model chooses useful
+non-movement actions and questions, never a maneuver.
 The remote project tools likewise only publish typed requests to the SSH
 helper; they never execute host commands in the companion process, and
 writes/commands still require explicit confirmation.
@@ -286,7 +285,8 @@ EPISODE_TRIGGERS = (
 # generates the actual movement deterministically from vision, every command
 # still gated by the safety daemon. Reminders and network-sharing issue no
 # motion at all.
-MAX_TOOL_ROUNDS = 3          # bound the tool<->model round-trips per utterance
+MAX_TOOL_ROUNDS = 8          # bounded, natural multi-step tool conversations
+MAX_TOOL_CALLS = 16          # cap parallel/repeated calls in one utterance
 REMINDER_SET_TOPIC = "picarx/tools/reminder/set"
 REMINDER_CONTROL_TOPIC = "picarx/tools/reminder/control"
 REMINDER_RESULT_TOPIC = "picarx/tools/reminder/result"
@@ -297,6 +297,11 @@ BLUETOOTH_CONNECT_TOPIC = "picarx/tools/bluetooth/connect"
 HEALTH_STATE_TOPIC = "picarx/health/state"
 LOWPOWER_REQUEST_TOPIC = "picarx/tools/lowpower/request"
 REMOTE_ASSIST_TOPIC = "picarx/tools/remote_assist"
+RADIO_TOPIC = "picarx/tools/radio"
+ROBOT_STATE_TOPIC = "picarx/state/current"
+GESTURE_STATUS_TOPIC = "picarx/gesture/status"
+REMOTE_RESULT_TOPIC = "picarx/tools/remote_assist/result"
+FOLLOW_STATUS_TOPIC = "picarx/tools/follow/status"
 
 # ---------- talking about its own experience ----------
 # Beyond what it sees and who it's with, the companion grounds replies in the
@@ -355,19 +360,6 @@ TOOLS = [
          "action": {"type": "string", "enum": ["start", "pause", "resume", "stop"]},
          "title": {"type": "string"}, "id": {"type": "string"},
          "confirmed": {"type": "boolean"}}, "required": ["action"]}},
-    {"name": "start_following",
-     "description": "Start physically following the person around, driving to keep "
-                    "them centered in view. This MOVES the robot, so only call it "
-                    "when you are VERY CONFIDENT the person is clearly, explicitly "
-                    "asking to be followed right now (e.g. 'follow me', 'come with "
-                    "me', 'walk with me'). If it's ambiguous, casual, hypothetical, "
-                    "or just talk ABOUT following, do NOT call it - reply in words "
-                    "and let them confirm. Movement stays under the safety system "
-                    "and can be stopped anytime.",
-     "input_schema": {"type": "object", "properties": {}, "required": []}},
-    {"name": "stop_following",
-     "description": "Stop following the person.",
-     "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "share_connection",
      "description": "Get internet by tethering over BLUETOOTH to the person's "
                     "already-paired phone, so radio and chat keep working where "
@@ -413,6 +405,26 @@ TOOLS = [
                     "person tells you to conserve power. (A safety system also does "
                     "this on its own if the battery gets critically low.)",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "describe_tools",
+     "description": "Explain the non-movement tools you can use in this thinking "
+                    "conversation. Use when the person asks what tools or abilities "
+                    "you have; do not claim access to movement controls here.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "get_robot_status",
+     "description": "Read what the robot is currently doing and its latest state: "
+                    "mode/claims, health, perception, radio, follow, gesture, and "
+                    "remote-session status. Use this before deciding what to do next "
+                    "or when the person asks what is happening.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "control_radio",
+     "description": "Control internet radio without moving the robot. You can play, "
+                    "stop, skip, list stations, find stations, report status, or play "
+                    "a named station. Use command and optional station/query.",
+     "input_schema": {"type": "object", "properties": {
+         "command": {"type": "string", "enum": ["play", "stop", "next",
+                     "list", "find", "status"]},
+         "station": {"type": "string"},
+         "query": {"type": "string"}}, "required": ["command"]}},
     {"name": "connect_remote_host",
      "description": "Connect to a developer's computer over SSH using the robot's "
                     "already-provisioned key, or a password entered in the tools "
@@ -459,37 +471,27 @@ TOOLS = [
          "required": ["operation"]}},
 ]
 
-# Advertise only the small slice of tools relevant to the current utterance.
-# The intent arbiter and explicit feedback loop already provide the robot's
-# command-phrase learning; this index only prevents unrelated tool schemas
-# from consuming context on ordinary conversation.
-_TOOL_INDEX = {tool["name"]: tool for tool in TOOLS}
+# Movement stays on the instant local command path and is deliberately not
+# offered to the slower thinking model. Keep the exclusion centralized so a
+# newly added conversational tool cannot accidentally acquire motor authority.
+MOVEMENT_TOOL_NAMES = frozenset({"start_following", "stop_following"})
+THINKING_TOOLS = tuple(
+    tool for tool in TOOLS if tool["name"] not in MOVEMENT_TOOL_NAMES)
+THINKING_TOOL_NAMES = frozenset(tool["name"] for tool in THINKING_TOOLS)
 
 
 def tools_for_utterance(text):
-    """Select relevant Claude tools using a cheap, fail-closed lexical gate."""
-    raw = (text or "").lower()
-    canon = speech_match.canonicalize(raw)
-    haystack = f"{raw} {canon}"
-    names = set()
-    if any(word in haystack for word in ("remind", "reminder")):
-        names.update(("schedule_reminder", "manage_reminders"))
-    if any(word in haystack for word in ("note", "meeting", "transcript")):
-        names.update(("create_note", "manage_notes", "control_meeting_notes"))
-    if any(word in haystack for word in ("follow", "following")):
-        names.update(("start_following", "stop_following"))
-    if any(word in haystack for word in ("bluetooth", "tether", "connection", "phone")):
-        names.add("share_connection")
-    if any(word in haystack for word in ("remember", "memory", "know", "learned")):
-        names.update(("recall_memory", "list_known_people"))
-    if any(word in haystack for word in ("battery", "charge", "power", "temperature", "disk")):
-        names.update(("check_vital_stats", "register_low_power_intent"))
-    if any(word in haystack for word in ("ssh", "remote", "host", "project", "patch")):
-        names.update(("connect_remote_host", "remote_project_operation"))
-    if (any(word in haystack for word in ("object", "thing", "saw", "seen"))
-            or "where is" in haystack or "where did" in haystack):
-        names.add("where_is_object")
-    return [_TOOL_INDEX[name] for name in _TOOL_INDEX if name in names]
+    """Return the complete non-movement thinking catalog.
+
+    Tool selection used to be a lexical pre-filter. That made the robot look
+    incapable of useful follow-up work: a question about a reminder could not
+    discover notes or status, and a multi-step task lost the tool it needed on
+    the next model round. The model now receives one stable, movement-free
+    catalog and chooses among typed tools itself; bounded rounds and per-call
+    validation remain the safety limits.
+    """
+    del text  # retained as a compatibility seam for callers/tests
+    return list(THINKING_TOOLS)
 
 PEOPLE_DIR = f"{DATA_DIR}/people"
 
@@ -587,6 +589,14 @@ class Companion:
         self.latest_frame_at = 0.0
         # Latest vital stats from health_daemon (for the check_vital_stats tool)
         self.latest_health = None
+        # Read-only status mirrors used by the thinking tools. Producers own
+        # these state machines; Companion only retains the latest bounded
+        # payload so a question can be answered without inventing activity.
+        self.latest_robot_state = None
+        self.latest_gesture_status = None
+        self.latest_follow_status = None
+        self.latest_remote_result = None
+        self.latest_radio_state = None
         # The reminder daemon owns timers; this is only a small read-only cache
         # of its published state so follow-up questions can be answered locally
         # without asking Claude to reconstruct an asynchronous tool call.
@@ -838,6 +848,26 @@ class Companion:
     def on_world_state(self, payload):
         with self.lock:
             self.latest_world = payload
+
+    def on_robot_state(self, payload):
+        with self.lock:
+            self.latest_robot_state = dict(payload or {})
+
+    def on_gesture_status(self, payload):
+        with self.lock:
+            self.latest_gesture_status = dict(payload or {})
+
+    def on_follow_status(self, payload):
+        with self.lock:
+            self.latest_follow_status = dict(payload or {})
+
+    def on_remote_result(self, payload):
+        with self.lock:
+            self.latest_remote_result = dict(payload or {})
+
+    def on_radio_state(self, payload):
+        with self.lock:
+            self.latest_radio_state = dict(payload or {})
 
     def on_unhandled(self, payload):
         text = (payload.get("text") or "").strip()
@@ -1646,9 +1676,13 @@ class Companion:
         results back so the model can produce a natural spoken reply.
         Returns the final spoken text ("" if none)."""
         convo = list(messages)
-        active_tools = TOOLS if tools is None else list(tools)
+        requested_tools = THINKING_TOOLS if tools is None else list(tools)
+        active_tools = [tool for tool in requested_tools
+                        if tool.get("name") not in MOVEMENT_TOOL_NAMES]
         final_text = ""
         request_id = f"companion-chat-{uuid.uuid4().hex}"
+        tool_calls = 0
+        exhausted = True
         for _ in range(MAX_TOOL_ROUNDS):
             if isinstance(client, LLMGateway):
                 result = client.complete(
@@ -1665,10 +1699,17 @@ class Companion:
                     final_text = text
                 tool_uses = [b for b in content if b.get("type") == "tool_use"]
                 if not tool_uses:
+                    exhausted = False
                     break
                 convo.append({"role": "assistant", "content": content})
                 results = []
                 for tu in tool_uses:
+                    tool_calls += 1
+                    if tool_calls > MAX_TOOL_CALLS:
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": tu.get("id"),
+                                        "content": "Tool-call budget exhausted for this turn."})
+                        continue
                     out = self._execute_tool(tu.get("name"), tu.get("input") or {})
                     results.append({"type": "tool_result",
                                     "tool_use_id": tu.get("id"),
@@ -1692,21 +1733,84 @@ class Companion:
             tool_uses = [b for b in response.content
                          if getattr(b, "type", None) == "tool_use"]
             if not tool_uses:
+                exhausted = False
                 break
             convo.append({"role": "assistant", "content": response.content})
             results = []
             for tu in tool_uses:
+                tool_calls += 1
+                if tool_calls > MAX_TOOL_CALLS:
+                    results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                    "content": "Tool-call budget exhausted for this turn."})
+                    continue
                 out = self._execute_tool(tu.name, getattr(tu, "input", None) or {})
                 results.append({"type": "tool_result", "tool_use_id": tu.id,
                                 "content": out})
             convo.append({"role": "user", "content": results})
+        if exhausted and not final_text:
+            return "I reached the safe limit for this task before I could finish."
         return final_text
 
     def _execute_tool(self, name, tool_input):
         """Run one tool call by publishing the matching mode/request topic.
         Returns a short result string fed back to the model. Never emits a
         motion primitive - follow motion is generated by follow_daemon."""
+        if name in MOVEMENT_TOOL_NAMES:
+            return ("Movement is not available to the thinking conversation. "
+                    "The separate local safety command path handles it.")
+        if name not in THINKING_TOOL_NAMES:
+            return f"Unknown tool: {name}"
         try:
+            if name == "describe_tools":
+                rows = []
+                for tool in THINKING_TOOLS:
+                    description = " ".join(str(tool.get("description") or "").split())
+                    rows.append(f"{tool['name']}: {description[:180]}")
+                return ("Available non-movement tools: " + "; ".join(rows) +
+                        ". Movement controls are intentionally excluded.")
+            if name == "get_robot_status":
+                with self.lock:
+                    state = dict(getattr(self, "latest_robot_state", None) or {})
+                    health = dict(getattr(self, "latest_health", None) or {})
+                    world = dict(getattr(self, "latest_world", None) or {})
+                    gesture = dict(getattr(self, "latest_gesture_status", None) or {})
+                    follow = dict(getattr(self, "latest_follow_status", None) or {})
+                    remote = dict(getattr(self, "latest_remote_result", None) or {})
+                    radio = dict(getattr(self, "latest_radio_state", None) or {})
+                parts = [f"mode {state.get('state') or 'unknown'}"]
+                claims = state.get("claims")
+                if isinstance(claims, list) and claims:
+                    owners = [str(c.get("owner") or "unknown") for c in claims
+                              if isinstance(c, dict)]
+                    if owners:
+                        parts.append("claims held by " + ", ".join(owners[:6]))
+                parts.append(self._format_health(health))
+                if world:
+                    parts.append("perception: " + self._context_blurb()[:420])
+                if gesture:
+                    parts.append("gesture " + str(gesture.get("state") or "unknown") +
+                                 (f" ({gesture.get('phase')})" if gesture.get("phase") else ""))
+                if follow:
+                    parts.append("follow " + str(follow.get("state") or
+                                                  follow.get("enabled") or "unknown"))
+                if radio:
+                    parts.append("radio " + (f"playing {radio.get('station')}"
+                                              if radio.get("playing") else "off"))
+                if remote:
+                    parts.append("remote session " + str(
+                        remote.get("command") or remote.get("state") or "active"))
+                return "Current robot status: " + "; ".join(parts) + "."
+            if name == "control_radio":
+                command = str(tool_input.get("command") or "").lower()
+                if command not in {"play", "stop", "next", "list", "find", "status"}:
+                    return "Radio command must be play, stop, next, list, find, or status."
+                request = {"command": command}
+                if tool_input.get("station"):
+                    request["station"] = str(tool_input["station"])[:160]
+                if tool_input.get("query"):
+                    request["keywords"] = str(tool_input["query"])[:160]
+                self.bus.publish(RADIO_TOPIC, request)
+                return f"Radio {command} request sent."
             if name == "schedule_reminder":
                 message = str(tool_input.get("message") or "").strip()
                 if not message:
@@ -1945,6 +2049,11 @@ class Companion:
         self.bus.subscribe(FEEDBACK_TOPIC, self.on_feedback)
         self.bus.subscribe(CAMERA_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)
+        self.bus.subscribe(ROBOT_STATE_TOPIC, self.on_robot_state)
+        self.bus.subscribe(GESTURE_STATUS_TOPIC, self.on_gesture_status)
+        self.bus.subscribe(FOLLOW_STATUS_TOPIC, self.on_follow_status)
+        self.bus.subscribe(REMOTE_RESULT_TOPIC, self.on_remote_result)
+        self.bus.subscribe("picarx/tools/radio_state", self.on_radio_state)
         self.bus.subscribe(HEALTH_STATE_TOPIC, self.on_health)
         self.bus.subscribe(REMINDER_STATE_TOPIC, self.on_reminder_state)
         self.bus.subscribe(REMINDER_RESULT_TOPIC, self.on_reminder_result)

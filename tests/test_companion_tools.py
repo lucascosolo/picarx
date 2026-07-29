@@ -65,9 +65,27 @@ class CompanionToolTest(unittest.TestCase):
         self.c._execute_tool("start_following", {})
         self.c._execute_tool("stop_following", {})
         msgs = self.c.bus.of(companion.FOLLOW_CONTROL_TOPIC)
-        self.assertEqual([m["enabled"] for m in msgs], [True, False])
+        self.assertEqual(msgs, [])
         # Companion must NEVER emit a raw motion primitive.
         self.assertEqual(self.c.bus.of("picarx/intent/move"), [])
+
+    def test_thinking_robot_can_describe_tools_and_current_status(self):
+        tools = self.c._execute_tool("describe_tools", {})
+        self.assertIn("schedule_reminder", tools)
+        self.assertIn("control_radio", tools)
+        self.assertNotIn("start_following", tools)
+        self.c.latest_robot_state = {"state": "IDLE", "claims": []}
+        self.c.latest_health = {"battery_v": 7.4, "battery_pct": 58}
+        status = self.c._execute_tool("get_robot_status", {})
+        self.assertIn("mode IDLE", status)
+        self.assertIn("battery 7.4 volts", status)
+
+    def test_thinking_robot_can_control_non_motion_radio(self):
+        out = self.c._execute_tool("control_radio", {
+            "command": "find", "query": "jazz"})
+        self.assertIn("radio find", out.lower())
+        self.assertEqual(self.c.bus.last(companion.RADIO_TOPIC), {
+            "command": "find", "keywords": "jazz"})
 
     def test_share_connection_publishes_bluetooth(self):
         self.c._execute_tool("share_connection", {"name": "Pixel"})
@@ -188,13 +206,19 @@ class CompanionToolTest(unittest.TestCase):
     def test_unknown_tool(self):
         self.assertIn("Unknown", self.c._execute_tool("frobnicate", {}))
 
-    def test_tool_catalog_is_narrow_for_ordinary_chat(self):
-        self.assertEqual(companion.tools_for_utterance("tell me a joke"), [])
+    def test_tool_catalog_is_complete_but_excludes_movement(self):
+        names = {tool["name"] for tool in companion.tools_for_utterance(
+            "tell me a joke")}
+        self.assertEqual(names, set(companion.THINKING_TOOL_NAMES))
+        self.assertNotIn("start_following", names)
+        self.assertNotIn("stop_following", names)
 
     def test_tool_catalog_keeps_only_relevant_capabilities(self):
         names = [t["name"] for t in companion.tools_for_utterance(
             "please remind me to call mom in ten minutes")]
-        self.assertEqual(names, ["schedule_reminder", "manage_reminders"])
+        self.assertIn("schedule_reminder", names)
+        self.assertIn("get_robot_status", names)
+        self.assertIn("remote_project_operation", names)
 
     # ---- full tool loop ----
 
@@ -207,7 +231,7 @@ class CompanionToolTest(unittest.TestCase):
         reply = self.c._chat_with_tools(client, messages)
         self.assertEqual(reply, "Okay, following you now!")
         # The tool actually fired.
-        self.assertEqual(self.c.bus.last(companion.FOLLOW_CONTROL_TOPIC)["enabled"], True)
+        self.assertEqual(self.c.bus.of(companion.FOLLOW_CONTROL_TOPIC), [])
         # Two model round-trips: the tool call and the spoken follow-up.
         self.assertEqual(len(client.messages.calls), 2)
         # Every call advertised the tools.
