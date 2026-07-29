@@ -84,6 +84,7 @@ from spatial_store import SpatialStore
 import speech_match
 import tool_catalog
 import capabilities
+import identity
 
 import threading
 import queue
@@ -1743,7 +1744,8 @@ class Companion:
         in what it has actually learned about itself and knows what time it
         is (needed for time-aware replies and the schedule_reminder tool).
         Costs one tiny read-only SELECT, no API call."""
-        prompt = (SYSTEM_PROMPT + "\n\nThe current local date and time is "
+        prompt = (identity.self_intro() + "\n\n" + SYSTEM_PROMPT +
+                  "\n\nThe current local date and time is "
                   + time.strftime("%A %B %d %Y, %I:%M %p") + ".")
         notes = self._self_model_notes()
         if not notes:

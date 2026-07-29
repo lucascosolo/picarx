@@ -133,6 +133,15 @@ KNOBS = [
      "default": 2, "env": "AUDIO_VAD_AGGRESSIVENESS",
      "desc": "webrtcvad aggressiveness: 0 (loose, hears more) to 3 (strict, "
              "rejects more non-speech)."},
+    # ---- identity (identity.py): who the robot is ----
+    {"section": "identity", "key": "name", "type": "str",
+     "default": "Marco", "env": "ROBOT_NAME",
+     "desc": "What the robot calls itself and answers to. Grounds the "
+             "conversational personality and is automatically added to the "
+             "wake phrases, so the robot's own name addresses it."},
+    {"section": "identity", "key": "pronouns", "type": "str",
+     "default": "he/him", "env": "ROBOT_PRONOUNS",
+     "desc": "How the robot refers to itself, for the personality prompt only."},
     # ---- dialog broker (dialog.py) + shared with field_agent forwarding ----
     {"section": "dialog", "key": "wake_phrases", "type": "str",
      "default": "robot,hey robot,computer", "env": "DIALOG_WAKE_PHRASES",

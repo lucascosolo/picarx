@@ -71,6 +71,7 @@ from broker_client import Bus
 import robot_config
 import attention
 import capabilities
+import identity
 import speech_match
 
 import threading
@@ -101,9 +102,17 @@ EXPIRY_SWEEP_SEC = 1.0   # how often the background sweeper checks the live dead
 ANSWER_SUPPRESS_SEC = 3.0
 
 
-WAKE_PHRASES = attention.normalize_wake_phrases(robot_config.get(
+# The robot's own name addresses it, alongside the generic wake phrases: we
+# tell it (in companion's personality prompt) that it answers to its name, so
+# the addressing layer has to actually recognize it, or "Marco, come here"
+# would be heard by everyone except Marco. The name is appended to the
+# configured phrases and de-duplicated, so setting identity.name is enough -
+# no need to also edit dialog.wake_phrases.
+_CONFIGURED_WAKE = attention.normalize_wake_phrases(robot_config.get(
     "dialog", "wake_phrases", "robot,hey robot,computer",
     env="DIALOG_WAKE_PHRASES"))
+WAKE_PHRASES = tuple(dict.fromkeys(
+    _CONFIGURED_WAKE + attention.normalize_wake_phrases([identity.name()])))
 
 
 class DialogBroker:

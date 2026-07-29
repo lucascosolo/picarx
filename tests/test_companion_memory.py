@@ -88,8 +88,10 @@ class CompanionMemoryTest(unittest.TestCase):
 
     def test_system_prompt_without_self_model_still_has_base_and_time(self):
         prompt = self.c._compose_system_prompt()
-        # Base personality is always present as a prefix...
-        self.assertTrue(prompt.startswith(companion.SYSTEM_PROMPT))
+        # The robot's identity grounds the prompt first (it is Marco, not a
+        # generic device), and the base personality always follows it...
+        self.assertTrue(prompt.startswith("Your name is"))
+        self.assertIn(companion.SYSTEM_PROMPT, prompt)
         # ...plus the dynamically-injected current local date/time...
         self.assertIn("current local date and time", prompt)
         self.assertIn(time.strftime("%Y"), prompt)
