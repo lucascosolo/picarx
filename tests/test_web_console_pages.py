@@ -156,6 +156,7 @@ class RouteTableTest(unittest.TestCase):
                        "not saved or sent to the language model",
                        "remoteWriteFile()", "write_file",
                        "thinkingPlan('approve_plan', true)", "Approve plan",
+                       "thinking-plan-progress", "completed_step_count",
                        "argv: document.getElementById('remote-command')"):
             self.assertIn(marker, page)
 

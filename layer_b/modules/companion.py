@@ -456,6 +456,22 @@ TOOLS = [
          "goal": {"type": "string"},
          "steps": {"type": "array", "items": {"type": "string"}}},
          "required": ["goal", "steps"]}},
+    {"name": "resume_plan",
+     "description": "Read the current thinking plan and its explicit step progress. "
+                    "Use after the person approves a plan or asks to continue. This "
+                    "is read-only and never executes a step.",
+     "input_schema": {"type": "object", "properties": {
+         "plan_id": {"type": "string"}}, "required": []}},
+    {"name": "update_plan_progress",
+     "description": "Record that an explicitly approved plan step is in progress "
+                    "or completed. This only updates resumable progress; it does "
+                    "not execute tools. Use the zero-based step_index from "
+                    "resume_plan.",
+     "input_schema": {"type": "object", "properties": {
+         "plan_id": {"type": "string"},
+         "step_index": {"type": "integer", "minimum": 0},
+         "progress": {"type": "string", "enum": ["in_progress", "completed"]}},
+         "required": ["plan_id", "step_index", "progress"]}},
     {"name": "cancel_current_task",
      "description": "Cancel the current thinking/tool task without moving the robot. "
                     "Use when the person says to stop the current research, coding, "
@@ -593,12 +609,21 @@ class ThinkingPlanManager:
                 "plan_id": uuid.uuid4().hex,
                 "goal": goal,
                 "steps": normalized,
+                "progress": ["pending"] * len(normalized),
                 "status": "pending",
                 "created_at": now,
                 "expires_at": now + self.ttl_sec,
                 "used_tools": [],
             }
-            return dict(self._plan)
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self):
+        plan = dict(self._plan) if self._plan else None
+        if plan:
+            plan["steps"] = list(plan.get("steps") or [])
+            plan["progress"] = list(plan.get("progress") or [])
+            plan["used_tools"] = list(plan.get("used_tools") or [])
+        return plan
 
     def _expire_locked(self, now):
         if self._plan and self._plan["status"] in {"pending", "approved"} and \
@@ -608,7 +633,7 @@ class ThinkingPlanManager:
     def current(self):
         with self._lock:
             self._expire_locked(float(self.clock()))
-            return dict(self._plan) if self._plan else None
+            return self._snapshot_locked()
 
     def approve(self, plan_id):
         with self._lock:
@@ -616,17 +641,19 @@ class ThinkingPlanManager:
             if not self._plan or self._plan["plan_id"] != str(plan_id):
                 return None
             if self._plan["status"] != "pending":
-                return dict(self._plan)
+                return self._snapshot_locked()
             self._plan["status"] = "approved"
             self._plan["approved_at"] = float(self.clock())
-            return dict(self._plan)
+            self._plan["updated_at"] = float(self.clock())
+            return self._snapshot_locked()
 
     def reject(self, plan_id, status="rejected"):
         with self._lock:
             if not self._plan or self._plan["plan_id"] != str(plan_id):
                 return None
             self._plan["status"] = status
-            return dict(self._plan)
+            self._plan["updated_at"] = float(self.clock())
+            return self._snapshot_locked()
 
     def allows(self, plan_id, tool_name=None):
         with self._lock:
@@ -636,7 +663,53 @@ class ThinkingPlanManager:
                 return False
             if tool_name and tool_name not in self._plan["used_tools"]:
                 self._plan["used_tools"].append(str(tool_name))
+                self._plan["updated_at"] = float(self.clock())
             return True
+
+    def record_tool_outcome(self, plan_id, tool_name, outcome):
+        """Keep safe execution evidence without guessing which step finished."""
+        with self._lock:
+            self._expire_locked(float(self.clock()))
+            if not self._plan or self._plan["status"] != "approved" or \
+                    self._plan["plan_id"] != str(plan_id):
+                return None
+            self._plan["last_tool"] = str(tool_name)[:100]
+            self._plan["last_outcome"] = str(outcome)[:40]
+            self._plan["updated_at"] = float(self.clock())
+            return self._snapshot_locked()
+
+    def update_progress(self, plan_id, step_index, progress):
+        """Apply an explicit model progress signal to an approved plan.
+
+        This never executes a step and does not infer progress from tool names:
+        the model must identify the step it believes it started or completed.
+        """
+        try:
+            step_index = int(step_index)
+        except (TypeError, ValueError):
+            return None
+        progress = str(progress or "").lower()
+        if progress not in {"in_progress", "completed"}:
+            return None
+        with self._lock:
+            self._expire_locked(float(self.clock()))
+            if not self._plan or self._plan["status"] != "approved" or \
+                    self._plan["plan_id"] != str(plan_id):
+                return None
+            if not 0 <= step_index < len(self._plan["steps"]):
+                return None
+            self._plan["progress"][step_index] = progress
+            if progress == "in_progress":
+                self._plan["active_step"] = step_index
+            else:
+                pending = [i for i, state in enumerate(self._plan["progress"])
+                           if state != "completed"]
+                self._plan["active_step"] = pending[0] if pending else None
+                if not pending:
+                    self._plan["status"] = "completed"
+                    self._plan["completed_at"] = float(self.clock())
+            self._plan["updated_at"] = float(self.clock())
+            return self._snapshot_locked()
 
 
 def _spoken_age(seconds):
@@ -1505,10 +1578,12 @@ class Companion:
             parts.append(reminder_note)
 
         plan = self._plan_manager().current()
-        if plan and plan.get("status") in {"pending", "approved"}:
+        if plan and plan.get("status") in {"pending", "approved", "completed"}:
+            completed = sum(state == "completed"
+                            for state in (plan.get("progress") or []))
             parts.append("thinking plan " + str(plan.get("plan_id")) +
                          " is " + str(plan.get("status")) +
-                         f" with {len(plan.get('steps') or [])} steps")
+                         f" with {completed}/{len(plan.get('steps') or [])} steps complete")
 
         # Its own recent EXPERIENCE: how it's moving/being handled right now,
         # a bump/pickup it just felt, what it did earlier today, and anything it
@@ -1878,11 +1953,14 @@ class Companion:
 
     def _publish_plan_event(self, plan, event, reason, plan_id=None):
         plan_id = plan_id or (plan or {}).get("plan_id")
+        progress = (plan or {}).get("progress") or []
         payload = {
             "state": "plan_" + str(event),
             "plan_id": plan_id,
             "plan_status": (plan or {}).get("status"),
             "step_count": len((plan or {}).get("steps") or []),
+            "completed_step_count": sum(state == "completed" for state in progress),
+            "active_step": (plan or {}).get("active_step"),
             "ts": time.time(),
         }
         self.bus.publish(THINKING_STATUS_TOPIC, payload)
@@ -1890,9 +1968,21 @@ class Companion:
             "source": "companion", "kind": "thinking_plan",
             "choice": {"event": event, "plan_status": (plan or {}).get("status"),
                         "plan_id": plan_id,
-                        "step_count": len((plan or {}).get("steps") or [])},
+                        "step_count": len((plan or {}).get("steps") or []),
+                        "completed_step_count": sum(
+                            state == "completed" for state in progress)},
             "reason": str(reason)[:240], "ts": time.time(),
         })
+
+    @staticmethod
+    def _format_plan(plan):
+        progress = plan.get("progress") or []
+        rows = []
+        for index, step in enumerate(plan.get("steps") or []):
+            state = progress[index] if index < len(progress) else "pending"
+            rows.append(f"{index}: [{state}] {step}")
+        return (f"Plan {plan.get('plan_id')} is {plan.get('status')}. Goal: "
+                f"{plan.get('goal')}. Steps: " + "; ".join(rows) + ".")
 
     def _approved_plan_required(self, tool_input, tool_name):
         plan_id = str((tool_input or {}).get("plan_id") or "").strip()
@@ -2145,6 +2235,8 @@ class Companion:
             "reason": "thinking tool returned a bounded result",
             "ts": time.time(),
         })
+        self._plan_manager().record_tool_outcome(
+            (tool_input or {}).get("plan_id"), name, outcome_class)
         return outcome
 
     def _execute_tool(self, name, tool_input):
@@ -2196,9 +2288,12 @@ class Companion:
                     parts.append("remote session " + str(
                         remote.get("command") or remote.get("state") or "active"))
                 plan = self._plan_manager().current()
-                if plan and plan.get("status") in {"pending", "approved"}:
+                if plan and plan.get("status") in {"pending", "approved", "completed"}:
+                    completed = sum(state == "completed"
+                                    for state in (plan.get("progress") or []))
                     parts.append("plan " + str(plan.get("plan_id")) +
-                                 " is " + str(plan.get("status")))
+                                 " is " + str(plan.get("status")) +
+                                 f" ({completed}/{len(plan.get('steps') or [])} steps complete)")
                 lock, runs = self._thinking_registry()
                 with lock:
                     if runs:
@@ -2210,7 +2305,24 @@ class Companion:
                 self._publish_plan_event(plan, "proposed",
                                          "thinking model proposed a bounded plan")
                 return (f"Plan {plan['plan_id']} proposed and waiting for explicit "
-                        "local approval; do not execute its destructive steps yet.")
+                        "local approval; do not execute its destructive steps yet. "
+                        "Use resume_plan after approval to continue it.")
+            if name == "resume_plan":
+                plan = self._plan_manager().current()
+                requested_id = str(tool_input.get("plan_id") or "").strip()
+                if not plan or (requested_id and requested_id != plan.get("plan_id")):
+                    return "There is no matching thinking plan to resume."
+                return self._format_plan(plan)
+            if name == "update_plan_progress":
+                plan = self._plan_manager().update_progress(
+                    tool_input.get("plan_id"), tool_input.get("step_index"),
+                    tool_input.get("progress"))
+                if not plan:
+                    return ("Plan progress was not updated; the plan must exist, be "
+                            "approved, and use a valid step index and progress state.")
+                self._publish_plan_event(plan, "progress",
+                                         "thinking model reported explicit plan progress")
+                return self._format_plan(plan)
             if name == "cancel_current_task":
                 canceled = self._cancel_thinking_runs()
                 return (f"Cancellation requested for {len(canceled)} thinking task(s)."

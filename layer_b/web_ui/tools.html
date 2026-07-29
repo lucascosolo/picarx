@@ -71,6 +71,7 @@
     <button class="danger" onclick="thinkingPlan('reject_plan', true)">Reject plan</button>
     <button onclick="thinkingPlan('cancel')">Cancel task</button></div>
   <div class="stat"><span>Thinking status</span><span id="thinking-status">idle</span></div>
+  <div class="stat"><span>Plan progress</span><span id="thinking-plan-progress">none</span></div>
 </div>
 
 <script src="/app.js"></script>
@@ -148,6 +149,10 @@ PX.onPoll(s => {
     ? 'writes authorized for this session' : 'writes not authorized';
   const thinking = s.thinking || {};
   document.getElementById('thinking-status').textContent = thinking.state || 'idle';
+  const planStatus = thinking.plan_status;
+  document.getElementById('thinking-plan-progress').textContent = planStatus
+    ? `${planStatus} (${thinking.completed_step_count || 0}/${thinking.step_count || 0})`
+    : 'none';
 });
 PX.startPolling(2000);
 </script>

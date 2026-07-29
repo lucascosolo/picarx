@@ -37,6 +37,19 @@ class ThinkingPlanManagerTest(unittest.TestCase):
         manager.reject(first["plan_id"])
         self.assertEqual(manager.propose("second", ["two"])["status"], "pending")
 
+    def test_approved_plan_progress_is_explicit_and_completes(self):
+        manager = companion.ThinkingPlanManager(clock=lambda: 100.0)
+        plan = manager.propose("repair", ["inspect", "test"])
+        self.assertIsNone(manager.update_progress(plan["plan_id"], 0, "completed"))
+        manager.approve(plan["plan_id"])
+        in_progress = manager.update_progress(plan["plan_id"], 0, "in_progress")
+        self.assertEqual(in_progress["active_step"], 0)
+        complete_first = manager.update_progress(plan["plan_id"], 0, "completed")
+        self.assertEqual(complete_first["status"], "approved")
+        complete_all = manager.update_progress(plan["plan_id"], 1, "completed")
+        self.assertEqual(complete_all["status"], "completed")
+        self.assertFalse(manager.allows(plan["plan_id"], "remote.run"))
+
 
 def _text(t):
     return SimpleNamespace(type="text", text=t)
@@ -241,6 +254,16 @@ class CompanionToolTest(unittest.TestCase):
         self.assertTrue(event.is_set())
         self.assertEqual(self.c.bus.last(companion.THINKING_STATUS_TOPIC)["plan_id"],
                          plan_id)
+
+    def test_approved_plan_can_be_resumed_and_progressed_across_turns(self):
+        plan_id = self._approved_plan()
+        resumed = self.c._execute_tool("resume_plan", {"plan_id": plan_id})
+        self.assertIn("[pending] inspect", resumed)
+        self.assertIn("[pending] change", resumed)
+        progressed = self.c._execute_tool("update_plan_progress", {
+            "plan_id": plan_id, "step_index": 0, "progress": "completed"})
+        self.assertIn("[completed] inspect", progressed)
+        self.assertIn("1/3", self.c._execute_tool("get_robot_status", {}))
 
     def test_note_and_meeting_tools_publish_typed_requests(self):
         out = self.c._execute_tool("create_note", {"text": "buy milk"})

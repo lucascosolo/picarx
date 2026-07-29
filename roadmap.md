@@ -137,8 +137,10 @@ and safe outcomes enter the decision journal for later reflection. Voice-native
 approval is now restricted to explicit spoken plan phrases while a live plan is
 pending; a bare “yes” cannot authorize it. Spoken rejection/cancellation also
 uses the typed control path and stops an active thinking loop. Resumable plan
-execution remains next, along with transport-level cancellation for long-running
-remote work.
+execution now has explicit, model-reported step progress and a read-only
+`resume_plan` view so a later turn can continue an approved plan without guessing
+which step ran. Completion closes the approval gate. The web tools page shows the
+same bounded progress; plan progress does not execute anything itself.
 
 Progress (2026-07-28): Companion now attaches correlation IDs to reminder,
 notes, and remote-assist requests, briefly waits for fast daemon results, and
@@ -153,7 +155,8 @@ and never translate cancellation into a motor command. Long-running remote
 operations now accept a typed cancel request: the persistent SSH/helper channel
 keeps listening while an allowlisted host process runs, terminates that process
 group, returns bounded canceled metadata, and keeps the project session alive.
-Actual remote-host validation and resumable plan execution remain next.
+Actual remote-host validation and a fuller user-directed coder-session workflow
+remain next.
 
 Growth architecture progress (2026-07-28): thinking-tool requests and
 bounded outcomes now enter the existing `picarx/decision` journal with only
