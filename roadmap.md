@@ -33,7 +33,13 @@ change from here should move in this direction:
   `person_memory`, reflection, the coach's bandit policies) already exists and
   is the right substrate; what is missing is a persistent identity and history
   that shapes how he answers, so he is the same individual across restarts
-  rather than a fresh assistant each turn.
+  rather than a fresh assistant each turn. *Started 2026-07-29:* `identity.py`
+  gives him a configurable name ("Marco"), grounded first-person in the
+  personality prompt and folded into the wake phrases so his name addresses
+  him. Still missing: a persistent narrative history (who he's spent time
+  with, what he's done over days, not just the learned "self" facts) that
+  colours his voice, and reconciling the learned self-model with a stable core
+  identity so growth doesn't erase who he is.
 
 **The boundary that does not move.** Layer A stays hardcoded and Marco has no
 authority over it: the safety daemon remains the final motion veto, movement is
