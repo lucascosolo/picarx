@@ -11,7 +11,7 @@ is required. For local testing it can be run as
 Protocol: one JSON object per stdin line, one JSON result per stdout line.
 Supported operations are ``status``, ``list``, ``read``, ``search``, ``stat``,
 ``logs``, ``write_file``, ``delete_path``, ``preview_patch``, ``apply_patch``,
-``rollback``, and ``run``. File edits are bounded, rooted at the explicitly
+``rollback``, ``run``, and ``cancel``. File edits are bounded, rooted at the explicitly
 scoped project, and require robot-side write authorization.
 """
 import argparse
@@ -19,10 +19,12 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -69,6 +71,8 @@ class HostHelper:
         self.started_at = time.time()
         self._session_log = deque(maxlen=MAX_SESSION_LOG)
         self._last_patch = None
+        self._active_lock = threading.Lock()
+        self._active_command = None
 
     def _path(self, value, must_exist=False):
         rel = str(value or ".")
@@ -351,19 +355,79 @@ class HostHelper:
         if not cwd.is_dir():
             raise HelperError("command cwd is not a directory")
         timeout = min(MAX_COMMAND_SEC, max(0.1, float(request.get("timeout_sec", 30))))
+        with self._active_lock:
+            if self._active_command is not None:
+                raise HelperError("another remote command is already running")
+        active = None
         try:
-            proc = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  timeout=timeout, check=False)
-            stdout, out_trunc = _bounded_text(proc.stdout)
-            stderr, err_trunc = _bounded_text(proc.stderr)
+            proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True)
+            active = {"proc": proc, "request_id": request.get("request_id"),
+                      "cancel_requested": False}
+            with self._active_lock:
+                # A second run may have won the slot between the first check
+                # and process creation. Refuse it without leaving a child.
+                if self._active_command is not None:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                    raise HelperError("another remote command is already running")
+                self._active_command = active
+            try:
+                stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            finally:
+                with self._active_lock:
+                    canceled = bool(active["cancel_requested"])
+                    if self._active_command is active:
+                        self._active_command = None
+            stdout, out_trunc = _bounded_text(stdout_raw)
+            stderr, err_trunc = _bounded_text(stderr_raw)
+            if canceled:
+                return {"returncode": None, "stdout": stdout, "stderr": stderr,
+                        "timed_out": False, "canceled": True,
+                        "truncated": out_trunc or err_trunc}
             return {"returncode": proc.returncode, "stdout": stdout, "stderr": stderr,
                     "timed_out": False, "truncated": out_trunc or err_trunc}
         except subprocess.TimeoutExpired as e:
-            stdout, _ = _bounded_text(e.stdout or b"")
-            stderr, _ = _bounded_text(e.stderr or b"")
+            with self._active_lock:
+                if active is not None:
+                    active["cancel_requested"] = True
+            try:
+                if active is not None:
+                    os.killpg(active["proc"].pid, signal.SIGTERM)
+            except (AttributeError, OSError, ProcessLookupError):
+                if active is not None:
+                    active["proc"].terminate()
+            stdout_raw, stderr_raw = e.stdout or b"", e.stderr or b""
+            if active is not None:
+                try:
+                    stdout_raw, stderr_raw = active["proc"].communicate(timeout=2)
+                except Exception:
+                    pass
+            stdout, _ = _bounded_text(stdout_raw)
+            stderr, _ = _bounded_text(stderr_raw)
             return {"returncode": None, "stdout": stdout, "stderr": stderr,
                     "timed_out": True, "truncated": True}
+
+    def cancel(self, request):
+        """Stop the one active host command without killing the SSH helper."""
+        with self._active_lock:
+            active = self._active_command
+            if active is None:
+                return {"canceled": False, "reason": "no active command"}
+            target = request.get("target_request_id")
+            if target and str(target) != str(active.get("request_id")):
+                return {"canceled": False, "reason": "request is not active"}
+            active["cancel_requested"] = True
+            proc = active["proc"]
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (AttributeError, OSError, ProcessLookupError):
+            try:
+                proc.terminate()
+            except Exception:
+                return {"canceled": False, "reason": "command already exited"}
+        return {"canceled": True, "target_request_id": active.get("request_id")}
 
     def handle(self, request):
         if not isinstance(request, dict):
@@ -375,7 +439,7 @@ class HostHelper:
                    "search": self.search, "stat": self.stat, "logs": self.logs,
                    "write_file": self.write_file, "delete_path": self.delete_path,
                    "preview_patch": self.preview_patch, "apply_patch": self.apply_patch,
-                   "rollback": self.rollback, "run": self.run}
+                   "rollback": self.rollback, "run": self.run, "cancel": self.cancel}
         if op not in methods:
             raise HelperError(f"unsupported operation: {op}")
         try:
@@ -416,17 +480,41 @@ def main(argv=None):
     except HelperError as e:
         print(json.dumps({"ok": False, "error": str(e)}), flush=True)
         return 2
-    for line in sys.stdin:
-        request_id = None
+    output_lock = threading.Lock()
+    workers = []
+
+    def emit(response):
+        with output_lock:
+            print(json.dumps(response, separators=(",", ":")), flush=True)
+
+    def serve(request):
+        request_id = request.get("request_id") if isinstance(request, dict) else None
         try:
-            request = json.loads(line)
-            request_id = request.get("request_id") if isinstance(request, dict) else None
             result = helper.handle(request)
             response = {"ok": True, "request_id": request_id, "result": result}
         except Exception as e:
             response = {"ok": False, "request_id": request_id,
                         "error": str(e)[:500]}
-        print(json.dumps(response, separators=(",", ":")), flush=True)
+        emit(response)
+
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+        except Exception as e:
+            emit({"ok": False, "request_id": None, "error": str(e)[:500]})
+            continue
+        # A command gets its own worker so the input loop can receive a typed
+        # cancel request over the same SSH channel while it is running. Other
+        # operations stay synchronous, preserving the simple JSONL behavior.
+        if isinstance(request, dict) and str(request.get("op") or "").lower() == "run":
+            worker = threading.Thread(target=serve, args=(request,),
+                                      name="picarx-helper-command")
+            worker.start()
+            workers.append(worker)
+        else:
+            serve(request)
+    for worker in workers:
+        worker.join()
     return 0
 
 

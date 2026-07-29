@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -72,6 +73,32 @@ class HostHelperTests(unittest.TestCase):
         with self.assertRaises(self.mod.HelperError):
             self.helper.run({"command": "sh -c 'echo unsafe'"})
 
+    def test_active_command_can_be_canceled_without_ending_helper(self):
+        helper = self.mod.HostHelper(
+            self.root, command_prefixes=((sys.executable, "-c"),))
+        result = {}
+
+        def run_command():
+            result["run"] = helper.handle({
+                "op": "run", "request_id": "run-1", "confirmed": True,
+                "argv": [sys.executable, "-c", "import time; time.sleep(30)"]})
+
+        worker = threading.Thread(target=run_command)
+        worker.start()
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            with helper._active_lock:
+                if helper._active_command is not None:
+                    break
+            time.sleep(0.01)
+        canceled = helper.handle({"op": "cancel", "request_id": "cancel-1",
+                                  "target_request_id": "run-1"})
+        worker.join(timeout=3)
+        self.assertTrue(canceled["canceled"])
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(result["run"]["canceled"])
+        self.assertEqual(helper.handle({"op": "status"})["requests"], 2)
+
     def test_jsonl_mutating_operations_require_confirmation_and_logs_are_bounded(self):
         with self.assertRaises(self.mod.HelperError):
             self.helper.handle({"op": "run", "argv": ["git", "status"]})
@@ -132,6 +159,7 @@ class FakeSession:
     def __init__(self):
         self.connected = False
         self.requests = []
+        self.cancel_calls = 0
 
     def connect(self, host, user=None, port=None, project_root="."):
         self.connected = True
@@ -144,6 +172,10 @@ class FakeSession:
 
     def close(self):
         self.connected = False
+
+    def cancel(self, target_request_id=None):
+        self.cancel_calls += 1
+        return True
 
 
 class RemoteAssistTests(unittest.TestCase):
@@ -170,6 +202,14 @@ class RemoteAssistTests(unittest.TestCase):
         self.assertEqual(session.requests[-1]["op"], "run")
         remote._handle({"command": "disconnect"})
         self.assertFalse(remote.connected)
+
+    def test_remote_cancel_uses_transport_without_disconnecting(self):
+        session = FakeSession()
+        remote = RemoteAssist(session=session)
+        remote._handle({"command": "connect", "host": "192.168.1.20"})
+        remote._handle({"command": "cancel", "silent": True})
+        self.assertEqual(session.cancel_calls, 1)
+        self.assertTrue(remote.connected)
 
     def test_remote_coding_file_edit_requires_session_authorization(self):
         session = FakeSession()

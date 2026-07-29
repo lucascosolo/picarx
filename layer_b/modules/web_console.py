@@ -695,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
             allowed = {"connect", "disconnect", "status", "list", "read", "search",
                        "stat", "logs", "authorize_write", "revoke_write",
                        "write_file", "delete_path", "preview_patch", "apply_patch",
-                       "rollback", "run"}
+                       "rollback", "run", "cancel"}
             if command not in allowed:
                 self._send(400, {"error": "unsupported remote command"})
                 return

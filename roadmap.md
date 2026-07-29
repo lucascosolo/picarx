@@ -150,7 +150,10 @@ Progress (2026-07-28): a typed thinking-control path can cancel active model
 loops, and `cancel_current_task` is available as a non-movement tool. Runs
 publish bounded lifecycle state, check cancellation between model/tool calls,
 and never translate cancellation into a motor command. Long-running remote
-operations still need explicit plan approval and transport-level cancellation.
+operations now accept a typed cancel request: the persistent SSH/helper channel
+keeps listening while an allowlisted host process runs, terminates that process
+group, returns bounded canceled metadata, and keeps the project session alive.
+Actual remote-host validation and resumable plan execution remain next.
 
 Growth architecture progress (2026-07-28): thinking-tool requests and
 bounded outcomes now enter the existing `picarx/decision` journal with only

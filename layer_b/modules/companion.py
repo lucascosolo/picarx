@@ -491,6 +491,8 @@ TOOLS = [
                     "write_file, delete_path, preview_patch, apply_patch, rollback, "
                     "run, logs, authorize_write, "
                     "revoke_write, and disconnect. "
+                    "Use cancel to stop the active bounded host command without "
+                    "closing the session. "
                     "Read/list/search/preview/logs are safe. Grant write access once "
                     "with authorize_write after the person explicitly approves it; "
                     "that grant covers file edits, apply_patch, and rollback until "
@@ -504,10 +506,10 @@ TOOLS = [
                     "host-side allowlisted and bounded.",
      "input_schema": {"type": "object", "properties": {
          "operation": {"type": "string", "enum": ["status", "list", "read",
-                       "search", "stat", "logs", "write_file", "delete_path",
-                       "preview_patch", "apply_patch",
-                       "rollback", "run", "authorize_write", "revoke_write",
-                       "disconnect"]},
+                    "search", "stat", "logs", "write_file", "delete_path",
+                    "preview_patch", "apply_patch",
+                    "rollback", "run", "authorize_write", "revoke_write",
+                    "disconnect", "cancel"]},
          "path": {"type": "string"},
          "pattern": {"type": "string"},
          "patch": {"type": "string"},
@@ -1945,6 +1947,13 @@ class Companion:
         self.bus.publish(THINKING_STATUS_TOPIC, {
             "state": "cancel_requested", "run_id": run_id,
             "canceled_count": len(canceled), "ts": time.time()})
+        if canceled:
+            # The model loop's event is not enough when a remote helper is
+            # blocked in a host-side test. Ask that transport to terminate
+            # its active child while keeping the SSH/helper session alive.
+            self.bus.publish(REMOTE_ASSIST_TOPIC, {
+                "command": "cancel", "source": "thinking_cancel",
+                "silent": True, "ts": time.time()})
         return canceled
 
     def on_thinking_control(self, payload):
@@ -2364,7 +2373,7 @@ class Companion:
                 allowed = {"status", "list", "read", "search", "stat", "logs",
                            "write_file", "delete_path", "preview_patch", "apply_patch",
                            "rollback", "run",
-                           "authorize_write", "revoke_write", "disconnect"}
+                           "authorize_write", "revoke_write", "disconnect", "cancel"}
                 if operation not in allowed:
                     return "That remote operation is not supported."
                 if operation in {"run", "write_file", "delete_path", "authorize_write"} and \

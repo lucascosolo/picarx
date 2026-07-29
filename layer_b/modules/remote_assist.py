@@ -69,6 +69,7 @@ class RemoteSession:
         self.remote_script = None
         self._destination = None
         self._port = None
+        self._write_lock = threading.Lock()
         # A password is an intentionally transient connect-time credential.
         # It is fed to sshpass through an inherited pipe, never placed in an
         # argv/environment value, and cleared when the session closes.
@@ -209,8 +210,9 @@ class RemoteSession:
             raise RuntimeError("SSH session is not connected")
         request_id = payload.get("request_id") or uuid.uuid4().hex
         payload = dict(payload, request_id=request_id)
-        self.proc.stdin.write(json.dumps(payload) + "\n")
-        self.proc.stdin.flush()
+        with self._write_lock:
+            self.proc.stdin.write(json.dumps(payload) + "\n")
+            self.proc.stdin.flush()
         deadline = time.monotonic() + (self.request_timeout if timeout is None else float(timeout))
         while time.monotonic() < deadline:
             remaining = max(0.01, deadline - time.monotonic())
@@ -224,6 +226,26 @@ class RemoteSession:
             if response.get("request_id") in (None, request_id):
                 return response
         raise TimeoutError("remote helper response timed out")
+
+    def cancel(self, target_request_id=None):
+        """Ask the persistent helper to terminate its active command.
+
+        This is intentionally fire-and-forget: the normal request reader will
+        consume the small cancel acknowledgement or the eventual command
+        result by request ID. The SSH/helper session itself remains alive.
+        """
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return False
+        payload = {"op": "cancel", "request_id": uuid.uuid4().hex}
+        if target_request_id:
+            payload["target_request_id"] = str(target_request_id)[:80]
+        with self._write_lock:
+            if self.proc is not proc:
+                return False
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+        return True
 
     def close(self):
         proc, self.proc = self.proc, None
@@ -288,10 +310,18 @@ class RemoteAssist:
             text = "Remote project session closed."
         elif message.get("command") == "run":
             result = message.get("result") or {}
-            text = f"Remote command finished with status {result.get('returncode')}."
+            if result.get("canceled"):
+                text = "Remote command canceled."
+            else:
+                text = f"Remote command finished with status {result.get('returncode')}."
             output = (result.get("stderr") or result.get("stdout") or "").strip()
             if output:
                 text += " " + " ".join(output.split())[:220]
+        elif message.get("command") == "cancel":
+            result = message.get("result") or {}
+            text = ("Remote command cancellation requested."
+                    if result.get("canceled") else
+                    "There was no active remote command to cancel.")
         elif message.get("command") == "list":
             result = message.get("result") or {}
             names = [str(entry.get("name")) for entry in result.get("entries", [])]
@@ -338,6 +368,8 @@ class RemoteAssist:
             text += "s." if len(entries) != 1 else "."
         else:
             text = "Remote operation complete. I sent the details to the tools console."
+        if message.get("silent"):
+            return
         self.bus.publish("picarx/audio/speak", {"text": text[:400], "ts": time.time()})
 
     def _claim(self):
@@ -356,6 +388,13 @@ class RemoteAssist:
         command = str(payload.get("command") or payload.get("op") or "").lower()
         request_id = str(payload.get("request_id") or uuid.uuid4().hex)[:80]
         try:
+            if command == "cancel":
+                canceled = self.session.cancel(payload.get("target_request_id"))
+                self._publish({"ok": True, "command": command,
+                               "request_id": request_id,
+                               "result": {"canceled": bool(canceled)},
+                               "silent": bool(payload.get("silent"))})
+                return
             with self.lock:
                 if command == "connect":
                     self.session.close()

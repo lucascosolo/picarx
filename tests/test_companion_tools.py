@@ -138,6 +138,8 @@ class CompanionToolTest(unittest.TestCase):
         out = self.c._execute_tool("cancel_current_task", {})
         self.assertIn("requested", out.lower())
         self.assertTrue(event.is_set())
+        self.assertEqual(self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)["command"],
+                         "cancel")
         self.c.on_thinking_control({"command": "status"})
         self.assertEqual(self.c.bus.last(companion.THINKING_STATUS_TOPIC)["state"],
                          "status")
