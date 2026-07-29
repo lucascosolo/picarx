@@ -98,6 +98,27 @@ class CompanionMemoryTest(unittest.TestCase):
         # ...and no self-model block when there is no self-model yet.
         self.assertNotIn("self-understanding", prompt)
 
+    # ---- what the per-turn context is allowed to say is "current" ----
+
+    def _blurb_with_plan(self, finish):
+        self.c.latest_world = {"battery": {"voltage": 7.4}}
+        self.c.recent_physical_events = []
+        self.c.latest_training = None
+        self.c.plan_manager = companion.ThinkingPlanManager(clock=lambda: 100.0)
+        plan = self.c.plan_manager.propose("delete that note", ["delete it"])
+        if finish:
+            self.c.plan_manager.approve(plan["plan_id"])
+            self.c.plan_manager.update_progress(plan["plan_id"], 0, "completed")
+        return self.c._context_blurb()
+
+    def test_a_live_plan_is_current_status(self):
+        self.assertIn("thinking plan", self._blurb_with_plan(finish=False))
+
+    def test_a_finished_plan_is_not_current_status(self):
+        # Reciting a completed plan every turn is what had the robot bringing
+        # up work it had already done, turns after the topic had moved on.
+        self.assertNotIn("thinking plan", self._blurb_with_plan(finish=True))
+
     def test_system_prompt_requires_evidence_for_remote_coding_claims(self):
         self.assertIn("expected_sha256", companion.SYSTEM_PROMPT)
         self.assertIn("typed remote result confirms it", companion.SYSTEM_PROMPT)

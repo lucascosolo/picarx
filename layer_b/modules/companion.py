@@ -176,6 +176,10 @@ CORRECTION_WINDOW_SEC = 45.0     # how long "what did you want?" waits for an an
 DIALOG_ASK_TOPIC = "picarx/dialog/ask"
 DIALOG_ANSWER_TOPIC = "picarx/dialog/answer"
 DIALOG_CLEARED_TOPIC = "picarx/dialog/cleared"
+# The broker also publishes when the conversation itself opens and closes.
+# A close is an END, which is what tells this module that transient intent
+# from that conversation has stopped being relevant - see on_conversation.
+DIALOG_CONVERSATION_TOPIC = "picarx/dialog/conversation"
 DIALOG_ASKER = "companion"
 
 # Commands the arbiter may emit. Deliberately EXCLUDES "explore",
@@ -694,6 +698,37 @@ class ThinkingPlanManager:
         with self._lock:
             self._expire_locked(float(self.clock()))
             return self._snapshot_locked()
+
+    def retire(self, drop_pending=False):
+        """Forget a plan that is no longer live, returning what was retired.
+
+        A plan is EPHEMERAL state about the conversation it was proposed in,
+        but nothing used to end its life: a finished plan sat here forever and
+        an unapproved one for its whole TTL, and the per-turn context blurb
+        recited it the entire time - which is how the robot ended up appending
+        "still waiting on your go-ahead to delete that note" to unrelated
+        replies long after the note was gone.
+
+        Terminal plans (completed/rejected/expired) are always retired.
+        `drop_pending` additionally abandons a plan still waiting on human
+        approval: consent that was never given does not carry across the end
+        of the conversation that asked for it. An APPROVED plan is never
+        retired here - it may still be executing, and its authority ends on
+        its own TTL, not on a conversational boundary."""
+        with self._lock:
+            self._expire_locked(float(self.clock()))
+            if not self._plan:
+                return None
+            status = self._plan["status"]
+            terminal = status in {"completed", "rejected", "canceled", "expired"}
+            abandoning = drop_pending and status == "pending"
+            if not (terminal or abandoning):
+                return None
+            retired = self._snapshot_locked()
+            if abandoning:
+                retired["status"] = "abandoned"
+            self._plan = None
+            return retired
 
     def approve(self, plan_id):
         with self._lock:
@@ -1458,6 +1493,38 @@ class Companion:
             if awaiting and payload.get("question_id") == awaiting["question_id"]:
                 self.awaiting_correction = None
 
+    def on_conversation(self, payload):
+        """The dialog broker opened or closed the conversation channel.
+
+        Closing it is the signal this module never had: an END. Transient
+        conversational intent - a plan nobody ever approved, a clarification
+        nobody ever gave - used to live on a wall-clock TTL and leak into
+        whatever was said next, so the robot would resurface a request from a
+        conversation that was over. Relevance is a property of the
+        conversation, not of a timer, so when the conversation ends the things
+        that were only true INSIDE it end with it.
+
+        Deliberately narrow: this drops pending intent, never memory. Turn
+        history, learned intents, and the semantic store are what make him the
+        same individual tomorrow and are untouched (a long gap is already
+        handled separately, by the gap note). An APPROVED plan is also left
+        alone - it may still be executing."""
+        if payload.get("open"):
+            return
+        reason = str(payload.get("reason") or "ended")
+        retired = self._plan_manager().retire(drop_pending=True)
+        if retired:
+            self._publish_plan_event(retired, "retired",
+                                     f"conversation {reason}")
+            print(f"Companion: retired {retired.get('status')} plan "
+                  f"{retired.get('plan_id')} - conversation {reason}")
+        with self.lock:
+            dropped = self.awaiting_correction
+            self.awaiting_correction = None
+        if dropped:
+            print(f"Companion: dropped an unanswered correction question - "
+                  f"conversation {reason}")
+
     def on_feedback(self, payload):
         verdict = payload.get("verdict")
         if verdict not in ("correct", "incorrect"):
@@ -1654,8 +1721,12 @@ class Companion:
         if reminder_note:
             parts.append(reminder_note)
 
+        # Only a plan that is still LIVE belongs in "current status": one
+        # waiting on the human, or one being carried out. A finished plan is
+        # not a current state, and reciting it every turn is how the robot
+        # ended up bringing up work it had already done, turns later.
         plan = self._plan_manager().current()
-        if plan and plan.get("status") in {"pending", "approved", "completed"}:
+        if plan and plan.get("status") in {"pending", "approved"}:
             completed = sum(state == "completed"
                             for state in (plan.get("progress") or []))
             parts.append("thinking plan " + str(plan.get("plan_id")) +
@@ -2807,6 +2878,7 @@ class Companion:
                            self.on_learned_intent_control)
         self.bus.subscribe(DIALOG_ANSWER_TOPIC, self.on_dialog_answer)
         self.bus.subscribe(DIALOG_CLEARED_TOPIC, self.on_dialog_cleared)
+        self.bus.subscribe(DIALOG_CONVERSATION_TOPIC, self.on_conversation)
         self.bus.subscribe(FEEDBACK_TOPIC, self.on_feedback)
         self.bus.subscribe(CAMERA_FRAME_TOPIC, self.on_frame)
         self.bus.subscribe("picarx/state/world", self.on_world_state)

@@ -59,7 +59,7 @@ hand-written matcher.
 ## Current state (2026-07-29)
 
 - The repository is on `master`; the local implementation currently passes
-  1,102 tests. The full suite is the source-of-truth regression gate, while
+  1,113 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -433,10 +433,10 @@ targets; and never imply that label memory changed detector weights.
     often as the field symptom suggests (watch the `raw` field), whether
     CHAT_SHAPE raises LLM spend near a television, and whether the open channel
     plus the max-duration backstop are the right defaults in a real room.
-  - *Next on this thread:* companion does not yet consume
-    `picarx/dialog/conversation`. It should — an open channel is the honest
-    definition of "what is currently relevant", which is also the substrate the
-    stale-intent item below needs.
+  - *Landed 2026-07-29:* companion now consumes `picarx/dialog/conversation` —
+    an open channel is the honest definition of "what is currently relevant",
+    and closing it is what retires stale intent (see the stale-intent item
+    below). First consumer of the boundary; more should follow.
 
 - **Stale intent lingers in context — Marco doesn't know when something stops
   mattering (owner-reported, 2026-07-29):** he deletes a note successfully, the
@@ -449,14 +449,23 @@ targets; and never imply that label memory changed detector weights.
   only after the 600s TTL). So a finished note-delete plan sits in his context
   and he dutifully narrates it. The same shape affects `pending_reminders` and
   `awaiting_correction`: per-turn state injected with no link between "the task
-  is done / we changed subject" and "stop mentioning it." Symptom-level fix is
-  small (clear/tombstone a plan once its goal is satisfied, and don't recite
-  `completed` plans), but the RIGHT fix is the Direction one: relevance should
-  be something Marco judges from the conversation, not a status enum that
-  outlives the topic. A durable turn should carry an explicit "is this still
-  live?" notion — resolved intents drop out of context, and stale ones age out
-  by conversational distance, not just wall-clock TTL. Scope: `_context_blurb`,
-  `ThinkingPlanManager`, and how reminder/correction state is folded in.
+  is done / we changed subject" and "stop mentioning it."
+  *First fix landed 2026-07-29:* a plan's lifetime is now the **conversation's**
+  lifetime rather than a wall-clock TTL. `ThinkingPlanManager.retire()` drops a
+  plan that is no longer live; `companion.on_conversation()` subscribes to
+  `picarx/dialog/conversation` and, when the channel closes, retires terminal
+  plans, abandons one still waiting on an approval that will now never come,
+  and clears `awaiting_correction`. An *approved* plan is deliberately left
+  alone — it may still be executing, and its authority ends on its own TTL.
+  `_context_blurb()` no longer recites `completed` plans at all, which is the
+  reported symptom's direct cause. Memory (history, learned intents, the
+  semantic store) is untouched: this drops pending *intent*, never what he
+  knows. *Still open:* `pending_reminders` are still folded in on a wall-clock
+  basis and outlive the topic the same way, and relevance is still not
+  something Marco judges — inside a single long conversation a resolved intent
+  can still linger until the channel closes. The RIGHT fix remains the
+  Direction one: stale intent should age out by conversational distance, judged
+  from the dialogue, not by a status enum or a timer.
 - **Unify utterance routing behind one arbiter (architecture debt):** today,
   "is this utterance for me, and who handles it" logic is split across several
   independently-maintained phrase/keyword lists that have to be hand-kept in

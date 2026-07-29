@@ -52,6 +52,91 @@ class ThinkingPlanManagerTest(unittest.TestCase):
         self.assertFalse(manager.allows(plan["plan_id"], "remote.run"))
 
 
+class PlanRetirementTest(unittest.TestCase):
+    """A plan is state about the conversation it was proposed in. Nothing used
+    to end its life, so the per-turn context recited a finished (or never
+    approved) plan for as long as it sat there - the "still waiting on your
+    go-ahead to delete that note" bug."""
+
+    def _manager(self):
+        return companion.ThinkingPlanManager(clock=lambda: 100.0)
+
+    def test_a_finished_plan_is_retired(self):
+        manager = self._manager()
+        plan = manager.propose("tidy up", ["one"])
+        manager.approve(plan["plan_id"])
+        manager.update_progress(plan["plan_id"], 0, "completed")
+        self.assertEqual(manager.current()["status"], "completed")
+        retired = manager.retire()
+        self.assertEqual(retired["status"], "completed")
+        self.assertIsNone(manager.current())     # gone, not recited forever
+
+    def test_a_live_plan_is_not_retired(self):
+        manager = self._manager()
+        plan = manager.propose("tidy up", ["one"])
+        self.assertIsNone(manager.retire())                  # pending, still live
+        manager.approve(plan["plan_id"])
+        self.assertIsNone(manager.retire(drop_pending=True))  # approved: may run
+        self.assertEqual(manager.current()["status"], "approved")
+
+    def test_unapproved_consent_does_not_survive_the_conversation(self):
+        manager = self._manager()
+        manager.propose("delete that note", ["delete it"])
+        retired = manager.retire(drop_pending=True)
+        self.assertEqual(retired["status"], "abandoned")
+        self.assertIsNone(manager.current())
+
+    def test_retiring_nothing_is_a_noop(self):
+        self.assertIsNone(self._manager().retire(drop_pending=True))
+
+
+class ConversationBoundaryTest(unittest.TestCase):
+    """Closing the conversation is the END signal companion never had."""
+
+    def setUp(self):
+        self.c = companion.Companion.__new__(companion.Companion)
+        self.c.lock = threading.Lock()
+        self.c.bus = harness.FakeBus()
+        self.c.plan_manager = companion.ThinkingPlanManager(clock=lambda: 100.0)
+        self.c.awaiting_correction = None
+        self.c.history = deque(maxlen=4)
+        self.c.last_turn_at = 123.0
+
+    def _close(self, reason="idle"):
+        self.c.on_conversation({"open": False, "reason": reason})
+
+    def test_an_open_conversation_changes_nothing(self):
+        self.c.plan_manager.propose("delete that note", ["delete it"])
+        self.c.on_conversation({"open": True, "reason": "wake"})
+        self.assertIsNotNone(self.c.plan_manager.current())
+
+    def test_ending_the_conversation_drops_a_plan_nobody_approved(self):
+        self.c.plan_manager.propose("delete that note", ["delete it"])
+        self._close()
+        self.assertIsNone(self.c.plan_manager.current())
+        event = self.c.bus.last(companion.THINKING_STATUS_TOPIC)
+        self.assertEqual(event["state"], "plan_retired")
+
+    def test_ending_the_conversation_leaves_an_approved_plan_running(self):
+        plan = self.c.plan_manager.propose("tidy up", ["one"])
+        self.c.plan_manager.approve(plan["plan_id"])
+        self._close()
+        self.assertEqual(self.c.plan_manager.current()["status"], "approved")
+
+    def test_ending_the_conversation_drops_an_unanswered_question(self):
+        self.c.awaiting_correction = {"question_id": "q1", "utterance": "spin"}
+        self._close()
+        self.assertIsNone(self.c.awaiting_correction)
+
+    def test_memory_is_not_touched(self):
+        # The end of a conversation ends pending INTENT, never who he is: turn
+        # history is what makes him the same individual next time.
+        self.c.history.append({"role": "user", "content": "hello"})
+        self._close()
+        self.assertEqual(len(self.c.history), 1)
+        self.assertEqual(self.c.last_turn_at, 123.0)
+
+
 def _text(t):
     return SimpleNamespace(type="text", text=t)
 
