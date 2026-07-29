@@ -33,15 +33,34 @@ const PX = (() => {
   // Build the sticky header (brand + connection + battery + nav) at the top of
   // <body> so every page shares one chrome without repeating the markup.
   function mountHeader() {
+    if (document.querySelector("header")) return;
     const here = location.pathname === "/index.html" ? "/" : location.pathname;
+    const page = here === "/" ? "dashboard" : here.replace(/^\//, "").replace(/\W+/g, "-");
+    document.body.dataset.page = page || "dashboard";
     const nav = NAV.map(([href, label]) =>
-      `<a href="${href}" class="${href === here ? "active" : ""}">${label}</a>`).join("");
+      `<a href="${href}" class="${href === here ? "active" : ""}"` +
+      `${href === here ? ' aria-current="page"' : ""}>${label}</a>`).join("");
     const h = document.createElement("header");
     h.innerHTML =
-      `<div class="brand"><span>PicarX</span>` +
-      `<span><span id="h-batt">–</span> · <span id="conn">connecting…</span></span></div>` +
-      `<nav>${nav}</nav>`;
-    document.body.prepend(h);
+      `<div class="brand">` +
+      `<a class="brand-name" href="/" aria-label="PicarX dashboard">` +
+      `<span class="brand-mark" aria-hidden="true">PX</span>` +
+      `<span><strong>PicarX</strong><small>robot console</small></span></a>` +
+      `<div class="header-meta"><span id="h-batt">–</span>` +
+      `<span class="meta-divider" aria-hidden="true"></span>` +
+      `<span id="conn" role="status" aria-live="polite">connecting…</span></div></div>` +
+      `<nav aria-label="Primary navigation">${nav}</nav>`;
+    const skip = document.createElement("a");
+    skip.className = "skip-link";
+    skip.href = "#main-content";
+    skip.textContent = "Skip to content";
+    const content = document.createElement("main");
+    content.className = "page-content";
+    content.id = "main-content";
+    Array.from(document.body.children).forEach(node => {
+      if (node.tagName !== "SCRIPT") content.appendChild(node);
+    });
+    document.body.prepend(skip, h, content);
   }
 
   function onPoll(cb) { pollers.push(cb); }

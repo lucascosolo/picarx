@@ -145,6 +145,21 @@ class RouteTableTest(unittest.TestCase):
         for path in ("/", "/drive", "/training", "/people", "/audio", "/tools", "/notes", "/config"):
             self.assertIn(path, web_console.PAGES)
 
+    def test_shared_console_shell_is_responsive_and_accessible(self):
+        web_ui = os.path.join(harness.LAYER_B, "web_ui")
+        with open(os.path.join(web_ui, "app.css"), encoding="utf-8") as stream:
+            css = stream.read()
+        for marker in ("max-width:1200px", "@media (max-width:560px)",
+                       "min-height:43px", ".page-content", ".skip-link",
+                       "grid-template-columns"):
+            self.assertIn(marker, css)
+        with open(os.path.join(web_ui, "app.js"), encoding="utf-8") as stream:
+            js = stream.read()
+        for marker in ("aria-label=\"Primary navigation\"",
+                       "aria-current=\"page\"", "main-content",
+                       "dataset.page", "Skip to content"):
+            self.assertIn(marker, js)
+
     def test_tools_page_exposes_feature_commands(self):
         with open(os.path.join(harness.LAYER_B, "web_ui", "tools.html"),
                   encoding="utf-8") as stream:

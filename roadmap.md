@@ -5,6 +5,51 @@ This file is the compact source of truth for future coding sessions. Prefer
 small, scoped commits; run the full test suite before pushing. Never weaken the
 safety daemon or let an LLM execute arbitrary tools, movement, or shell code.
 
+## Current state (2026-07-28)
+
+- The repository is on `master`; the local implementation currently passes
+  1,000 tests. The full suite is the source-of-truth regression gate, while
+  hardware and browser/device validation are still separate release gates.
+- The safety architecture is intact: the independent safety daemon remains the
+  final motion veto; RobotState leases and the central camera owner coordinate
+  RC, speech, gesture, remote assistance, and local capture. Movement is not an
+  LLM/thinking-plane capability.
+- The thinking plane now has the complete typed non-movement catalog, bounded
+  multi-tool loops, status/result correlation, approval plans, cancellation,
+  remote coding controls, local notes/reminders/radio, and confirmed local
+  audio/video clip capture and management. Decision journaling and reflection
+  provide the evidence-based growth path; raw notes, credentials, source, and
+  command arguments are not copied into learning records.
+- The web console has a fresh dependency-free shell: wider desktop layout,
+  phone-sized controls, horizontally scrollable navigation, accessible focus
+  states/skip navigation, live connection/battery status, and a dashboard
+  two-column layout on larger screens. Existing typed endpoints and RC
+  dead-man behavior were not changed. Browser rendering and touch testing on
+  the actual Pi remain outstanding.
+- Local clips are bounded and interruptible, but camera/ALSA codec behavior,
+  playback devices, and service startup have not yet been validated on the
+  target Pi. The gesture native runtime/package decision and provisioned-host
+  remote workflow also still need field validation.
+
+## Suggested next steps
+
+1. **Field validation on the Pi:** run the gesture model probe under the
+   selected venv, verify systemd startup/recovery, capture and play short audio
+   and video clips, and exercise the web console on a phone and desktop while
+   observing safety, camera, and RobotState telemetry.
+2. **Close remaining P0 gates:** finish the architecture-specific MediaPipe
+   packaging/ABI work and target-Pi gesture worker validation; then validate the
+   remote coding session against a real provisioned host, including reconnect,
+   cancellation, and failed-command recovery.
+3. **Finish web parity deliberately:** add clip status/list/play/delete controls
+   to the console only through the existing typed clip endpoints, then add
+   browser-level smoke coverage for narrow layouts, live updates, consent, and
+   offline/degraded responses. Do not duplicate safety logic in JavaScript.
+4. **Strengthen individual learning:** collect a small privacy-safe evaluation
+   corpus from real interactions, measure whether reflection/self-training
+   changes behavior from evidence, and add retention/review controls before
+   expanding what the robot stores or adopts.
+
 ## Production facts
 
 - The production services are `picarx-safety.service` and
@@ -260,6 +305,11 @@ targets; and never imply that label memory changed detector weights.
   Preserve the current typed safety/control boundaries, keep pages fast on the
   Pi, and validate touch targets, narrow-screen layout, live status updates,
   and degraded/offline behavior.
+  Progress (2026-07-28): the shared shell now provides a wider desktop canvas,
+  stacked narrow-screen form controls, touch-sized buttons, scrollable nav,
+  dashboard reflow, visible connection/battery status, and keyboard skip/focus
+  affordances without changing control endpoints. Browser/device validation
+  and clip-control parity remain next.
 - **Location graph:** completed telemetry/provenance and veto evidence remain
   authoritative. Later add validated fingerprint thresholds, directed edges and
   traversal timestamps, conservative IMU quality policy, audited merge/split,
@@ -304,9 +354,9 @@ safety daemon is the final authority.
 ## Delivery rules
 
 Use fake camera/MediaPipe/worker/process/servo/thermal/SSH tests off-robot,
-then field-test on the Pi. Current local full-suite baseline after the gesture
-worker tests is 951 passing tests (`python3 -m unittest discover -s tests -p
-'test_*.py'`); warnings from existing resource-cleanup tests are non-fatal.
+then field-test on the Pi. Current local full-suite baseline is 1,000 passing
+tests (`python3 -m unittest discover -s tests -p 'test_*.py'`); warnings from
+existing resource-cleanup tests are non-fatal.
 Keep commits scoped (for example, gesture worker; packaging; roadmap), push
 to `master`, and report any target-Pi limitation honestly instead of claiming
 that a native package was validated when it was not.
