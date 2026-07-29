@@ -154,6 +154,32 @@ class FollowDaemonBehaviourTest(unittest.TestCase):
         self.assertFalse(status["sources"]["person"]["last_pass_had_target"])
         self.assertEqual(status["sources"]["person"]["last_pass_at"], 100.0)
 
+    def test_fresh_negative_detector_pass_stops_using_cached_person(self):
+        self.d.on_control({"enabled": True})
+        self.d.on_objects({
+            "objects": [{"label": "person", "area_ratio": 0.1,
+                          "center_offset": 0, "frame_width": 640}],
+            "objects_updated_at": 100.0,
+        })
+        self.d.on_objects({"objects": [], "objects_updated_at": 101.0})
+        self.d._tick(101.1)
+        self.assertEqual(self._intents()[-1]["action"], {"direction": "stop"})
+        status = self.d.bus.last(fd.STATUS_TOPIC)
+        self.assertTrue(status["sources"]["person"]["cached"])
+        self.assertFalse(status["sources"]["person"]["fresh"])
+        self.assertIn("person_not_detected", status["reason"])
+
+    def test_out_of_order_positive_pass_cannot_resurrect_negative_result(self):
+        self.d.on_control({"enabled": True})
+        self.d.on_objects({"objects": [], "objects_updated_at": 101.0})
+        self.d.on_objects({
+            "objects": [{"label": "person", "area_ratio": 0.1,
+                          "center_offset": 0, "frame_width": 640}],
+            "objects_updated_at": 100.0,
+        })
+        self.assertIsNone(self.d.person)
+        self.assertEqual(self.d._person_pass["observed_at"], 101.0)
+
     def test_status_exposes_stale_target_and_arbiter_result(self):
         self.d.on_control({"enabled": True})
         self.d.on_robot_state({"state": "OBJECT_DETECTION", "owner": "vision_basic"})

@@ -201,6 +201,10 @@ class FollowDaemon:
         except (TypeError, ValueError):
             observed_at = time.time()
         with self.lock:
+            previous_pass = self._person_pass
+            if (previous_pass and
+                    observed_at < previous_pass.get("observed_at", observed_at)):
+                return
             self._person_pass = {"observed_at": observed_at,
                                  "present": person is not None,
                                  "frame_ts": payload.get("frame_ts")}
@@ -217,6 +221,10 @@ class FollowDaemon:
         except (TypeError, ValueError):
             observed_at = time.time()
         with self.lock:
+            previous_pass = self._face_pass
+            if (previous_pass and
+                    observed_at < previous_pass.get("observed_at", observed_at)):
+                return
             detected = bool(payload.get("detected"))
             self._face_pass = {"observed_at": observed_at,
                                "present": detected,
@@ -289,7 +297,7 @@ class FollowDaemon:
             "cached": bool(target),
             "observed_at": observed_at,
             "age_sec": self._age(now, observed_at),
-            "fresh": bool(target and now - target[3] < FRESH_TARGET_SEC),
+            "fresh": self._target_is_fresh(target, producer_pass, now),
             "last_pass_at": (producer_pass or {}).get("observed_at"),
             "last_pass_age_sec": self._age(
                 now, (producer_pass or {}).get("observed_at")),
@@ -354,22 +362,43 @@ class FollowDaemon:
         self._last_status_at = now
         self.bus.publish(STATUS_TOPIC, payload)
 
+    @staticmethod
+    def _target_is_fresh(target, producer_pass, now):
+        """Return whether a cached target is still valid for motion.
+
+        A newer detector pass that found no target is stronger evidence than
+        the age of the previous positive box. Keep the old box in telemetry so
+        operators can see what was lost, but never drive from it after that
+        negative pass. Producer timestamps also prevent an out-of-order MQTT
+        payload from resurrecting an older observation.
+        """
+        if not target or now - target[3] >= FRESH_TARGET_SEC:
+            return False
+        if not producer_pass:
+            return True
+        pass_at = producer_pass.get("observed_at")
+        return not (pass_at is not None and pass_at >= target[3]
+                    and not producer_pass.get("present"))
+
     def _fresh_target(self, now):
         """Prefer a fresh person track (has distance); else a fresh face
         (centering only). Returns (offset, frame_width, area_ratio) or None."""
         with self.lock:
             person, face = self.person, self.face
-        if person and now - person[3] < FRESH_TARGET_SEC:
+            person_pass, face_pass = self._person_pass, self._face_pass
+        if self._target_is_fresh(person, person_pass, now):
             return person[:3]
-        if face and now - face[3] < FRESH_TARGET_SEC:
+        if self._target_is_fresh(face, face_pass, now):
             return face[:3]
         return None
 
     def _target_info(self, now):
         with self.lock:
             person, face = self.person, self.face
-        for source, item in (("person", person), ("face", face)):
-            if item and now - item[3] < FRESH_TARGET_SEC:
+            person_pass, face_pass = self._person_pass, self._face_pass
+        for source, item, producer_pass in (("person", person, person_pass),
+                                             ("face", face, face_pass)):
+            if self._target_is_fresh(item, producer_pass, now):
                 return {
                     "source": source,
                     "offset": item[0],

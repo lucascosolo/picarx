@@ -220,6 +220,9 @@ second hard-coded personality memory.
 Follow already has freshness telemetry, bounded reacquisition, arbitration and
 safety reporting, correction `label_memory`, COCO export, deterministic
 training-bundle generation, offline training, evaluation gating, and rollback.
+Progress (2026-07-28): a newer detector pass with no person now invalidates the
+cached positive target for motion immediately while retaining it in status for
+diagnosis; out-of-order producer timestamps cannot resurrect an older target.
 Next: reproduce the sit-still case; separate fresh detector-pass time from
 cached-payload time; stop/reacquire/give-up deterministically; benchmark real
 targets; and never imply that label memory changed detector weights.
