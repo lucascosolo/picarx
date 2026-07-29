@@ -160,9 +160,11 @@ class FakeSession:
         self.connected = False
         self.requests = []
         self.cancel_calls = 0
+        self.password = None
 
-    def connect(self, host, user=None, port=None, project_root="."):
+    def connect(self, host, user=None, port=None, project_root=".", password=None):
         self.connected = True
+        self.password = password
         return {"host": host, "user": user, "port": port,
                 "project_root": project_root, "bootstrapped": False}
 
@@ -210,6 +212,17 @@ class RemoteAssistTests(unittest.TestCase):
         remote._handle({"command": "cancel", "silent": True})
         self.assertEqual(session.cancel_calls, 1)
         self.assertTrue(remote.connected)
+
+    def test_remote_connect_forwards_password_only_to_session(self):
+        session = FakeSession()
+        bus = harness.FakeBus()
+        remote = RemoteAssist(session=session, bus=bus)
+        remote._handle({"command": "connect", "host": "192.168.1.20",
+                        "password": "temporary secret"})
+        self.assertEqual(session.password, "temporary secret")
+        published = bus.last("picarx/tools/remote_assist/result")
+        self.assertNotIn("password", published)
+        self.assertNotIn("temporary secret", repr(published))
 
     def test_remote_coding_file_edit_requires_session_authorization(self):
         session = FakeSession()

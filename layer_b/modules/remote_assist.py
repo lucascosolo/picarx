@@ -400,7 +400,8 @@ class RemoteAssist:
                     self.session.close()
                     target = self.session.connect(payload.get("host"), payload.get("user"),
                                                   payload.get("port"),
-                                                  payload.get("project_root", "."))
+                                                  payload.get("project_root", "."),
+                                                  password=payload.get("password"))
                     self.target, self.connected = target, True
                     self.write_authorized = False
                     self._claim()

@@ -105,6 +105,10 @@ submission and is carried to `sshpass -d` through an anonymous pipe, never in
 argv, environment, MQTT results, metadata, or companion/LLM tool input. The
 full user-directed coding-session redesign remains next for this P0 item.
 
+Audit correction (2026-07-28): `RemoteAssist` now forwards that transient
+credential only to `RemoteSession.connect`; the typed result and regression
+test prove it does not enter connection metadata or published output.
+
 The helper now also exposes bounded, atomic `write_file` and non-recursive
 `delete_path` operations for an explicitly authorized coding session. Writes
 stay inside the resolved project root, support an expected-content hash to
