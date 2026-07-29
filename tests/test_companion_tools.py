@@ -103,6 +103,19 @@ class CompanionToolTest(unittest.TestCase):
         self.assertEqual(request["project_root"], "~/src/picarx")
         self.assertNotIn("password", request)
 
+    def test_remote_coding_write_requires_explicit_confirmation(self):
+        out = self.c._execute_tool("remote_project_operation", {
+            "operation": "write_file", "path": "main.py",
+            "content": "print('edited')\n"})
+        self.assertIn("explicit approval", out.lower())
+        self.assertEqual(self.c.bus.of(companion.REMOTE_ASSIST_TOPIC), [])
+        self.c._execute_tool("remote_project_operation", {
+            "operation": "write_file", "path": "main.py",
+            "content": "print('edited')\n", "confirmed": True})
+        request = self.c.bus.last(companion.REMOTE_ASSIST_TOPIC)
+        self.assertEqual(request["command"], "write_file")
+        self.assertEqual(request["content"], "print('edited')\n")
+
     def test_note_and_meeting_tools_publish_typed_requests(self):
         out = self.c._execute_tool("create_note", {"text": "buy milk"})
         self.assertIn("saved", out.lower())

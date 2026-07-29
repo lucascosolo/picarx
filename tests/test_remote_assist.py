@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 import subprocess
@@ -84,6 +85,31 @@ class HostHelperTests(unittest.TestCase):
         with self.assertRaises(self.mod.HelperError):
             self.helper.apply_patch({"patch": "diff --git a/main.py b/main.py\n"})
 
+    def test_coding_session_writes_are_scoped_atomic_and_hash_checked(self):
+        writable = self.mod.HostHelper(self.root, allow_write=True)
+        created = writable.handle({"op": "write_file", "path": "src/new.py",
+                                    "content": "print('new')\n", "confirmed": True})
+        self.assertTrue(created["created"])
+        self.assertEqual(writable.read({"path": "src/new.py"})["text"],
+                         "print('new')")
+        with self.assertRaises(self.mod.HelperError):
+            writable.handle({"op": "write_file", "path": "main.py",
+                             "content": "changed\n", "expected_sha256": "bad",
+                             "confirmed": True})
+        updated = writable.handle({
+            "op": "write_file", "path": "main.py", "content": "changed\n",
+            "expected_sha256": hashlib.sha256(
+                b"print('hello')\n").hexdigest(), "confirmed": True})
+        self.assertFalse(updated["created"])
+        with self.assertRaises(self.mod.HelperError):
+            writable.handle({"op": "delete_path", "path": "src/new.py"})
+        deleted = writable.handle({"op": "delete_path", "path": "src/new.py",
+                                    "confirmed": True})
+        self.assertTrue(deleted["deleted"])
+        logs = writable.handle({"op": "logs", "limit": 20})["entries"]
+        self.assertFalse(any("print('new')" in repr(entry) or "changed\\n" in repr(entry)
+                             for entry in logs))
+
     def test_standalone_jsonl_process_needs_no_host_install(self):
         helper_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    "tools", "picarx_host_helper.py")
@@ -144,6 +170,20 @@ class RemoteAssistTests(unittest.TestCase):
         self.assertEqual(session.requests[-1]["op"], "run")
         remote._handle({"command": "disconnect"})
         self.assertFalse(remote.connected)
+
+    def test_remote_coding_file_edit_requires_session_authorization(self):
+        session = FakeSession()
+        remote = RemoteAssist(session=session)
+        remote._handle({"command": "connect", "host": "192.168.1.20"})
+        before = len(session.requests)
+        remote._handle({"command": "write_file", "path": "main.py",
+                        "content": "print('edited')\n"})
+        self.assertEqual(len(session.requests), before)
+        remote._handle({"command": "authorize_write", "confirmed": True})
+        remote._handle({"command": "write_file", "path": "main.py",
+                        "content": "print('edited')\n", "expected_sha256": "abc"})
+        self.assertEqual(session.requests[-1]["op"], "write_file")
+        self.assertTrue(session.requests[-1]["confirmed"])
 
     def test_write_authorization_persists_until_revoke_or_disconnect(self):
         session = FakeSession()

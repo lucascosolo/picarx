@@ -429,24 +429,30 @@ TOOLS = [
          "port": {"type": "integer", "description": "optional SSH port"}},
          "required": ["host"]}},
     {"name": "remote_project_operation",
-     "description": "Use the connected host helper to inspect or debug the scoped "
+     "description": "Use the connected host helper to inspect, edit, or debug the scoped "
                     "project. Supported operations are status, list, read, search, "
-                    "preview_patch, apply_patch, rollback, run, logs, authorize_write, "
+                    "write_file, delete_path, preview_patch, apply_patch, rollback, "
+                    "run, logs, authorize_write, "
                     "revoke_write, and disconnect. "
                     "Read/list/search/preview/logs are safe. Grant write access once "
                     "with authorize_write after the person explicitly approves it; "
-                    "that grant covers apply_patch and rollback until disconnect. "
+                    "that grant covers file edits, apply_patch, and rollback until "
+                    "disconnect. File overwrites use expected_sha256 when available "
+                    "to avoid clobbering a concurrent edit. "
                     "For run, set confirmed=true ONLY after the person explicitly "
                     "approves that specific command; otherwise ask for approval. Commands remain "
                     "host-side allowlisted and bounded.",
      "input_schema": {"type": "object", "properties": {
          "operation": {"type": "string", "enum": ["status", "list", "read",
-                       "search", "stat", "logs", "preview_patch", "apply_patch",
+                       "search", "stat", "logs", "write_file", "delete_path",
+                       "preview_patch", "apply_patch",
                        "rollback", "run", "authorize_write", "revoke_write",
                        "disconnect"]},
          "path": {"type": "string"},
          "pattern": {"type": "string"},
          "patch": {"type": "string"},
+         "content": {"type": "string"},
+         "expected_sha256": {"type": "string"},
          "command": {"type": "string"},
          "cwd": {"type": "string"},
          "confirmed": {"type": "boolean"}},
@@ -1826,21 +1832,23 @@ class Companion:
             if name == "remote_project_operation":
                 operation = str(tool_input.get("operation") or "").lower()
                 allowed = {"status", "list", "read", "search", "stat", "logs",
-                           "preview_patch", "apply_patch", "rollback", "run",
+                           "write_file", "delete_path", "preview_patch", "apply_patch",
+                           "rollback", "run",
                            "authorize_write", "revoke_write", "disconnect"}
                 if operation not in allowed:
                     return "That remote operation is not supported."
-                if operation in {"run", "authorize_write"} and \
+                if operation in {"run", "write_file", "delete_path", "authorize_write"} and \
                         not bool(tool_input.get("confirmed")):
-                    return ("I need your explicit approval before I can apply a "
-                            "remote patch or run a remote command.")
+                    return ("I need your explicit approval before I can edit the "
+                            "remote project or run a remote command.")
                 request = {"command": operation}
-                fields = ("path", "pattern", "patch", "command", "cwd", "confirmed")
+                fields = ("path", "pattern", "patch", "content", "expected_sha256",
+                          "command", "cwd", "confirmed")
                 for key in fields:
                     value = tool_input.get(key)
                     if value not in (None, ""):
                         if isinstance(value, str):
-                            value = value[:20000 if key == "patch" else 1000]
+                            value = value[:20000 if key in {"patch", "content"} else 1000]
                         # `command` names the remote operation on the bus;
                         # the helper's run argument therefore travels as
                         # argv to avoid overwriting that operation name.

@@ -692,7 +692,8 @@ class Handler(BaseHTTPRequestHandler):
             command = str(body.get("command") or "").lower()
             allowed = {"connect", "disconnect", "status", "list", "read", "search",
                        "stat", "logs", "authorize_write", "revoke_write",
-                       "preview_patch", "apply_patch", "rollback", "run"}
+                       "write_file", "delete_path", "preview_patch", "apply_patch",
+                       "rollback", "run"}
             if command not in allowed:
                 self._send(400, {"error": "unsupported remote command"})
                 return
@@ -701,7 +702,8 @@ class Handler(BaseHTTPRequestHandler):
             # commands, hosts, and write confirmation.
             fields = {"command", "host", "user", "port", "project_root", "password", "path",
                       "pattern", "ignore_case", "start_line", "end_line", "cwd",
-                      "argv", "patch", "timeout_sec", "confirmed"}
+                      "argv", "patch", "content", "expected_sha256", "timeout_sec",
+                      "confirmed"}
             request = {k: v for k, v in body.items() if k in fields}
             BUS.publish("picarx/tools/remote_assist", request)
             self._send(200, {"ok": True})

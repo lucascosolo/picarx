@@ -315,6 +315,14 @@ class RemoteAssist:
         elif message.get("command") == "apply_patch":
             result = message.get("result") or {}
             text = "Remote patch " + ("applied." if result.get("applied") else "was not applied.")
+        elif message.get("command") == "write_file":
+            result = message.get("result") or {}
+            text = ("Remote file written: " + str(result.get("path") or "file") + "."
+                    if result.get("path") else "Remote file was not written.")
+        elif message.get("command") == "delete_path":
+            result = message.get("result") or {}
+            text = ("Remote file deleted: " + str(result.get("path") or "file") + "."
+                    if result.get("deleted") else "Remote file was not deleted.")
         elif message.get("command") == "rollback":
             result = message.get("result") or {}
             text = "Remote patch " + ("rolled back." if result.get("rolled_back")
@@ -388,10 +396,11 @@ class RemoteAssist:
                                 "request_id": request_id,
                                 "write_authorized": False}
                 elif command in {"list", "read", "search", "stat", "logs",
-                                 "preview_patch", "apply_patch", "rollback", "run"}:
+                                 "write_file", "delete_path", "preview_patch",
+                                 "apply_patch", "rollback", "run"}:
                     request = dict(payload)
                     request["op"] = command
-                    if command in {"apply_patch", "rollback"}:
+                    if command in {"write_file", "delete_path", "apply_patch", "rollback"}:
                         if not self.write_authorized:
                             raise PermissionError(
                                 "grant remote write access for this session first")

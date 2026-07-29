@@ -105,6 +105,13 @@ submission and is carried to `sshpass -d` through an anonymous pipe, never in
 argv, environment, MQTT results, metadata, or companion/LLM tool input. The
 full user-directed coding-session redesign remains next for this P0 item.
 
+The helper now also exposes bounded, atomic `write_file` and non-recursive
+`delete_path` operations for an explicitly authorized coding session. Writes
+stay inside the resolved project root, support an expected-content hash to
+avoid clobbering concurrent edits, and keep file contents out of audit logs;
+edits and deletion require confirmation. Patch operations remain as a
+backward-compatible path while the session/LLM orchestration is completed.
+
 ### 4. Follow/perception reliability
 
 Follow already has freshness telemetry, bounded reacquisition, arbitration and

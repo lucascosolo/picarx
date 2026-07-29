@@ -51,7 +51,10 @@
   <div class="row"><input id="remote-command" placeholder="allowlisted test command">
     <label><input type="checkbox" id="remote-confirm"> confirm remote command/write</label>
     <button onclick="remoteRun()">Run</button></div>
-  <textarea id="remote-patch" rows="10" placeholder="unified git diff to preview or apply"></textarea>
+  <textarea id="remote-content" rows="10" placeholder="file content for a scoped coding edit"></textarea>
+  <input id="remote-sha" placeholder="expected SHA-256 from the read (optional conflict guard)">
+  <button class="danger" onclick="remoteWriteFile()">Write confirmed file</button>
+  <textarea id="remote-patch" rows="10" placeholder="legacy unified diff (preview/apply)"></textarea>
   <div class="row"><button onclick="remotePatch('preview_patch')">Preview patch</button>
     <button class="danger" onclick="remotePatch('apply_patch')">Apply confirmed patch</button>
     <button class="danger" onclick="remoteCommand('rollback', {confirmed: document.getElementById('remote-confirm').checked})">Rollback last patch</button></div>
@@ -103,6 +106,16 @@ function remoteRun() {
 function remotePatch(command) {
   const patch = document.getElementById('remote-patch').value;
   remoteCommand(command, {patch, confirmed: document.getElementById('remote-confirm').checked});
+}
+function remoteWriteFile() {
+  if (!document.getElementById('remote-confirm').checked) {
+    alert('Check the confirmation box first.'); return;
+  }
+  remoteCommand('write_file', {
+    path: document.getElementById('remote-path').value.trim(),
+    content: document.getElementById('remote-content').value,
+    expected_sha256: document.getElementById('remote-sha').value.trim() || undefined,
+    confirmed: true});
 }
 PX.onPoll(s => {
   const mode = s.robot_state || {};

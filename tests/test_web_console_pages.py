@@ -154,6 +154,7 @@ class RouteTableTest(unittest.TestCase):
                        "remoteRun()", "authorizeRemoteWrites()", "revoke_write",
                        "remote-confirm", "remote-password",
                        "not saved or sent to the language model",
+                       "remoteWriteFile()", "write_file",
                        "argv: document.getElementById('remote-command')"):
             self.assertIn(marker, page)
 

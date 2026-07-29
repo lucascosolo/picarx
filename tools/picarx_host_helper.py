@@ -10,15 +10,19 @@ is required. For local testing it can be run as
 
 Protocol: one JSON object per stdin line, one JSON result per stdout line.
 Supported operations are ``status``, ``list``, ``read``, ``search``, ``stat``,
-``logs``, ``preview_patch``, ``apply_patch``, ``rollback``, and ``run``.
+``logs``, ``write_file``, ``delete_path``, ``preview_patch``, ``apply_patch``,
+``rollback``, and ``run``. File edits are bounded, rooted at the explicitly
+scoped project, and require robot-side write authorization.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -188,6 +192,69 @@ class HostHelper:
                 break
         return {"pattern": pattern, "results": results, "truncated": truncated}
 
+    def write_file(self, request):
+        """Atomically write one bounded UTF-8 text file inside the root."""
+        if not self.allow_write:
+            raise HelperError("host helper is read-only; restart it with --allow-write")
+        content = request.get("content")
+        if not isinstance(content, str) or not content:
+            raise HelperError("file content must be a non-empty text string")
+        encoded = content.encode("utf-8")
+        if len(encoded) > MAX_READ_BYTES:
+            raise HelperError("file content is too large")
+        if "\x00" in content:
+            raise HelperError("binary file content is not accepted")
+        path = self._path(request.get("path"))
+        if path == self.root:
+            raise HelperError("a file path is required")
+        if path.exists() and not path.is_file():
+            raise HelperError("path is not a file")
+        expected = request.get("expected_sha256")
+        current = None
+        if path.exists():
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+            if expected and str(expected).lower() != current:
+                raise HelperError("file changed since it was read; refusing to overwrite")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=path.parent,
+                    prefix=f".{path.name}.picarx-", delete=False) as stream:
+                temporary = stream.name
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if current is not None:
+                os.chmod(temporary, path.stat().st_mode & 0o777)
+            os.replace(temporary, path)
+        except OSError as exc:
+            raise HelperError(f"could not write file: {exc}") from exc
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+        return {"path": self._relative(path), "bytes": len(encoded),
+                "created": current is None,
+                "sha256": hashlib.sha256(encoded).hexdigest()}
+
+    def delete_path(self, request):
+        """Delete one file after explicit confirmation; never recurse."""
+        if not self.allow_write:
+            raise HelperError("host helper is read-only; restart it with --allow-write")
+        path = self._path(request.get("path"), must_exist=True)
+        if path == self.root:
+            raise HelperError("the project root cannot be deleted")
+        if not path.is_file():
+            raise HelperError("only individual files can be deleted")
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise HelperError(f"could not delete file: {exc}") from exc
+        return {"path": self._relative(path), "deleted": True}
+
     def preview_patch(self, request):
         patch = str(request.get("patch") or "")
         if not patch or len(patch.encode()) > MAX_READ_BYTES:
@@ -306,12 +373,13 @@ class HostHelper:
         started = time.monotonic()
         methods = {"status": self.status, "list": self.list, "read": self.read,
                    "search": self.search, "stat": self.stat, "logs": self.logs,
+                   "write_file": self.write_file, "delete_path": self.delete_path,
                    "preview_patch": self.preview_patch, "apply_patch": self.apply_patch,
                    "rollback": self.rollback, "run": self.run}
         if op not in methods:
             raise HelperError(f"unsupported operation: {op}")
         try:
-            if op in {"apply_patch", "rollback", "run"} and \
+            if op in {"write_file", "delete_path", "apply_patch", "rollback", "run"} and \
                     not bool(request.get("confirmed")):
                 raise HelperError("explicit confirmation is required for this operation")
             result = methods[op](request)
