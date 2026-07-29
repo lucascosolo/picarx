@@ -57,9 +57,35 @@ PROTOCOL
   out  picarx/audio/unhandled {text, confidence}   addressed free-form -> chat.
   out  picarx/audio/uncertain {text, confidence, from}  command-shaped -> the
          LLM intent arbiter.
+  out  picarx/dialog/conversation {open, reason, since, turns}
+         The conversation opened or closed - see below.
 
-Fail-soft and stdlib-only. A sweeper thread expires stale questions even in a
-silent room so an unanswered question always resolves.
+THE OPEN CONVERSATION
+---------------------
+The third thing this broker owns is whether a conversation is HAPPENING. It
+used to be a 45-second window reset by exactly two events: a wake phrase, or an
+utterance the local phrase tables recognized as a command. So a genuine
+back-and-forth died mid-conversation unless the human kept re-addressing the
+robot or kept saying things the matcher already knew - the request/response
+shape the roadmap's Direction section is trying to get out of.
+
+Now it is an attention.Conversation: say the robot's name (or give it a command
+it acts on) and the channel OPENS; while it is open, every turn on either side
+keeps it open - including plain chat, and including the robot's own replies, so
+thinking for twenty seconds before answering doesn't hang up on you. It ends
+when someone says so ("stop listening", "goodbye"), when nobody has spoken for
+`conversation_window_sec`, or when it hits `conversation_max_sec` - the backstop
+that keeps a talkative television from holding the channel open forever.
+
+The sleep phrases are detected on the RAW heard stream rather than on
+field_agent's misses, because field_agent acts on "stop listening" as a motion
+stop first and reports it as handled. That is the correct order and is left
+exactly as it is: stopping is always safe, this broker just also hears the
+phrase. Nothing here can suppress a safety word.
+
+Fail-soft and stdlib-only. A sweeper thread expires stale questions and closes
+idle conversations even in a silent room, so an unanswered question always
+resolves and the channel never stays open on a timestamp nobody refreshes.
 """
 import os
 import getpass
@@ -87,6 +113,8 @@ CLEARED_TOPIC = "picarx/dialog/cleared"
 DIRECTED_TOPIC = "picarx/audio/directed"      # field_agent's command-misses, in
 UNHANDLED_TOPIC = "picarx/audio/unhandled"    # -> companion free-form chat
 UNCERTAIN_TOPIC = "picarx/audio/uncertain"    # -> companion LLM intent arbiter
+SPEAK_TOPIC = "picarx/audio/speak"            # the robot's own turn, in and out
+CONVERSATION_TOPIC = "picarx/dialog/conversation"   # the channel opened/closed
 
 # Wake phrases and the no-wake-word follow-up window are shared with
 # field_agent's forwarding path; both read them here so there's one source of
@@ -94,6 +122,8 @@ UNCERTAIN_TOPIC = "picarx/audio/uncertain"    # -> companion LLM intent arbiter
 # window only so it never mistakes a wake-addressed fresh command for an answer.)
 CONVERSATION_WINDOW_SEC = float(robot_config.get(
     "dialog", "conversation_window_sec", 45.0, env="DIALOG_CONVERSATION_WINDOW_SEC"))
+CONVERSATION_MAX_SEC = float(robot_config.get(
+    "dialog", "conversation_max_sec", 600.0, env="DIALOG_CONVERSATION_MAX_SEC"))
 EXPIRY_SWEEP_SEC = 1.0   # how often the background sweeper checks the live deadline
 # When an utterance is routed as an answer, field_agent (which also sees it on
 # the raw heard stream) forwards its own copy on the directed stream a beat
@@ -114,14 +144,32 @@ _CONFIGURED_WAKE = attention.normalize_wake_phrases(robot_config.get(
 WAKE_PHRASES = tuple(dict.fromkeys(
     _CONFIGURED_WAKE + attention.normalize_wake_phrases([identity.name()])))
 
+# Ending a conversation on purpose. These are attention CONTROLS, the same
+# class of thing as the wake phrases and deliberately just as small: a hard,
+# offline, always-available way to hang up, so "stop listening" can never
+# depend on a model being reachable or in a good mood. They are not intent
+# understanding, and nothing else in the routing path is allowed to grow this
+# way - see the Direction section of the roadmap.
+SLEEP_PHRASES = attention.normalize_wake_phrases(robot_config.get(
+    "dialog", "sleep_phrases",
+    "stop listening,go to sleep,goodbye,good bye,that's all,thats all",
+    env="DIALOG_SLEEP_PHRASES"))
+SLEEP_ACK = "Okay, I'll stop listening."
+# field_agent acts on "stop listening" as a motion stop and reports it handled
+# a beat AFTER we close the conversation here, which would immediately reopen
+# it. Ignore that one echo (the same shape as ANSWER_SUPPRESS_SEC below).
+SLEEP_SUPPRESS_SEC = 3.0
+
 
 class DialogBroker:
     def __init__(self):
         self.bus = Bus()
         self.lock = threading.Lock()
         self.question = None            # the single live attention.Question, or None
-        self.last_directed_at = 0.0     # last wake/command-shaped utterance (window base)
+        self.conversation = attention.Conversation(
+            idle_sec=CONVERSATION_WINDOW_SEC, max_sec=CONVERSATION_MAX_SEC)
         self._answered = None           # (text_lower, ts) of the last routed answer
+        self._slept_at = 0.0            # when we were last told to stop listening
         self.meeting_recording = False  # notes daemon owns heard speech while active
 
     # ---------- question registry ----------
@@ -156,6 +204,58 @@ class DialogBroker:
             "reason": reason, "ts": time.time()})
         print(f"Dialog: question {question.id} ({question.asker}) cleared - {reason}")
 
+    # ---------- the open conversation ----------
+
+    def _publish_conversation(self, now):
+        with self.lock:
+            c = self.conversation
+            state = {"open": c.is_open(now), "reason": c.reason,
+                     "since": c.opened_at or None, "turns": c.turns,
+                     "remaining": round(c.remaining(now), 1), "ts": now}
+        self.bus.publish(CONVERSATION_TOPIC, state)
+
+    def _open_conversation(self, now, reason):
+        """Open the channel (or count a turn if it is already open). Announced
+        on the bus only on the transition, so anyone tracking whether a
+        conversation is live gets edges, not a stream."""
+        with self.lock:
+            newly = self.conversation.open(now, reason)
+        if newly:
+            print(f"Dialog: conversation opened ({reason})")
+            self._publish_conversation(now)
+        return newly
+
+    def _touch_conversation(self, now):
+        """One more turn on an open channel; never opens one."""
+        with self.lock:
+            return self.conversation.touch(now)
+
+    def _close_conversation(self, now, reason, ack=None):
+        """End an open conversation. Returns False if none was open (so being
+        told to stop listening when nobody was talking stays silent)."""
+        with self.lock:
+            was_open = self.conversation.close()
+            if reason == attention.ASKED:
+                self._slept_at = now
+        if not was_open:
+            return False
+        print(f"Dialog: conversation closed ({reason})")
+        self.bus.publish(CONVERSATION_TOPIC,
+                         {"open": False, "reason": reason, "ts": now})
+        if ack:
+            self.bus.publish(SPEAK_TOPIC, {"text": ack})
+        return True
+
+    def on_speak(self, payload):
+        """The robot took its turn. That keeps an open conversation alive - a
+        reply that took a while to think about must not be followed by the
+        channel having quietly closed. It cannot OPEN one (see
+        Conversation.touch), so an unprompted announcement to an empty room
+        doesn't start the robot listening."""
+        if not (payload.get("text") or "").strip():
+            return
+        self._touch_conversation(time.time())
+
     # ---------- utterance routing ----------
 
     def on_notes_state(self, payload):
@@ -178,6 +278,13 @@ class DialogBroker:
         if not text:
             return
         now = time.time()
+
+        # "Stop listening" / "goodbye": hang up. Read off the RAW heard stream
+        # because field_agent takes "stop listening" as a motion stop and
+        # reports it handled - which is the right order and stays that way.
+        if attention.contains_phrase(text, SLEEP_PHRASES) is not None:
+            if self._close_conversation(now, attention.ASKED, ack=SLEEP_ACK):
+                return
 
         # Drop a stale question before considering this utterance as its answer.
         expired = None
@@ -279,15 +386,20 @@ class DialogBroker:
             if self.meeting_recording:
                 return
         now = time.time()
+        with self.lock:
+            just_slept = (now - self._slept_at) < SLEEP_SUPPRESS_SEC
         if payload.get("handled"):
-            with self.lock:
-                self.last_directed_at = now
+            # A command the robot acted on is the human addressing it, so it
+            # opens the channel - unless the command WAS "stop listening",
+            # whose handled echo would otherwise undo the hang-up.
+            if not just_slept:
+                self._open_conversation(now, "command")
             return
         text = (payload.get("text") or "").strip()
         if not text:
             return
         with self.lock:
-            in_conversation = (now - self.last_directed_at) < CONVERSATION_WINDOW_SEC
+            in_conversation = self.conversation.is_open(now)
             answered = self._answered
         # Already routed as an answer a beat ago -> it reached its asker; don't
         # also forward it to chat (the dedup only the single-authority broker can
@@ -302,8 +414,7 @@ class DialogBroker:
             text, wake_phrases=WAKE_PHRASES, in_conversation=in_conversation)
 
         if addressing.reason == attention.WAKE:
-            with self.lock:
-                self.last_directed_at = now      # an explicit wake opens the window
+            self._open_conversation(now, attention.WAKE)   # an explicit start
             self.bus.publish(UNHANDLED_TOPIC,
                              {"text": addressing.remainder, "confidence": confidence})
             print(f"Dialog: wake chat -> companion: '{addressing.remainder}'")
@@ -322,7 +433,13 @@ class DialogBroker:
                 "text": text, "confidence": confidence, "from": "field_agent"})
             print(f"Dialog: command-shaped -> intent arbiter: '{text}'")
         elif addressing.reason == attention.CONVERSATION:
-            # A wake-less follow-up inside the window: chat, but don't re-extend.
+            # A wake-less follow-up inside an open conversation. It IS a turn,
+            # so it keeps the channel alive: talking to the robot is what a
+            # conversation is made of, and requiring the human to re-address it
+            # every 45 seconds is the request/response shape we're leaving
+            # behind. Conversation.max_sec is the backstop that keeps this from
+            # becoming "open forever" in a room with a television.
+            self._touch_conversation(now)
             self.bus.publish(UNHANDLED_TOPIC, {"text": text, "confidence": confidence})
             print(f"Dialog: in-conversation chat -> companion: '{text}'")
         elif addressing.reason == attention.CHAT_SHAPE:
@@ -345,8 +462,15 @@ class DialogBroker:
             if q is not None and q.expired(now):
                 self.question = None
                 expired = q
+            # A conversation nobody is having any more ends on the clock, not
+            # on the next thing somebody happens to say.
+            ending = self.conversation.closing_reason(now)
         if expired is not None:
             self._emit_cleared(expired, "expired")
+        if ending is not None:
+            # Silent on purpose: the robot saying goodbye into an empty room
+            # is exactly the muttering the chat quality gate exists to avoid.
+            self._close_conversation(now, ending)
 
     # ---------- main loop ----------
 
@@ -355,9 +479,11 @@ class DialogBroker:
         self.bus.subscribe(HEARD_TOPIC, self.on_heard)
         self.bus.subscribe("picarx/tools/notes/state", self.on_notes_state)
         self.bus.subscribe(DIRECTED_TOPIC, self.on_directed)
+        self.bus.subscribe(SPEAK_TOPIC, self.on_speak)
         print(f"Dialog broker active - one open question at a time, and the sole "
               f"turn-taking router (wake={list(WAKE_PHRASES)}, "
-              f"window {CONVERSATION_WINDOW_SEC:.0f}s)")
+              f"idle {CONVERSATION_WINDOW_SEC:.0f}s, "
+              f"max {CONVERSATION_MAX_SEC:.0f}s, sleep={list(SLEEP_PHRASES)})")
         while True:
             time.sleep(EXPIRY_SWEEP_SEC)
             self._sweep_once(time.time())

@@ -125,6 +125,25 @@ def looks_conversational(text):
     return toks[0] in _QUESTION_OPENERS
 
 
+def contains_phrase(text, phrases):
+    """The first phrase in PHRASES that appears in TEXT as a contiguous run of
+    whole words, or None.
+
+    Whole-word runs only, no regex and no substring test: "go to sleep" must
+    not fire on "sleepy", and "goodbye" must not fire on "goodbyes". Used for
+    the small set of attention CONTROLS (see Conversation) - never for
+    understanding what someone meant."""
+    toks = speech_match.tokens(text)
+    for phrase in phrases:
+        want = speech_match.tokens(phrase)
+        if not want or len(want) > len(toks):
+            continue
+        for i in range(len(toks) - len(want) + 1):
+            if toks[i:i + len(want)] == want:
+                return phrase
+    return None
+
+
 def normalize_wake_phrases(value):
     """Coerce a wake-phrase config value to a lowercase tuple. config.json
     stores a JSON list; the env override arrives as a comma-separated string.
@@ -184,6 +203,111 @@ def is_addressed(text, canon=None, *, wake_phrases=(), in_conversation=False):
     a = classify(text, canon, wake_phrases=wake_phrases,
                  in_conversation=in_conversation)
     return a.addressed, a.reason
+
+
+# ---------------------------------------------------------------------
+# The open conversation ("voice mode")
+# ---------------------------------------------------------------------
+# The window used to be a bare timestamp comparison ("did something address
+# the robot in the last 45 seconds?"), and only two events reset it: a wake
+# phrase, or a command the local matcher recognized. That is a request/response
+# shape wearing a conversation's clothes - the human had to keep re-addressing
+# the robot, or keep saying things the phrase tables happened to know, or the
+# conversation quietly ended mid-sentence.
+#
+# A real conversation SUSTAINS ITSELF: it opens when someone starts it, stays
+# open while the two of you are actually going back and forth (either side's
+# turn counts), and ends when it is over - either because someone said so, or
+# because nobody said anything for a while. That is what this models, as
+# explicit state instead of arithmetic on one timestamp, so the routers can ask
+# "are we talking?" rather than "was there a keyword recently?".
+#
+# Two independent clocks, because they answer different questions:
+#   idle_sec - how long a silence ends the conversation. Reset by every turn.
+#   max_sec  - the longest one conversation can run before the robot needs to
+#              be addressed again. NOT reset by anything: it is the backstop
+#              that stops a talkative television (or the robot answering its
+#              own replies) from holding the channel open indefinitely.
+# Pure: the caller owns the clock and the bus, same as the rest of this module.
+DEFAULT_IDLE_SEC = 45.0
+DEFAULT_MAX_SEC = 600.0
+
+# why a conversation ended
+IDLE = "idle"                  # nobody said anything for idle_sec
+MAX_DURATION = "max_duration"  # ran past max_sec without being re-addressed
+ASKED = "asked"                # someone told the robot to stop listening
+
+
+class Conversation:
+    """One open conversation. Closed until something opens it."""
+
+    __slots__ = ("idle_sec", "max_sec", "opened_at", "last_turn_at", "turns",
+                 "reason")
+
+    def __init__(self, idle_sec=DEFAULT_IDLE_SEC, max_sec=DEFAULT_MAX_SEC):
+        self.idle_sec = float(idle_sec)
+        self.max_sec = float(max_sec)
+        self.opened_at = 0.0
+        self.last_turn_at = 0.0
+        self.turns = 0
+        self.reason = None
+
+    def open(self, now, reason=WAKE):
+        """Start a conversation, or count a turn if one is already running.
+        Returns True only when it was NEWLY opened, so a caller can announce
+        the transition exactly once."""
+        if self.is_open(now):
+            self.touch(now)
+            return False
+        self.opened_at = now
+        self.last_turn_at = now
+        self.turns = 1
+        self.reason = reason
+        return True
+
+    def touch(self, now):
+        """Count one more turn of an ALREADY-open conversation, resetting the
+        idle clock. Never opens one: the robot speaking, or someone chatting
+        near it, extends a conversation that exists but must not start one -
+        otherwise an announcement to an empty room would open the channel."""
+        if not self.is_open(now):
+            return False
+        self.last_turn_at = now
+        self.turns += 1
+        return True
+
+    def closing_reason(self, now):
+        """Why this conversation is over, or None while it is still running."""
+        if not self.opened_at:
+            return None
+        if self.idle_sec and (now - self.last_turn_at) >= self.idle_sec:
+            return IDLE
+        if self.max_sec and (now - self.opened_at) >= self.max_sec:
+            return MAX_DURATION
+        return None
+
+    def is_open(self, now):
+        return bool(self.opened_at) and self.closing_reason(now) is None
+
+    def close(self):
+        """End it. Returns True if it had been open (so the caller only
+        announces a real ending)."""
+        was_open = bool(self.opened_at)
+        self.opened_at = 0.0
+        self.last_turn_at = 0.0
+        self.turns = 0
+        self.reason = None
+        return was_open
+
+    def remaining(self, now):
+        """Seconds until this conversation closes on its own (0 when closed)."""
+        if not self.opened_at:
+            return 0.0
+        by_idle = (self.idle_sec - (now - self.last_turn_at)
+                   if self.idle_sec else float("inf"))
+        by_max = (self.max_sec - (now - self.opened_at)
+                  if self.max_sec else float("inf"))
+        return max(0.0, min(by_idle, by_max))
 
 
 # ---------------------------------------------------------------------

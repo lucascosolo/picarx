@@ -149,8 +149,19 @@ KNOBS = [
              "'computer ...'); read by both field_agent and the dialog broker."},
     {"section": "dialog", "key": "conversation_window_sec", "type": "float",
      "default": 45.0, "env": "DIALOG_CONVERSATION_WINDOW_SEC",
-     "desc": "After a wake-word or command, how long follow-ups may skip the "
-             "wake word before it's needed again."},
+     "desc": "How long a silence ends an open conversation; every turn on "
+             "either side resets it, so follow-ups need no wake word."},
+    {"section": "dialog", "key": "conversation_max_sec", "type": "float",
+     "default": 600.0, "env": "DIALOG_CONVERSATION_MAX_SEC",
+     "desc": "The longest one conversation runs before the robot must be "
+             "addressed again. Never reset by a turn - it is the backstop "
+             "against a talkative room holding the channel open."},
+    {"section": "dialog", "key": "sleep_phrases", "type": "str",
+     "default": "stop listening,go to sleep,goodbye,good bye,that's all,thats all",
+     "env": "DIALOG_SLEEP_PHRASES",
+     "desc": "Comma-separated phrases that close an open conversation - the "
+             "offline counterpart to the wake phrases, so hanging up never "
+             "depends on a model being reachable."},
     # ---- observability (heartbeat.py / broker_client / debug_monitor) ----
     {"section": "observability", "key": "heartbeat", "type": "bool",
      "default": True, "env": "PICARX_HEARTBEAT",

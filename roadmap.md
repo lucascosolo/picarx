@@ -24,7 +24,14 @@ change from here should move in this direction:
   local layer demoted to a fast path for things he has already learned, plus a
   cost/offline gate. This is the real content of the "unify utterance routing"
   item below — the unification is not a tidier keyword list, it is deleting the
-  keyword lists' authority.
+  keyword lists' authority. *Started 2026-07-29* with the open conversation
+  (`attention.Conversation`): while a conversation is running, the phrase
+  tables no longer decide whether it continues — the conversation itself does,
+  and everything said inside it goes to Marco rather than to a matcher. The
+  deterministic phrases that remain on this path are now only attention
+  CONTROLS (wake, sleep), the offline hard edges of the channel, not
+  understanding. Still to invert: what happens to an utterance OUTSIDE an open
+  conversation, where the tables still hold first refusal.
 - **Capabilities are tools he chooses, not phrases he waits for.** A capability
   declares itself once and is reachable both ways (landed: `CapabilityTool` in
   `capability_registry.py`). He should be able to decide to check the clock or
@@ -52,7 +59,7 @@ hand-written matcher.
 ## Current state (2026-07-29)
 
 - The repository is on `master`; the local implementation currently passes
-  1,072 tests. The full suite is the source-of-truth regression gate, while
+  1,102 tests. The full suite is the source-of-truth regression gate, while
   hardware and browser/device validation are still separate release gates.
 - The safety architecture is intact: the independent safety daemon remains the
   final motion veto; RobotState leases and the central camera owner coordinate
@@ -80,9 +87,11 @@ hand-written matcher.
   router whether anything actually claims an utterance before spending the
   command-repair budget on it, and capabilities declare an optional
   `CapabilityTool` next to their phrase rules so dice and clock are reachable
-  from the thinking plane. Both are steps toward the Direction above; the
-  phrase tables still hold routing authority and that is the next thing to
-  invert.
+  from the thinking plane. Both are steps toward the Direction above. The
+  conversation is now an open channel rather than a keyword-reset window
+  (`attention.Conversation`, `picarx/dialog/conversation`): inside it the
+  phrase tables no longer decide whether the conversation continues. Outside
+  it they still hold first refusal, and that is the next thing to invert.
 - Local clips are bounded and interruptible, but camera/ALSA codec behavior,
   playback devices, and service startup have not yet been validated on the
   target Pi. The gesture native runtime/package decision and provisioned-host
@@ -403,9 +412,31 @@ targets; and never imply that label memory changed detector weights.
     talk that no capability claims, isn't shaped like an instruction, and
     addresses the robot in the second person goes to chat instead. This is the
     first piece of the router inversion in the Direction section.
+  - *The conversation ended mid-sentence (fixed 2026-07-29):* the 45s window
+    was reset by exactly two events — a wake phrase, or an utterance the local
+    phrase tables recognized as a command — so a genuine back-and-forth timed
+    out unless the human kept re-addressing the robot or kept saying things the
+    matcher already knew. `attention.Conversation` replaces the timestamp
+    comparison with a real open channel (voice mode): saying his name or giving
+    him a command he acts on OPENS it, and while it is open every turn on
+    either side keeps it alive — including plain chat and including Marco's own
+    replies (`dialog.on_speak`), so thinking for twenty seconds doesn't hang up
+    on you. It ends on `dialog.sleep_phrases` ("stop listening", "goodbye"), on
+    `conversation_window_sec` of silence, or at `conversation_max_sec` — the
+    backstop, never reset by a turn, that keeps a talkative television from
+    holding the channel open forever. State edges are published on
+    `picarx/dialog/conversation`. Sleep phrases are read off the RAW heard
+    stream because field_agent takes "stop listening" as a motion stop and
+    reports it handled first; that order is unchanged and nothing here can
+    suppress a safety word.
   - *Still open:* unvalidated on the Pi — whether the artifact repair fires as
-    often as the field symptom suggests (watch the `raw` field), and whether
-    CHAT_SHAPE raises LLM spend near a television.
+    often as the field symptom suggests (watch the `raw` field), whether
+    CHAT_SHAPE raises LLM spend near a television, and whether the open channel
+    plus the max-duration backstop are the right defaults in a real room.
+  - *Next on this thread:* companion does not yet consume
+    `picarx/dialog/conversation`. It should — an open channel is the honest
+    definition of "what is currently relevant", which is also the substrate the
+    stale-intent item below needs.
 
 - **Stale intent lingers in context — Marco doesn't know when something stops
   mattering (owner-reported, 2026-07-29):** he deletes a note successfully, the

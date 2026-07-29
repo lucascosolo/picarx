@@ -280,5 +280,113 @@ class DirectedRoutingTest(unittest.TestCase):
         self.assertEqual(self.d.bus.last(UNHANDLED)["text"], "it's a speaker")
 
 
+class OpenConversationTest(unittest.TestCase):
+    """Voice mode: the channel opens when someone starts a conversation, stays
+    open while it is actually being had, and ends when it is over."""
+
+    def setUp(self):
+        self.d = dialog.DialogBroker()
+
+    def _directed(self, **payload):
+        self.d.on_directed(payload)
+
+    def _age(self, seconds):
+        """Pretend SECONDS passed since the last turn (idle clock only)."""
+        self.d.conversation.last_turn_at -= seconds
+
+    # ---- staying open ----
+
+    def test_plain_conversation_keeps_the_channel_open(self):
+        # The point of the change: a back-and-forth sustains itself. Before,
+        # only a wake phrase or a matched command reset the window, so an
+        # ordinary conversation timed out mid-sentence.
+        self._directed(text="robot hello there")               # opens
+        for _ in range(3):
+            self._age(dialog.CONVERSATION_WINDOW_SEC - 5)      # nearly idle out
+            self.d.bus.clear()
+            self._directed(text="that is interesting tell me more")
+            self.assertIsNotNone(self.d.bus.last(UNHANDLED))   # still conversation
+        self.assertTrue(self.d.conversation.is_open(time.time()))
+
+    def test_the_robot_speaking_holds_the_channel_open(self):
+        # A reply that took a while to think about must not be followed by the
+        # channel having quietly closed under it.
+        self._directed(text="robot hello there")
+        self._age(dialog.CONVERSATION_WINDOW_SEC - 1)
+        self.d.on_speak({"text": "Sorry, I was thinking about that."})
+        self._age(dialog.CONVERSATION_WINDOW_SEC - 5)
+        self.d.bus.clear()
+        self._directed(text="the weather is nice today")
+        self.assertIsNotNone(self.d.bus.last(UNHANDLED))
+
+    def test_speaking_alone_never_opens_a_channel(self):
+        # An announcement into an empty room must not start the robot listening.
+        self.d.on_speak({"text": "My battery is getting low."})
+        self.assertFalse(self.d.conversation.is_open(time.time()))
+        self._directed(text="the weather is nice today")
+        self.assertIsNone(self.d.bus.last(UNHANDLED))
+
+    # ---- ending ----
+
+    def test_silence_closes_the_channel(self):
+        self._directed(text="robot hello there")
+        self.d.bus.clear()
+        self._age(dialog.CONVERSATION_WINDOW_SEC + 1)
+        self.d._sweep_once(time.time())
+        state = self.d.bus.last(dialog.CONVERSATION_TOPIC)
+        self.assertFalse(state["open"])
+        self.assertEqual(state["reason"], "idle")
+        # ...and it closes silently: no goodbye muttered into an empty room.
+        self.assertEqual(self.d.bus.of("picarx/audio/speak"), [])
+
+    def test_a_long_conversation_ends_even_while_still_being_talked_at(self):
+        # The backstop against a television holding the channel open forever:
+        # max_sec is never reset by a turn.
+        self._directed(text="robot hello there")
+        self.d.conversation.opened_at -= dialog.CONVERSATION_MAX_SEC + 1
+        self.d._sweep_once(time.time())
+        self.assertFalse(self.d.conversation.is_open(time.time()))
+        self.assertEqual(self.d.bus.last(dialog.CONVERSATION_TOPIC)["reason"],
+                         "max_duration")
+
+    def test_stop_listening_hangs_up_and_says_so(self):
+        self._directed(text="robot hello there")
+        self.d.on_heard({"text": "okay stop listening"})
+        self.assertFalse(self.d.conversation.is_open(time.time()))
+        self.assertEqual(self.d.bus.last("picarx/audio/speak")["text"],
+                         dialog.SLEEP_ACK)
+        self.assertEqual(self.d.bus.last(dialog.CONVERSATION_TOPIC)["reason"],
+                         "asked")
+
+    def test_the_handled_echo_of_stop_listening_does_not_reopen_it(self):
+        # field_agent acts on "stop listening" as a motion stop and reports it
+        # handled a beat later - which must not undo the hang-up.
+        self._directed(text="robot hello there")
+        self.d.on_heard({"text": "stop listening"})
+        self._directed(handled=True)
+        self.assertFalse(self.d.conversation.is_open(time.time()))
+
+    def test_stop_listening_when_nobody_was_talking_stays_silent(self):
+        self.d.on_heard({"text": "goodbye"})
+        self.assertEqual(self.d.bus.of("picarx/audio/speak"), [])
+        self.assertIsNone(self.d.bus.last(dialog.CONVERSATION_TOPIC))
+
+    def test_a_sleep_word_inside_a_longer_word_does_not_hang_up(self):
+        self._directed(text="robot hello there")
+        self.d.on_heard({"text": "i am feeling sleepy"})
+        self.assertTrue(self.d.conversation.is_open(time.time()))
+
+    # ---- the state topic ----
+
+    def test_opening_is_announced_once_not_per_turn(self):
+        self._directed(text="robot hello there")
+        self._directed(text="and what do you think about that")
+        self._directed(text="tell me more about it")
+        states = self.d.bus.of(dialog.CONVERSATION_TOPIC)
+        self.assertEqual(len(states), 1)
+        self.assertTrue(states[0]["open"])
+        self.assertEqual(states[0]["reason"], "wake")
+
+
 if __name__ == "__main__":
     unittest.main()
